@@ -96,3 +96,6 @@ syncRouter.post('/sync', async (c) => {
     }, 500);
   }
 });
+
+// Export as default for Cloudflare Workers
+export default syncRouter;
