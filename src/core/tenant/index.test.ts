@@ -13,7 +13,7 @@ describe('Tenant-as-Code & Module Registry', () => {
     const app = new Hono();
     app.use('*', tenantResolver);
     app.get('/test', (c) => {
-      const tenant = c.get('tenant') as any;
+      const tenant = c.get('tenant' as any) as any;
       return c.json({ tenantId: tenant.tenantId });
     });
 
@@ -32,7 +32,7 @@ describe('Tenant-as-Code & Module Registry', () => {
     const app = new Hono();
     app.use('*', tenantResolver);
     app.get('/test', (c) => {
-      const tenant = c.get('tenant') as any;
+      const tenant = c.get('tenant' as any) as any;
       return c.json({ tenantId: tenant.tenantId });
     });
 
@@ -83,7 +83,7 @@ describe('Tenant-as-Code & Module Registry', () => {
     const app = new Hono();
     app.use('*', tenantResolver);
     app.get('/test', (c) => {
-      const tenant = c.get('tenant') as any;
+      const tenant = c.get('tenant' as any) as any;
       return c.json({ 
         tenantId: tenant.tenantId,
         marketplaceId: tenant.marketplaceId
