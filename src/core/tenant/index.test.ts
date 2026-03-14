@@ -10,10 +10,10 @@ describe('Tenant-as-Code & Module Registry', () => {
   });
 
   it('should resolve tenant by X-Tenant-ID header', async () => {
-    const app = new Hono();
+    const app = new Hono<{ Variables: { tenant: any } }>();
     app.use('*', tenantResolver);
     app.get('/test', (c) => {
-      const tenant = c.get('tenant' as any) as any;
+      const tenant = c.get('tenant');
       return c.json({ tenantId: tenant.tenantId });
     });
 
@@ -29,10 +29,10 @@ describe('Tenant-as-Code & Module Registry', () => {
   });
 
   it('should resolve tenant by domain', async () => {
-    const app = new Hono();
+    const app = new Hono<{ Variables: { tenant: any } }>();
     app.use('*', tenantResolver);
     app.get('/test', (c) => {
-      const tenant = c.get('tenant' as any) as any;
+      const tenant = c.get('tenant');
       return c.json({ tenantId: tenant.tenantId });
     });
 
@@ -46,7 +46,7 @@ describe('Tenant-as-Code & Module Registry', () => {
   });
 
   it('should return 404 for unknown tenant', async () => {
-    const app = new Hono();
+    const app = new Hono<{ Variables: { tenant: any } }>();
     app.use('*', tenantResolver);
     app.get('/test', (c) => c.json({ ok: true }));
 
@@ -57,7 +57,7 @@ describe('Tenant-as-Code & Module Registry', () => {
   });
 
   it('should allow access if module is enabled', async () => {
-    const app = new Hono();
+    const app = new Hono<{ Variables: { tenant: any } }>();
     app.use('*', tenantResolver);
     app.get('/pos', requireModule('retail_pos'), (c) => c.json({ ok: true }));
 
@@ -68,7 +68,7 @@ describe('Tenant-as-Code & Module Registry', () => {
   });
 
   it('should deny access if module is not enabled', async () => {
-    const app = new Hono();
+    const app = new Hono<{ Variables: { tenant: any } }>();
     app.use('*', tenantResolver);
     app.get('/marketplace', requireModule('multi_vendor_marketplace'), (c) => c.json({ ok: true }));
 
@@ -80,10 +80,10 @@ describe('Tenant-as-Code & Module Registry', () => {
   });
 
   it('should support scoped vendor tenants (marketplaceId + tenantId)', async () => {
-    const app = new Hono();
+    const app = new Hono<{ Variables: { tenant: any } }>();
     app.use('*', tenantResolver);
     app.get('/test', (c) => {
-      const tenant = c.get('tenant' as any) as any;
+      const tenant = c.get('tenant');
       return c.json({ 
         tenantId: tenant.tenantId,
         marketplaceId: tenant.marketplaceId
