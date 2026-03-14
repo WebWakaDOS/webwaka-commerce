@@ -1,0 +1,25 @@
+name = "webwaka-commerce-api"
+main = "src/core/sync/server.ts"
+compatibility_date = "2024-03-14"
+
+# Staging Environment
+[env.staging]
+name = "webwaka-commerce-api-staging"
+kv_namespaces = [
+  { binding = "TENANT_CONFIG", id = "staging_tenant_config_id" }
+]
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "webwaka-commerce-staging"
+database_id = "staging_db_id"
+
+# Production Environment
+[env.production]
+name = "webwaka-commerce-api-prod"
+kv_namespaces = [
+  { binding = "TENANT_CONFIG", id = "prod_tenant_config_id" }
+]
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "webwaka-commerce-prod"
+database_id = "prod_db_id"
