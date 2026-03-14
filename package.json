@@ -1,0 +1,29 @@
+{
+  "name": "webwaka-os-v4",
+  "version": "1.0.0",
+  "description": "**Project:** WebWaka Digital Operating System v4   **Status:** Active   **Description:** AI-Native SaaS Operating System and SaaS Generation Platform for Emerging Markets",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260313.1",
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "dexie": "^4.3.0",
+    "hono": "^4.12.8",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  }
+}
