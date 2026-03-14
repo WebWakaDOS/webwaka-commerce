@@ -12,7 +12,10 @@ describe('Tenant-as-Code & Module Registry', () => {
   it('should resolve tenant by X-Tenant-ID header', async () => {
     const app = new Hono();
     app.use('*', tenantResolver);
-    app.get('/test', (c) => c.json({ tenantId: c.get('tenant').tenantId }));
+    app.get('/test', (c) => {
+      const tenant = c.get('tenant') as any;
+      return c.json({ tenantId: tenant.tenantId });
+    });
 
     const req = new Request('http://localhost/test', {
       headers: { 'X-Tenant-ID': 'tnt_123' }
@@ -28,7 +31,10 @@ describe('Tenant-as-Code & Module Registry', () => {
   it('should resolve tenant by domain', async () => {
     const app = new Hono();
     app.use('*', tenantResolver);
-    app.get('/test', (c) => c.json({ tenantId: c.get('tenant').tenantId }));
+    app.get('/test', (c) => {
+      const tenant = c.get('tenant') as any;
+      return c.json({ tenantId: tenant.tenantId });
+    });
 
     const req = new Request('http://shop.example.com/test');
 
@@ -77,7 +83,7 @@ describe('Tenant-as-Code & Module Registry', () => {
     const app = new Hono();
     app.use('*', tenantResolver);
     app.get('/test', (c) => {
-      const tenant = c.get('tenant');
+      const tenant = c.get('tenant') as any;
       return c.json({ 
         tenantId: tenant.tenantId,
         marketplaceId: tenant.marketplaceId

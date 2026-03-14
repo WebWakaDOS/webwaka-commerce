@@ -50,7 +50,7 @@ export class MarketplaceCore {
       if (!acc[item.vendorId]) {
         acc[item.vendorId] = [];
       }
-      acc[item.vendorId].push(item);
+      acc[item.vendorId]!.push(item);
       return acc;
     }, {} as Record<string, MarketplaceCartItem[]>);
 
