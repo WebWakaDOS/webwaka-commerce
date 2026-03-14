@@ -6,20 +6,22 @@ compatibility_date = "2024-03-14"
 [env.staging]
 name = "webwaka-commerce-api-staging"
 kv_namespaces = [
-  { binding = "TENANT_CONFIG", id = "staging_tenant_config_id" }
+  { binding = "TENANT_CONFIG", id = "018ac3a580104b8b8868712919be71bd" },
+  { binding = "EVENTS", id = "ee8c49024b2d43a98c54962dba43f15b" }
 ]
 [[env.staging.d1_databases]]
 binding = "DB"
-database_name = "webwaka-commerce-staging"
-database_id = "staging_db_id"
+database_name = "webwaka-commerce-db-staging"
+database_id = "13ee017f-b140-4255-8c5b-3ae0fca7ce76"
 
 # Production Environment
 [env.production]
 name = "webwaka-commerce-api-prod"
 kv_namespaces = [
-  { binding = "TENANT_CONFIG", id = "prod_tenant_config_id" }
+  { binding = "TENANT_CONFIG", id = "e9a8b3178cf245a7815f4e5bf7e67299" },
+  { binding = "EVENTS", id = "4e0bd5d5233f47dbaff75f8b10b89a8d" }
 ]
 [[env.production.d1_databases]]
 binding = "DB"
-database_name = "webwaka-commerce-prod"
-database_id = "prod_db_id"
+database_name = "webwaka-commerce-db-prod"
+database_id = "1cc45df9-36e5-44d4-8a3b-e8377881c00b"
