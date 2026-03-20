@@ -1,5 +1,5 @@
 name = "webwaka-commerce-api"
-main = "src/core/sync/server.ts"
+main = "src/worker.ts"
 compatibility_date = "2024-03-14"
 
 # Staging Environment
@@ -13,7 +13,7 @@ kv_namespaces = [
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "webwaka-commerce-db-staging"
-database_id = "13ee017f-b140-4255-8c5b-3ae0fca7ce76"
+database_id = "f39bc175-4485-482a-ae87-b1195ead0ef3"
 
 # Production Environment
 [env.production]
