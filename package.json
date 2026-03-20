@@ -1,15 +1,19 @@
 {
-  "name": "webwaka-os-v4",
-  "version": "1.0.0",
+  "name": "webwaka-commerce",
+  "version": "4.0.0",
   "description": "**Project:** WebWaka Digital Operating System v4   **Status:** Active   **Description:** AI-Native SaaS Operating System and SaaS Generation Platform for Emerging Markets",
   "main": "index.js",
   "directories": {
     "doc": "docs"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "tsc",
-    "deploy": "wrangler deploy"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && echo 'TypeCheck passed'",
+    "deploy": "wrangler deploy --env production",
+    "deploy:staging": "wrangler deploy --env staging"
   },
   "keywords": [],
   "author": "",
@@ -19,10 +23,11 @@
     "@types/node": "^25.5.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@vitest/coverage-v8": "^2.0.0",
     "dexie": "^4.3.0",
     "hono": "^4.12.8",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.0"
+    "vitest": "^2.0.0"
   },
   "dependencies": {
     "react": "^19.2.4",
