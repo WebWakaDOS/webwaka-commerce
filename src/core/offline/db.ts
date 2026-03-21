@@ -124,6 +124,59 @@ export async function getPendingMutations(tenantId: string): Promise<CommerceMut
 }
 
 /**
+ * Get count of pending mutations for a tenant (or all tenants)
+ */
+export async function getPendingMutationCount(tenantId?: string): Promise<number> {
+  if (tenantId) {
+    const db = getCommerceDB(tenantId);
+    return db.mutations.where({ tenantId, status: 'PENDING' }).count();
+  }
+  let total = 0;
+  for (const [, dbInstance] of dbCache) {
+    total += await dbInstance.mutations.where({ status: 'PENDING' }).count();
+  }
+  return total;
+}
+
+/**
+ * Add item to offline cart (merge quantity if product already in cart)
+ */
+export async function addToCart(
+  tenantId: string,
+  sessionToken: string,
+  item: Omit<OfflineCartItem, 'id' | 'tenantId' | 'sessionToken' | 'addedAt'>
+): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  const existing = await db.cartItems
+    .where({ tenantId, sessionToken, productId: item.productId })
+    .first();
+  if (existing && existing.id !== undefined) {
+    await db.cartItems.update(existing.id, { quantity: existing.quantity + item.quantity });
+  } else {
+    await db.cartItems.add({ ...item, tenantId, sessionToken, addedAt: Date.now() });
+  }
+}
+
+/**
+ * Get all cart items for a session
+ */
+export async function getCartItems(
+  tenantId: string,
+  sessionToken: string
+): Promise<OfflineCartItem[]> {
+  const db = getCommerceDB(tenantId);
+  return db.cartItems.where({ tenantId, sessionToken }).toArray();
+}
+
+/**
+ * Clear all cart items for a session
+ */
+export async function clearCart(tenantId: string, sessionToken: string): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  await db.cartItems.where({ tenantId, sessionToken }).delete();
+}
+
+/**
  * Mark mutation as synced
  */
 export async function markMutationSynced(id: number): Promise<void> {

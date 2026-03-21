@@ -1,61 +1,92 @@
-const CACHE_NAME = 'webwaka-commerce-v1';
-const ASSETS_TO_CACHE = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  // In a real build, we would inject the bundled JS/CSS here
-];
+/**
+ * WebWaka Commerce Suite — Service Worker v2
+ * Strategy: Cache-First for shell, Network-First for API, Background Sync for mutations
+ * Invariants: Offline-First, PWA-First, Nigeria-First
+ */
+const CACHE_VERSION = 'v2';
+const SHELL_CACHE = `webwaka-commerce-shell-${CACHE_VERSION}`;
+const API_CACHE = `webwaka-commerce-api-${CACHE_VERSION}`;
+const SYNC_TAG = 'webwaka-commerce-sync';
 
-// Install event: Cache static assets
+const SHELL_ASSETS = ['/', '/index.html', '/manifest.json'];
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(ASSETS_TO_CACHE);
-    })
+    caches.open(SHELL_CACHE)
+      .then((cache) => cache.addAll(SHELL_ASSETS).catch(() => {}))
+      .then(() => self.skipWaiting())
   );
 });
 
-// Activate event: Clean up old caches
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames.map((cacheName) => {
-          if (cacheName !== CACHE_NAME) {
-            return caches.delete(cacheName);
-          }
-        })
-      );
-    })
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys
+          .filter((k) => k.startsWith('webwaka-commerce-') && k !== SHELL_CACHE && k !== API_CACHE)
+          .map((k) => caches.delete(k))
+      )
+    ).then(() => self.clients.claim())
   );
 });
 
-// Fetch event: Network first, fallback to cache (Offline First Invariant)
 self.addEventListener('fetch', (event) => {
-  // Skip cross-origin requests
-  if (!event.request.url.startsWith(self.location.origin)) {
-    return;
-  }
+  const { request } = event;
+  const url = new URL(request.url);
+  if (request.method !== 'GET' || !url.protocol.startsWith('http')) return;
 
-  // For API requests (like /sync), we don't cache them here.
-  // The Dexie Mutation Queue handles offline data sync.
-  if (event.request.url.includes('/sync') || event.request.url.includes('/publish')) {
+  if (url.pathname.startsWith('/api/')) {
+    event.respondWith(
+      fetch(request)
+        .then((res) => {
+          if (res.ok) {
+            const clone = res.clone();
+            caches.open(API_CACHE).then((c) => c.put(request, clone));
+          }
+          return res;
+        })
+        .catch(() => caches.match(request))
+    );
     return;
   }
 
   event.respondWith(
-    fetch(event.request).catch(() => {
-      return caches.match(event.request);
+    caches.match(request).then((cached) => {
+      if (cached) return cached;
+      return fetch(request)
+        .then((res) => {
+          if (res.ok) {
+            const clone = res.clone();
+            caches.open(SHELL_CACHE).then((c) => c.put(request, clone));
+          }
+          return res;
+        })
+        .catch(() => {
+          if (request.mode === 'navigate') return caches.match('/index.html');
+        });
     })
   );
 });
 
-// Background Sync event (for the Mutation Queue)
 self.addEventListener('sync', (event) => {
-  if (event.tag === 'webwaka-sync') {
+  if (event.tag === SYNC_TAG) {
     event.waitUntil(
-      // In a real implementation, this would trigger the SyncManager to process the queue
-      console.log('Background sync triggered')
+      self.clients.matchAll({ type: 'window' }).then((clients) =>
+        clients.forEach((c) => c.postMessage({ type: 'SYNC_MUTATIONS' }))
+      )
     );
   }
+});
+
+self.addEventListener('push', (event) => {
+  if (!event.data) return;
+  const data = event.data.json();
+  event.waitUntil(
+    self.registration.showNotification(data.title ?? 'WebWaka Commerce', {
+      body: data.body ?? '',
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-96.png',
+      tag: data.tag ?? 'webwaka-commerce',
+    })
+  );
 });

@@ -12,21 +12,31 @@
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit && echo 'TypeCheck passed'",
+    "build:ui": "vite build",
+    "dev:ui": "vite",
+    "preview:ui": "vite preview",
     "deploy": "wrangler deploy --env production",
-    "deploy:staging": "wrangler deploy --env staging"
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:ui": "wrangler pages deploy dist --project-name webwaka-commerce-ui --branch main",
+    "deploy:ui:staging": "wrangler pages deploy dist --project-name webwaka-commerce-ui --branch develop",
+    "e2e": "playwright test",
+    "e2e:report": "playwright show-report"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260313.1",
+    "@playwright/test": "^1.58.2",
     "@types/node": "^25.5.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.7.0",
     "@vitest/coverage-v8": "^2.0.0",
     "dexie": "^4.3.0",
     "hono": "^4.12.8",
     "typescript": "^5.9.3",
+    "vite": "^6.4.1",
     "vitest": "^2.0.0"
   },
   "dependencies": {
