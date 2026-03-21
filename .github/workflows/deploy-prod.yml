@@ -40,14 +40,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
         
-      - name: Build PWA
-        run: npm run build
-        
-      - name: Deploy to Cloudflare Pages (Production)
-        uses: cloudflare/pages-action@v1
+      - name: Build PWA (Vite)
+        run: npm run build:ui
+        env:
+          VITE_API_BASE: https://webwaka-commerce-api-prod.webwaka.workers.dev
+          VITE_TENANT_ID: tnt_demo
+
+      - name: Deploy PWA to Cloudflare Pages (Production)
+        uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          apiToken: ${{ secrets.CLOUDFLARE_PAGES_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: webwaka-commerce
-          directory: dist
-          branch: main
+          command: pages deploy dist --project-name webwaka-commerce-ui --branch main
