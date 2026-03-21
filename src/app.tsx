@@ -613,11 +613,13 @@ export function CommerceApp() {
   const [activeModule, setActiveModule] = useState<Module>('pos');
 
   return (
-    <div style={{
-      display: 'flex', flexDirection: 'column', height: '100vh',
-      maxWidth: '600px', margin: '0 auto', backgroundColor: '#f9fafb',
-      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-    }}>
+    <div
+      data-testid="commerce-app"
+      style={{
+        display: 'flex', flexDirection: 'column', height: '100vh',
+        maxWidth: '600px', margin: '0 auto', backgroundColor: '#f9fafb',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      }}>
       {/* Status Bar */}
       <StatusBar isOnline={isOnline} pendingCount={pendingCount} lang={lang} onChangeLang={changeLang} />
 

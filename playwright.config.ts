@@ -15,17 +15,24 @@ export default defineConfig({
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
     video: 'off',
-    // Mobile-First: test on iPhone 12 viewport
-    ...devices['iPhone 12'],
+    browserName: 'chromium',
   },
   projects: [
     {
+      // Mobile-First: Chromium with iPhone 12 viewport emulation
       name: 'mobile-chrome',
-      use: { ...devices['iPhone 12'], channel: 'chromium' },
+      use: {
+        browserName: 'chromium',
+        viewport: { width: 390, height: 844 },
+        deviceScaleFactor: 3,
+        isMobile: true,
+        hasTouch: true,
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
+      },
     },
     {
       name: 'desktop-chrome',
-      use: { ...devices['Desktop Chrome'] },
+      use: { browserName: 'chromium', viewport: { width: 1280, height: 720 } },
     },
   ],
   webServer: {
