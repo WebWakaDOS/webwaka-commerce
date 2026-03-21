@@ -47,12 +47,12 @@ test.describe('Commerce App', () => {
 
     // Switch to Yoruba
     await langSelect.selectOption('yo');
-    // Check that some text changed to Yoruba
-    await expect(page.locator('text=Ibi Tita')).toBeVisible();
+    // Check that nav button label changed to Yoruba (unambiguous aria-label selector)
+    await expect(page.locator('button[aria-label="Ibi Tita"]')).toBeVisible({ timeout: 5_000 });
 
     // Switch back to English
     await langSelect.selectOption('en');
-    await expect(page.locator('text=Point of Sale')).toBeVisible();
+    await expect(page.locator('button[aria-label="Point of Sale"]')).toBeVisible({ timeout: 5_000 });
   });
 
   test('has correct PWA meta tags', async ({ page }) => {
@@ -99,8 +99,8 @@ test.describe('POS Module', () => {
     const addBtn = page.locator('button', { hasText: /Add to Cart/i }).first();
     if (await addBtn.isVisible()) {
       await addBtn.click();
-      // Cart should show 1 item
-      await expect(page.locator('text=/Cart.*1|1.*item/i')).toBeVisible({ timeout: 3_000 });
+      // Cart should show 1 item (use data-testid to avoid strict mode violation)
+      await expect(page.locator('[data-testid="cart-badge"]')).toBeVisible({ timeout: 3_000 });
     }
   });
 

@@ -288,7 +288,7 @@ function POSModule({ tenantId, t, isOnline }: { tenantId: string; t: ReturnType<
           borderTop: '2px solid #e5e7eb', backgroundColor: '#f9fafb',
           maxHeight: '40vh', overflowY: 'auto', padding: '12px',
         }}>
-          <div style={{ fontWeight: 700, marginBottom: '8px' }}>
+          <div data-testid="cart-badge" style={{ fontWeight: 700, marginBottom: '8px' }}>
             {t.pos_cart} ({cart.length})
           </div>
           {cart.map(item => (
