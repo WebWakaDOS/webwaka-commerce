@@ -87,7 +87,7 @@ This document serves as the single source of truth for all 67 Agency Agent Skill
 
 ## Brand Guardian
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-brand-guardian](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-brand-guardian)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-brand-guardian](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-brand-guardian)
 
 ### Skill Content
 
@@ -416,7 +416,7 @@ You're successful when:
 
 ## Image Prompt Engineer
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-image-prompt-engineer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-image-prompt-engineer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-image-prompt-engineer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-image-prompt-engineer)
 
 ### Skill Content
 
@@ -660,7 +660,7 @@ inspired by [photographer], authentic and unretouched aesthetic
 
 ## Inclusive Visuals Specialist
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-inclusive-visuals-specialist](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-inclusive-visuals-specialist)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-inclusive-visuals-specialist](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-inclusive-visuals-specialist)
 
 ### Skill Content
 
@@ -739,7 +739,7 @@ You continuously update your knowledge of:
 
 ## Ui Designer
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-ui-designer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-ui-designer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-ui-designer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-ui-designer)
 
 ### Skill Content
 
@@ -1129,7 +1129,7 @@ You're successful when:
 
 ## Ux Architect
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-ux-architect](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-ux-architect)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-ux-architect](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-ux-architect)
 
 ### Skill Content
 
@@ -1605,7 +1605,7 @@ You're successful when:
 
 ## Ux Researcher
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-ux-researcher](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-ux-researcher)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-ux-researcher](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-ux-researcher)
 
 ### Skill Content
 
@@ -1941,7 +1941,7 @@ You're successful when:
 
 ## Visual Storyteller
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-visual-storyteller](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-visual-storyteller)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-visual-storyteller](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-visual-storyteller)
 
 ### Skill Content
 
@@ -2097,7 +2097,7 @@ You're successful when:
 
 ## Whimsy Injector
 **Division:** Design
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-whimsy-injector](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-design-whimsy-injector)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-whimsy-injector](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-design-whimsy-injector)
 
 ### Skill Content
 
@@ -2544,7 +2544,7 @@ You're successful when:
 
 ## Ai Engineer
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-ai-engineer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-ai-engineer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-ai-engineer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-ai-engineer)
 
 ### Skill Content
 
@@ -2697,7 +2697,7 @@ You're successful when:
 
 ## Autonomous Optimization Architect
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-autonomous-optimization-architect](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-autonomous-optimization-architect)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-autonomous-optimization-architect](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-autonomous-optimization-architect)
 
 ### Skill Content
 
@@ -2812,7 +2812,7 @@ This agent fills a critical gap between several existing `agency-agents` roles. 
 
 ## Backend Architect
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-backend-architect](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-backend-architect)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-backend-architect](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-backend-architect)
 
 ### Skill Content
 
@@ -3054,7 +3054,7 @@ You're successful when:
 
 ## Data Engineer
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-data-engineer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-data-engineer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-data-engineer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-data-engineer)
 
 ### Skill Content
 
@@ -3368,7 +3368,7 @@ You're successful when:
 
 ## Devops Automator
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-devops-automator](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-devops-automator)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-devops-automator](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-devops-automator)
 
 ### Skill Content
 
@@ -3751,7 +3751,7 @@ You're successful when:
 
 ## Frontend Developer
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-frontend-developer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-frontend-developer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-frontend-developer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-frontend-developer)
 
 ### Skill Content
 
@@ -3983,7 +3983,7 @@ You're successful when:
 
 ## Mobile App Builder
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-mobile-app-builder](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-mobile-app-builder)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-mobile-app-builder](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-mobile-app-builder)
 
 ### Skill Content
 
@@ -4483,7 +4483,7 @@ You're successful when:
 
 ## Rapid Prototyper
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-rapid-prototyper](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-rapid-prototyper)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-rapid-prototyper](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-rapid-prototyper)
 
 ### Skill Content
 
@@ -4952,7 +4952,7 @@ You're successful when:
 
 ## Security Engineer
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-security-engineer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-security-engineer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-security-engineer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-security-engineer)
 
 ### Skill Content
 
@@ -5237,7 +5237,7 @@ You're successful when:
 
 ## Senior Developer
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-senior-developer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-senior-developer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-senior-developer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-senior-developer)
 
 ### Skill Content
 
@@ -5421,7 +5421,7 @@ Remember and build on:
 
 ## Technical Writer
 **Division:** Engineering
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-technical-writer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-engineering-technical-writer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-technical-writer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-engineering-technical-writer)
 
 ### Skill Content
 
@@ -5824,7 +5824,7 @@ You're successful when:
 
 ## App Store Optimizer
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-app-store-optimizer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-app-store-optimizer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-app-store-optimizer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-app-store-optimizer)
 
 ### Skill Content
 
@@ -6152,7 +6152,7 @@ You're successful when:
 
 ## Content Creator
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-content-creator](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-content-creator)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-content-creator](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-content-creator)
 
 ### Skill Content
 
@@ -6213,7 +6213,7 @@ Use this agent when you need:
 
 ## Growth Hacker
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-growth-hacker](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-growth-hacker)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-growth-hacker](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-growth-hacker)
 
 ### Skill Content
 
@@ -6274,7 +6274,7 @@ Use this agent when you need:
 
 ## Instagram Curator
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-instagram-curator](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-instagram-curator)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-instagram-curator](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-instagram-curator)
 
 ### Skill Content
 
@@ -6394,7 +6394,7 @@ Remember: You're not just creating Instagram content - you're building a visual 
 
 ## Reddit Community Builder
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-reddit-community-builder](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-reddit-community-builder)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-reddit-community-builder](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-reddit-community-builder)
 
 ### Skill Content
 
@@ -6524,7 +6524,7 @@ Remember: You're not marketing on Reddit - you're becoming a valued community me
 
 ## Social Media Strategist
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-social-media-strategist](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-social-media-strategist)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-social-media-strategist](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-social-media-strategist)
 
 ### Skill Content
 
@@ -6657,7 +6657,7 @@ Use this agent when you need:
 
 ## Tiktok Strategist
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-tiktok-strategist](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-tiktok-strategist)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-tiktok-strategist](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-tiktok-strategist)
 
 ### Skill Content
 
@@ -6789,7 +6789,7 @@ Remember: You're not just creating TikTok content - you're engineering viral mom
 
 ## Twitter Engager
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-twitter-engager](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-twitter-engager)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-twitter-engager](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-twitter-engager)
 
 ### Skill Content
 
@@ -6922,7 +6922,7 @@ Remember: You're not just tweeting - you're building a real-time brand presence 
 
 ## Wechat Official Account
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-wechat-official-account](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-wechat-official-account)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-wechat-official-account](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-wechat-official-account)
 
 ### Skill Content
 
@@ -7075,7 +7075,7 @@ Remember: WeChat Official Account is China's most intimate business communicatio
 
 ## Zhihu Strategist
 **Division:** Marketing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-zhihu-strategist](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-marketing-zhihu-strategist)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-zhihu-strategist](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-marketing-zhihu-strategist)
 
 ### Skill Content
 
@@ -7247,7 +7247,7 @@ Remember: On Zhihu, you're building authority through authentic expertise-sharin
 
 ## Behavioral Nudge Engine
 **Division:** Product
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-behavioral-nudge-engine](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-behavioral-nudge-engine)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-behavioral-nudge-engine](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-behavioral-nudge-engine)
 
 ### Skill Content
 
@@ -7335,7 +7335,7 @@ You continuously update your knowledge of:
 
 ## Feedback Synthesizer
 **Division:** Product
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-feedback-synthesizer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-feedback-synthesizer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-feedback-synthesizer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-feedback-synthesizer)
 
 ### Skill Content
 
@@ -7461,7 +7461,7 @@ Use this agent when you need:
 
 ## Sprint Prioritizer
 **Division:** Product
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-sprint-prioritizer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-sprint-prioritizer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-sprint-prioritizer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-sprint-prioritizer)
 
 ### Skill Content
 
@@ -7622,7 +7622,7 @@ Use this agent when you need:
 
 ## Trend Researcher
 **Division:** Product
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-trend-researcher](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-product-trend-researcher)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-trend-researcher](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-product-trend-researcher)
 
 ### Skill Content
 
@@ -7790,7 +7790,7 @@ Use this agent when you need:
 
 ## Experiment Tracker
 **Division:** Project Management
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-experiment-tracker](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-experiment-tracker)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-experiment-tracker](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-experiment-tracker)
 
 ### Skill Content
 
@@ -7995,7 +7995,7 @@ You're successful when:
 
 ## Project Manager Senior
 **Division:** Project Management
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-project-manager-senior](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-project-manager-senior)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-project-manager-senior](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-project-manager-senior)
 
 ### Skill Content
 
@@ -8138,7 +8138,7 @@ Your goal is to become the best PM for web development projects by learning from
 
 ## Project Shepherd
 **Division:** Project Management
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-project-shepherd](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-project-shepherd)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-project-shepherd](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-project-shepherd)
 
 ### Skill Content
 
@@ -8339,7 +8339,7 @@ You're successful when:
 
 ## Studio Operations
 **Division:** Project Management
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-studio-operations](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-studio-operations)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-studio-operations](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-studio-operations)
 
 ### Skill Content
 
@@ -8546,7 +8546,7 @@ You're successful when:
 
 ## Studio Producer
 **Division:** Project Management
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-studio-producer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-project-management-studio-producer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-studio-producer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-project-management-studio-producer)
 
 ### Skill Content
 
@@ -8758,7 +8758,7 @@ You're successful when:
 
 ## Macos Spatial Metal Engineer
 **Division:** Spatial Computing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-macos-spatial-metal-engineer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-macos-spatial-metal-engineer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-macos-spatial-metal-engineer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-macos-spatial-metal-engineer)
 
 ### Skill Content
 
@@ -9102,7 +9102,7 @@ You're successful when:
 
 ## Terminal Integration Specialist
 **Division:** Spatial Computing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-terminal-integration-specialist](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-terminal-integration-specialist)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-terminal-integration-specialist](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-terminal-integration-specialist)
 
 ### Skill Content
 
@@ -9179,7 +9179,7 @@ Focuses on creating robust, performant terminal experiences that feel native to 
 
 ## Visionos Spatial Engineer
 **Division:** Spatial Computing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-visionos-spatial-engineer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-visionos-spatial-engineer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-visionos-spatial-engineer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-visionos-spatial-engineer)
 
 ### Skill Content
 
@@ -9240,7 +9240,7 @@ Focuses on leveraging visionOS 26's spatial computing capabilities to create imm
 
 ## Xr Cockpit Interaction Specialist
 **Division:** Spatial Computing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-xr-cockpit-interaction-specialist](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-xr-cockpit-interaction-specialist)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-xr-cockpit-interaction-specialist](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-xr-cockpit-interaction-specialist)
 
 ### Skill Content
 
@@ -9280,7 +9280,7 @@ You are **XR Cockpit Interaction Specialist**, focused exclusively on the design
 
 ## Xr Immersive Developer
 **Division:** Spatial Computing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-xr-immersive-developer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-xr-immersive-developer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-xr-immersive-developer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-xr-immersive-developer)
 
 ### Skill Content
 
@@ -9320,7 +9320,7 @@ You are **XR Immersive Developer**, a deeply technical engineer who builds immer
 
 ## Xr Interface Architect
 **Division:** Spatial Computing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-xr-interface-architect](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-spatial-computing-xr-interface-architect)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-xr-interface-architect](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-spatial-computing-xr-interface-architect)
 
 ### Skill Content
 
@@ -9362,7 +9362,7 @@ You are **XR Interface Architect**, a UX/UI designer specialized in crafting int
 
 ## Agentic Identity Trust
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-agentic-identity-trust](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-agentic-identity-trust)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-agentic-identity-trust](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-agentic-identity-trust)
 
 ### Skill Content
 
@@ -9739,7 +9739,7 @@ You're successful when:
 
 ## Agents Orchestrator
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-agents-orchestrator](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-agents-orchestrator)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-agents-orchestrator](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-agents-orchestrator)
 
 ### Skill Content
 
@@ -10113,7 +10113,7 @@ Please spawn an agents-orchestrator to execute complete development pipeline for
 
 ## Cultural Intelligence Strategist
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-cultural-intelligence-strategist](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-cultural-intelligence-strategist)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-cultural-intelligence-strategist](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-cultural-intelligence-strategist)
 
 ### Skill Content
 
@@ -10209,7 +10209,7 @@ You continuously update your knowledge of:
 
 ## Data Analytics Reporter
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-data-analytics-reporter](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-data-analytics-reporter)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-data-analytics-reporter](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-data-analytics-reporter)
 
 ### Skill Content
 
@@ -10270,7 +10270,7 @@ Use this agent when you need:
 
 ## Data Consolidation Agent
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-data-consolidation-agent](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-data-consolidation-agent)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-data-consolidation-agent](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-data-consolidation-agent)
 
 ### Skill Content
 
@@ -10338,7 +10338,7 @@ Aggregate and consolidate sales metrics from all territories, representatives, a
 
 ## Developer Advocate
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-developer-advocate](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-developer-advocate)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-developer-advocate](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-developer-advocate)
 
 ### Skill Content
 
@@ -10663,7 +10663,7 @@ You're successful when:
 
 ## Lsp Index Engineer
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-lsp-index-engineer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-lsp-index-engineer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-lsp-index-engineer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-lsp-index-engineer)
 
 ### Skill Content
 
@@ -10984,7 +10984,7 @@ You're successful when:
 
 ## Report Distribution Agent
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-report-distribution-agent](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-report-distribution-agent)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-report-distribution-agent](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-report-distribution-agent)
 
 ### Skill Content
 
@@ -11057,7 +11057,7 @@ Automate the distribution of consolidated sales reports to representatives based
 
 ## Sales Data Extraction Agent
 **Division:** Specialized
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-sales-data-extraction-agent](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-specialized-sales-data-extraction-agent)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-sales-data-extraction-agent](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-specialized-sales-data-extraction-agent)
 
 ### Skill Content
 
@@ -11134,7 +11134,7 @@ Monitor designated Excel file directories for new or updated sales reports. Extr
 
 ## Analytics Reporter
 **Division:** Support
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-analytics-reporter](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-analytics-reporter)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-analytics-reporter](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-analytics-reporter)
 
 ### Skill Content
 
@@ -11506,7 +11506,7 @@ You're successful when:
 
 ## Executive Summary Generator
 **Division:** Support
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-executive-summary-generator](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-executive-summary-generator)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-executive-summary-generator](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-executive-summary-generator)
 
 ### Skill Content
 
@@ -11726,7 +11726,7 @@ You're successful when:
 
 ## Finance Tracker
 **Division:** Support
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-finance-tracker](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-finance-tracker)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-finance-tracker](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-finance-tracker)
 
 ### Skill Content
 
@@ -12175,7 +12175,7 @@ You're successful when:
 
 ## Infrastructure Maintainer
 **Division:** Support
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-infrastructure-maintainer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-infrastructure-maintainer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-infrastructure-maintainer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-infrastructure-maintainer)
 
 ### Skill Content
 
@@ -12800,7 +12800,7 @@ You're successful when:
 
 ## Legal Compliance Checker
 **Division:** Support
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-legal-compliance-checker](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-legal-compliance-checker)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-legal-compliance-checker](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-legal-compliance-checker)
 
 ### Skill Content
 
@@ -13395,7 +13395,7 @@ You're successful when:
 
 ## Support Responder
 **Division:** Support
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-support-responder](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-support-support-responder)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-support-responder](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-support-support-responder)
 
 ### Skill Content
 
@@ -13989,7 +13989,7 @@ You're successful when:
 
 ## Accessibility Auditor
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-accessibility-auditor](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-accessibility-auditor)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-accessibility-auditor](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-accessibility-auditor)
 
 ### Skill Content
 
@@ -14313,7 +14313,7 @@ You're successful when:
 
 ## Api Tester
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-api-tester](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-api-tester)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-api-tester](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-api-tester)
 
 ### Skill Content
 
@@ -14626,7 +14626,7 @@ You're successful when:
 
 ## Evidence Collector
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-evidence-collector](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-evidence-collector)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-evidence-collector](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-evidence-collector)
 
 ### Skill Content
 
@@ -14844,7 +14844,7 @@ Remember: Your job is to be the reality check that prevents broken websites from
 
 ## Performance Benchmarker
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-performance-benchmarker](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-performance-benchmarker)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-performance-benchmarker](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-performance-benchmarker)
 
 ### Skill Content
 
@@ -15119,7 +15119,7 @@ You're successful when:
 
 ## Reality Checker
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-reality-checker](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-reality-checker)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-reality-checker](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-reality-checker)
 
 ### Skill Content
 
@@ -15365,7 +15365,7 @@ Remember: You're the final reality check. Your job is to ensure only truly ready
 
 ## Test Results Analyzer
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-test-results-analyzer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-test-results-analyzer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-test-results-analyzer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-test-results-analyzer)
 
 ### Skill Content
 
@@ -15677,7 +15677,7 @@ You're successful when:
 
 ## Tool Evaluator
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-tool-evaluator](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-tool-evaluator)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-tool-evaluator](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-tool-evaluator)
 
 ### Skill Content
 
@@ -16078,7 +16078,7 @@ You're successful when:
 
 ## Workflow Optimizer
 **Division:** Testing
-**GitHub Link:** [https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-workflow-optimizer](https://github.com/WebWakaHub/manus-agency-skills/tree/main/agency-testing-workflow-optimizer)
+**GitHub Link:** [https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-workflow-optimizer](https://github.com/WebWakaDOS/manus-agency-skills/tree/main/agency-testing-workflow-optimizer)
 
 ### Skill Content
 
