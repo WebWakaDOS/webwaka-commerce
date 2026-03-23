@@ -4,13 +4,14 @@
  * Invariants: Nigeria-First (Paystack), Offline-First (sync mutations), Multi-tenancy
  */
 import { Hono } from 'hono';
+import { getTenantId } from '@webwaka/core';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
 
 // Tenant middleware
 app.use('*', async (c, next) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (!tenantId) {
     return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   }
@@ -20,7 +21,7 @@ app.use('*', async (c, next) => {
 
 // GET /api/pos/ - List products for POS
 app.get('/', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       'SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
@@ -33,7 +34,7 @@ app.get('/', async (c) => {
 
 // GET /api/pos/products - List products
 app.get('/products', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const category = c.req.query('category');
   const search = c.req.query('search');
   try {
@@ -51,7 +52,7 @@ app.get('/products', async (c) => {
 
 // POST /api/pos/products - Create product
 app.post('/products', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     sku: string; name: string; price: number; quantity: number;
     description?: string; category?: string; barcode?: string;
@@ -72,7 +73,7 @@ app.post('/products', async (c) => {
 
 // GET /api/pos/products/:id - Get product
 app.get('/products/:id', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const id = c.req.param('id');
   try {
     const product = await c.env.DB.prepare(
@@ -87,7 +88,7 @@ app.get('/products/:id', async (c) => {
 
 // PATCH /api/pos/products/:id - Update product
 app.patch('/products/:id', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const id = c.req.param('id');
   const body = await c.req.json<Record<string, unknown>>();
   const now = Date.now();
@@ -108,7 +109,7 @@ app.patch('/products/:id', async (c) => {
 
 // POST /api/pos/checkout - Process POS sale
 app.post('/checkout', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; quantity: number; price: number; name: string }>;
     payment_method: string;
@@ -135,7 +136,7 @@ app.post('/checkout', async (c) => {
 
 // GET /api/pos/orders - List POS orders
 app.get('/orders', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
@@ -148,7 +149,7 @@ app.get('/orders', async (c) => {
 
 // POST /api/pos/sync - Offline sync endpoint
 app.post('/sync', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ mutations: Array<{ entity_type: string; entity_id: string; action: string; payload: unknown; version: number }> }>();
   const now = Date.now();
   const applied: string[] = [];
@@ -174,7 +175,7 @@ app.post('/sync', async (c) => {
 
 // GET /api/pos/dashboard - Sales summary
 app.get('/dashboard', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const todayTs = today.getTime();
