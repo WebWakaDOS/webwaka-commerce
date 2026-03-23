@@ -35,7 +35,9 @@ export default defineConfig({
     'import.meta.env.VITE_TENANT_ID': JSON.stringify(process.env.VITE_TENANT_ID ?? 'tnt_demo'),
   },
   server: {
-    port: 5173,
+    port: 5000,
+    host: '0.0.0.0',
+    allowedHosts: true,
     proxy: {
       '/api': {
         target: 'https://webwaka-commerce-api-staging.webwaka.workers.dev',
