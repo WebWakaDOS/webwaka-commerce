@@ -4,7 +4,7 @@
  * Invariants: Nigeria-First (Paystack), Offline-First (sync mutations), Multi-tenancy
  */
 import { Hono } from 'hono';
-import { getTenantId } from '@webwaka/core';
+import { getTenantId, requireRole } from '@webwaka/core';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -51,7 +51,7 @@ app.get('/products', async (c) => {
 });
 
 // POST /api/pos/products - Create product
-app.post('/products', async (c) => {
+app.post('/products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     sku: string; name: string; price: number; quantity: number;
@@ -87,7 +87,7 @@ app.get('/products/:id', async (c) => {
 });
 
 // PATCH /api/pos/products/:id - Update product
-app.patch('/products/:id', async (c) => {
+app.patch('/products/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const id = c.req.param('id');
   const body = await c.req.json<Record<string, unknown>>();
@@ -108,7 +108,7 @@ app.patch('/products/:id', async (c) => {
 });
 
 // POST /api/pos/checkout - Process POS sale
-app.post('/checkout', async (c) => {
+app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; quantity: number; price: number; name: string }>;
@@ -135,7 +135,7 @@ app.post('/checkout', async (c) => {
 });
 
 // GET /api/pos/orders - List POS orders
-app.get('/orders', async (c) => {
+app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
@@ -148,7 +148,7 @@ app.get('/orders', async (c) => {
 });
 
 // POST /api/pos/sync - Offline sync endpoint
-app.post('/sync', async (c) => {
+app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{ mutations: Array<{ entity_type: string; entity_id: string; action: string; payload: unknown; version: number }> }>();
   const now = Date.now();
@@ -174,7 +174,7 @@ app.post('/sync', async (c) => {
 });
 
 // GET /api/pos/dashboard - Sales summary
-app.get('/dashboard', async (c) => {
+app.get('/dashboard', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   try {
     const today = new Date(); today.setHours(0, 0, 0, 0);
