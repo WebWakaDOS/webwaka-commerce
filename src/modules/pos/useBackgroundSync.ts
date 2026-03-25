@@ -1,0 +1,91 @@
+/**
+ * useBackgroundSync — flushes pending Dexie mutations to the server (Phase 2)
+ * Triggers on component mount (if online) and on every `online` event.
+ * Uses the existing POST /api/pos/sync endpoint (idempotent).
+ */
+import { useEffect, useCallback, useRef } from 'react';
+
+interface SyncResult {
+  applied: string[];
+  skipped: string[];
+  failed: string[];
+  synced_at: number;
+}
+
+async function flushPendingMutations(tenantId: string): Promise<SyncResult | null> {
+  try {
+    // Lazy import so this hook is safe in non-IndexedDB environments
+    const { getCommerceDB } = await import('../../core/offline/db');
+    const db = getCommerceDB(tenantId);
+    const pending = await db.mutations.where({ tenantId, status: 'PENDING' }).toArray();
+
+    if (pending.length === 0) return null;
+
+    const res = await fetch('/api/pos/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+      body: JSON.stringify({
+        mutations: pending.map((m) => ({
+          entity_type: m.entityType,
+          entity_id: m.entityId,
+          action: m.action,
+          payload: m.payload,
+          version: m.version,
+        })),
+      }),
+    });
+
+    if (!res.ok) return null;
+
+    const data = (await res.json()) as { success: boolean; data: SyncResult };
+    if (!data.success) return null;
+
+    // Mark successfully applied mutations as SYNCED
+    for (const m of pending) {
+      if (m.id !== undefined && data.data.applied.some((id) => id === m.entityId)) {
+        await db.mutations.update(m.id, { status: 'SYNCED' });
+      } else if (m.id !== undefined && data.data.failed.some((id) => id === m.entityId)) {
+        await db.mutations.update(m.id, { status: 'FAILED', retryCount: (m.retryCount ?? 0) + 1 });
+      }
+    }
+
+    return data.data;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+export function useBackgroundSync(
+  tenantId: string,
+  onSynced?: (result: SyncResult) => void,
+) {
+  // Prevent overlapping sync calls
+  const syncInProgress = useRef(false);
+
+  const sync = useCallback(async () => {
+    if (syncInProgress.current) return;
+    syncInProgress.current = true;
+    try {
+      const result = await flushPendingMutations(tenantId);
+      if (result && result.applied.length > 0) {
+        onSynced?.(result);
+      }
+    } finally {
+      syncInProgress.current = false;
+    }
+  }, [tenantId, onSynced]);
+
+  useEffect(() => {
+    // Flush on mount if online
+    if (typeof navigator !== 'undefined' && navigator.onLine) {
+      sync();
+    }
+
+    const handleOnline = () => sync();
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, [sync]);
+
+  return { flush: sync };
+}
