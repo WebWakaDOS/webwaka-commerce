@@ -2,6 +2,10 @@ name = "webwaka-commerce-api"
 main = "src/worker.ts"
 compatibility_date = "2024-03-14"
 
+# Cron Triggers — Abandoned Cart WhatsApp Nudge (hourly)
+[triggers]
+crons = ["0 * * * *"]
+
 # Staging Environment
 [env.staging]
 name = "webwaka-commerce-api-staging"
