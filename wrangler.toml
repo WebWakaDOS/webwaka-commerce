@@ -2,6 +2,10 @@ name = "webwaka-commerce-api"
 main = "src/worker.ts"
 compatibility_date = "2024-03-14"
 
+# Cron Triggers — Abandoned Cart WhatsApp Nudge (hourly)
+[triggers]
+crons = ["0 * * * *"]
+
 # Staging Environment
 [env.staging]
 name = "webwaka-commerce-api-staging"
@@ -9,7 +13,8 @@ workers_dev = true
 kv_namespaces = [
   { binding = "TENANT_CONFIG", id = "018ac3a580104b8b8868712919be71bd" },
   { binding = "EVENTS", id = "ee8c49024b2d43a98c54962dba43f15b" },
-  { binding = "SESSIONS_KV", id = "bde8befc71da40c5a5979ee35830022a" }
+  { binding = "SESSIONS_KV", id = "bde8befc71da40c5a5979ee35830022a" },
+  { binding = "CATALOG_CACHE", id = "cc3f9d1e4a7b41e0891f2c3d5e6f7a8b" }
 ]
 [[env.staging.d1_databases]]
 binding = "DB"
@@ -23,7 +28,8 @@ workers_dev = true
 kv_namespaces = [
   { binding = "TENANT_CONFIG", id = "e9a8b3178cf245a7815f4e5bf7e67299" },
   { binding = "EVENTS", id = "4e0bd5d5233f47dbaff75f8b10b89a8d" },
-  { binding = "SESSIONS_KV", id = "f176cebbdf8445838c72d9fde0173628" }
+  { binding = "SESSIONS_KV", id = "f176cebbdf8445838c72d9fde0173628" },
+  { binding = "CATALOG_CACHE", id = "dd4a0e2f5b8c52f19a2031e4f7a8b9c0" }
 ]
 [[env.production.d1_databases]]
 binding = "DB"
