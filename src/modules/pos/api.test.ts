@@ -417,6 +417,7 @@ describe('COM-1: POS API', () => {
           { product_id: 'prod_2', quantity: 1, price: 30000, name: 'Item B' },
         ],
         payment_method: 'card',
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
@@ -427,6 +428,7 @@ describe('COM-1: POS API', () => {
       const req = makeRequest('POST', '/checkout', {
         items: [{ product_id: 'prod_1', quantity: 1, price: 100000, name: 'Item' }],
         payment_method: 'cash', discount: 10000,
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
@@ -596,6 +598,7 @@ describe('COM-1: POS API', () => {
       const req = makeRequest('POST', '/checkout', {
         line_items: [{ product_id: 'prod_1', quantity: 1, price: 100000, name: 'Item' }],
         payments: [{ method: 'cash', amount_kobo: 100000 }],
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(201);
@@ -615,6 +618,7 @@ describe('COM-1: POS API', () => {
           { method: 'cash', amount_kobo: 60000 },
           { method: 'card', amount_kobo: 40000 },
         ],
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(201);
@@ -627,6 +631,7 @@ describe('COM-1: POS API', () => {
       const req = makeRequest('POST', '/checkout', {
         line_items: [{ product_id: 'prod_1', quantity: 1, price: 50000, name: 'Item' }],
         payments: [{ method: 'card', amount_kobo: 50000 }],
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
@@ -637,6 +642,7 @@ describe('COM-1: POS API', () => {
       const req = makeRequest('POST', '/checkout', {
         line_items: [{ product_id: 'prod_1', quantity: 1, price: 75000, name: 'Item' }],
         payments: [{ method: 'transfer', amount_kobo: 75000 }],
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
@@ -674,6 +680,7 @@ describe('COM-1: POS API', () => {
       const req = makeRequest('POST', '/checkout', {
         line_items: [{ product_id: 'prod_1', quantity: 1, price: 50000, name: 'Item' }],
         payments: [{ method: 'card', amount_kobo: 50000, reference: 'EXISTING_REF_123' }],
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
@@ -690,6 +697,7 @@ describe('COM-1: POS API', () => {
           line_items: [{ product_id: 'prod_1', quantity: 1, price: 10000, name: 'X' }],
           payments: [{ method: 'cash', amount_kobo: 10000 }],
           session_id: 'sess_ratelimit_test',
+          include_vat: false,
         });
       for (let i = 0; i < 10; i++) {
         mockDb.batch
@@ -706,6 +714,7 @@ describe('COM-1: POS API', () => {
       const req = makeRequest('POST', '/checkout', {
         line_items: [{ product_id: 'prod_1', quantity: 1, price: 10000, name: 'X' }],
         payments: [{ method: 'cash', amount_kobo: 10000 }],
+        include_vat: false,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(201);
@@ -720,6 +729,7 @@ describe('COM-1: POS API', () => {
           line_items: [{ product_id: 'prod_1', quantity: 1, price: 10000, name: 'X' }],
           payments: [{ method: 'cash', amount_kobo: 10000 }],
           session_id: 'sess_under_limit',
+          include_vat: false,
         });
         const res = await posRouter.fetch(req, mockEnv as any);
         expect(res.status).toBe(201);

@@ -188,6 +188,7 @@ describe('Payment Splits — Edge Cases', () => {
         { method: 'cash', amount_kobo: 30000 },
         { method: 'transfer', amount_kobo: 70000 },
       ],
+      include_vat: false,
     }), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
@@ -202,6 +203,7 @@ describe('Payment Splits — Edge Cases', () => {
     const res = await posRouter.fetch(req('POST', '/checkout', {
       line_items: [{ product_id: 'prod_1', quantity: 1, price: 50000, name: 'Item' }],
       payments: [{ method: 'transfer', amount_kobo: 50000 }],
+      include_vat: false,
     }), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
@@ -212,6 +214,7 @@ describe('Payment Splits — Edge Cases', () => {
     const res = await posRouter.fetch(req('POST', '/checkout', {
       line_items: [{ product_id: 'prod_1', quantity: 1, price: 80000, name: 'X' }],
       payments: [{ method: 'agency_banking', amount_kobo: 80000 }],
+      include_vat: false,
     }), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
@@ -222,6 +225,7 @@ describe('Payment Splits — Edge Cases', () => {
     const res = await posRouter.fetch(req('POST', '/checkout', {
       line_items: [{ product_id: 'prod_1', quantity: 1, price: 30000, name: 'X' }],
       payments: [{ method: 'cash', amount_kobo: 30000 }],
+      include_vat: false,
     }), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
@@ -240,6 +244,7 @@ describe('Payment Splits — Edge Cases', () => {
         { method: 'card', amount_kobo: 40000 },
         { method: 'transfer', amount_kobo: 20000 },
       ],
+      include_vat: false,
     }), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
@@ -255,6 +260,7 @@ describe('Payment Splits — Edge Cases', () => {
         { method: 'cash', amount_kobo: 0 },
         { method: 'card', amount_kobo: 50000 },
       ],
+      include_vat: false,
     }), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
@@ -282,6 +288,7 @@ describe('Payment Splits — Edge Cases', () => {
       items: [{ product_id: 'prod_1', quantity: 1, price: 100000, name: 'X' }],
       payment_method: 'cash',
       discount: 10000,
+      include_vat: false,
     }), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
@@ -316,6 +323,7 @@ describe('Payment Splits — Edge Cases', () => {
       line_items: [{ product_id: 'prod_1', quantity: 1, price: 10000, name: 'X' }],
       payments: [{ method: 'cash', amount_kobo: 10000 }],
       session_id: 'sess_shared',
+      include_vat: false,
     }, 'tnt_B'), mockEnv as any);
     expect(resB.status).toBe(201);
   });

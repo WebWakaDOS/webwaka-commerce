@@ -3,6 +3,7 @@
  * Invariants: Offline-First, Build Once Use Infinitely
  * Uses IndexedDB via Dexie for client-side offline storage
  * v2: Added pos_receipts, pos_sessions tables for POS Phase 2
+ * v3: Added heldCarts for park/hold sale (POS Phase 4)
  */
 import Dexie, { type Table } from 'dexie';
 
@@ -84,6 +85,26 @@ export interface PosLocalSession {
   closedAt?: number;
 }
 
+// ─── Held cart — park/hold sale (Phase 4) ────────────────────────────────────
+export interface HeldCart {
+  id: string;                        // uuid generated at hold time
+  tenantId: string;
+  label: string;                     // e.g. "Table 4", "Mr Chukwu"
+  cartItems: Array<{
+    productId: string;
+    productName: string;
+    price: number;                   // kobo
+    quantity: number;
+  }>;
+  discountKobo: number;
+  discountPct: number;
+  customerId?: string;
+  customerName?: string;
+  customerPhone?: string;
+  heldAt: number;                    // epoch ms
+  sessionId?: string;
+}
+
 // ─── Database class ───────────────────────────────────────────────────────────
 export class CommerceOfflineDB extends Dexie {
   mutations!: Table<CommerceMutation, number>;
@@ -92,6 +113,7 @@ export class CommerceOfflineDB extends Dexie {
   products!: Table<OfflineProduct, string>;
   posReceipts!: Table<PosReceipt, string>;
   posSessions!: Table<PosLocalSession, string>;
+  heldCarts!: Table<HeldCart, string>;
 
   constructor(tenantId: string) {
     super(`WebWakaCommerce_${tenantId}`);
@@ -112,6 +134,17 @@ export class CommerceOfflineDB extends Dexie {
       products: 'id, tenantId, sku, category, cachedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
+    });
+
+    // v3 — adds heldCarts for park/hold sale (Phase 4)
+    this.version(3).stores({
+      mutations: '++id, tenantId, entityType, entityId, status, timestamp',
+      cartItems: '++id, tenantId, sessionToken, productId',
+      offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
+      products: 'id, tenantId, sku, category, cachedAt',
+      posReceipts: 'id, orderId, tenantId, createdAt',
+      posSessions: 'id, tenantId, status, openedAt',
+      heldCarts: 'id, tenantId, heldAt',
     });
   }
 }
@@ -136,15 +169,9 @@ export async function queueMutation(
 ): Promise<number> {
   const db = getCommerceDB(tenantId);
   return db.mutations.add({
-    tenantId,
-    entityType,
-    entityId,
-    action,
-    payload,
-    version: Date.now(),
-    timestamp: Date.now(),
-    status: 'PENDING',
-    retryCount: 0,
+    tenantId, entityType, entityId, action, payload,
+    version: Date.now(), timestamp: Date.now(),
+    status: 'PENDING', retryCount: 0,
   });
 }
 
@@ -220,4 +247,32 @@ export async function cacheSession(session: PosLocalSession): Promise<void> {
 export async function getOpenSession(tenantId: string): Promise<PosLocalSession | undefined> {
   const db = getCommerceDB(tenantId);
   return db.posSessions.where({ tenantId, status: 'open' }).first();
+}
+
+// ─── Held cart helpers (Phase 4) ─────────────────────────────────────────────
+export async function holdCart(
+  tenantId: string,
+  cart: Omit<HeldCart, 'id' | 'heldAt'>,
+): Promise<string> {
+  const db = getCommerceDB(tenantId);
+  const id = `held_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  await db.heldCarts.add({ ...cart, id, tenantId, heldAt: Date.now() });
+  return id;
+}
+
+export async function getHeldCarts(tenantId: string): Promise<HeldCart[]> {
+  const db = getCommerceDB(tenantId);
+  return db.heldCarts.where('tenantId').equals(tenantId).reverse().sortBy('heldAt');
+}
+
+export async function restoreHeldCart(tenantId: string, heldCartId: string): Promise<HeldCart | undefined> {
+  const db = getCommerceDB(tenantId);
+  const held = await db.heldCarts.get(heldCartId);
+  if (held) await db.heldCarts.delete(heldCartId);
+  return held;
+}
+
+export async function deleteHeldCart(tenantId: string, heldCartId: string): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  await db.heldCarts.delete(heldCartId);
 }

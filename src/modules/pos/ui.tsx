@@ -1,12 +1,15 @@
 /**
- * WebWaka POS UI — Phase 2
- * Phase 2: useOfflineCart (Dexie persistence), useBackgroundSync, thermal CSS,
- *          print button, WhatsApp share, low-stock badges, barcode autofocus
+ * WebWaka POS UI — Phase 4
+ * Phase 4: Customer lookup, discount%, hold/park sale, VAT 7.5% display,
+ *          useVirtualizer product grid, COD/agency banking payment modes
  */
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import type { CartItem } from './core';
 import { useOfflineCart } from './useOfflineCart';
 import { useBackgroundSync } from './useBackgroundSync';
+import { holdCart, getHeldCarts, restoreHeldCart } from '../../core/offline/db';
+import type { HeldCart } from '../../core/offline/db';
 
 // ─── Thermal receipt print styles (injected globally, stripped on unmount) ────
 const THERMAL_CSS = `
@@ -65,7 +68,7 @@ interface Product {
 }
 
 interface PaymentEntry {
-  method: 'cash' | 'card' | 'transfer';
+  method: 'cash' | 'card' | 'transfer' | 'cod' | 'agency_banking';
   amount_kobo: number;
   reference?: string;
 }
@@ -86,7 +89,7 @@ interface ReceiptData {
   items?: unknown[];
 }
 
-type PaymentMode = 'cash' | 'card' | 'transfer' | 'split';
+type PaymentMode = 'cash' | 'card' | 'transfer' | 'split' | 'cod' | 'agency_banking';
 
 // ─── Stable session token (persisted in sessionStorage) ───────────────────────
 function getSessionToken(tenantId: string): string {
@@ -182,8 +185,35 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [barcodeInput, setBarcodeInput] = useState('');
   const [searchInput, setSearchInput] = useState('');
 
-  // ── Totals ────────────────────────────────────────────────────────────────
-  const totalAmount = cart.reduce((sum, item) => sum + item.price * item.cartQuantity, 0);
+  // ── Phase 4: Discount %, Customer lookup, Held carts ─────────────────────
+  const [discountPct, setDiscountPct] = useState('');
+  const [customerId, setCustomerId] = useState<string | null>(null);
+  const [customerName, setCustomerName] = useState<string | null>(null);
+  const [customerPhone, setCustomerPhone] = useState('');
+  const [customerSearching, setCustomerSearching] = useState(false);
+  const [heldCarts, setHeldCarts] = useState<HeldCart[]>([]);
+  const productGridRef = useRef<HTMLDivElement>(null);
+
+  // ── useVirtualizer: 3-column product grid ────────────────────────────────
+  const GRID_COLS = 3;
+  const productRows = useMemo(
+    () => Math.ceil(products.length / GRID_COLS),
+    [products.length],
+  );
+  const rowVirtualizer = useVirtualizer({
+    count: productRows,
+    getScrollElement: () => productGridRef.current,
+    estimateSize: () => 110,
+    overscan: 4,
+  });
+
+  // ── Totals with VAT ────────────────────────────────────────────────────────
+  const subtotalKobo = cart.reduce((sum, item) => sum + item.price * item.cartQuantity, 0);
+  const discountPctNum = Math.min(100, Math.max(0, parseFloat(discountPct || '0')));
+  const discountKobo = Math.round(subtotalKobo * discountPctNum / 100);
+  const afterDiscountKobo = subtotalKobo - discountKobo;
+  const vatKobo = Math.round(afterDiscountKobo * 0.075);
+  const totalAmount = afterDiscountKobo + vatKobo;
   const tenderedKoboNum = Math.round(parseFloat(tenderedKobo || '0') * 100);
   const changeKobo = tenderedKoboNum - totalAmount;
   const splitCashNum = Math.round(parseFloat(splitCashKobo || '0') * 100);
@@ -236,6 +266,85 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     [setCart, removeFromCart],
   );
 
+  // ── Phase 4: Customer lookup ──────────────────────────────────────────────
+  const handleCustomerLookup = useCallback(async () => {
+    const phone = customerPhone.trim();
+    if (!phone) return;
+    setCustomerSearching(true);
+    try {
+      const res = await fetch(`/api/pos/customers/lookup?phone=${encodeURIComponent(phone)}`, {
+        headers: { 'x-tenant-id': tenantId },
+      });
+      if (res.ok) {
+        const json = (await res.json()) as { success: boolean; data: { id: string; name: string; loyalty_points: number } };
+        if (json.success) {
+          setCustomerId(json.data.id);
+          setCustomerName(`${json.data.name} (${json.data.loyalty_points} pts)`);
+        }
+      } else if (res.status === 404) {
+        setCustomerName('Not found — will create on checkout');
+        setCustomerId(null);
+      }
+    } catch { /* offline */ } finally {
+      setCustomerSearching(false);
+    }
+  }, [customerPhone, tenantId]);
+
+  // ── Phase 4: Hold / park current cart ─────────────────────────────────────
+  const handleHoldCart = useCallback(async () => {
+    if (cart.length === 0) return;
+    const label = `Hold ${new Date().toLocaleTimeString('en-NG', { hour: '2-digit', minute: '2-digit' })}`;
+    try {
+      await holdCart(tenantId, {
+        tenantId,
+        label,
+        cartItems: cart.map((i) => ({
+          productId: i.id,
+          productName: i.name,
+          price: i.price,
+          quantity: i.cartQuantity,
+        })),
+        discountKobo,
+        discountPct: discountPctNum,
+        ...(customerId ? { customerId } : {}),
+        ...(customerName ? { customerName } : {}),
+        ...(customerPhone.trim() ? { customerPhone: customerPhone.trim() } : {}),
+      });
+      setCart([]);
+      setDiscountPct('');
+      setCustomerId(null);
+      setCustomerName(null);
+      setCustomerPhone('');
+      const updated = await getHeldCarts(tenantId);
+      setHeldCarts(updated);
+    } catch { /* no-op */ }
+  }, [cart, tenantId, setCart, discountKobo, discountPctNum, customerId, customerName, customerPhone]);
+
+  const handleRestoreCart = useCallback(async (heldCartId: string) => {
+    try {
+      const held = await restoreHeldCart(tenantId, heldCartId);
+      if (held) {
+        setCart(held.cartItems.map((ci) => ({
+          id: ci.productId,
+          name: ci.productName,
+          price: ci.price,
+          cartQuantity: ci.quantity,
+          quantity: 9999,
+        })) as CartItem[]);
+        if (held.discountPct > 0) setDiscountPct(String(held.discountPct));
+        if (held.customerId) setCustomerId(held.customerId);
+        if (held.customerName) setCustomerName(held.customerName);
+        if (held.customerPhone) setCustomerPhone(held.customerPhone);
+        const updated = await getHeldCarts(tenantId);
+        setHeldCarts(updated);
+      }
+    } catch { /* no-op */ }
+  }, [tenantId, setCart]);
+
+  useEffect(() => {
+    getHeldCarts(tenantId).then(setHeldCarts).catch(() => {});
+  }, [tenantId]);
+
   // ── Barcode scan (Enter key) ───────────────────────────────────────────────
   const handleBarcodeSearch = useCallback(
     async (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -264,7 +373,8 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       if (splitCardNum > 0) entries.push({ method: 'card', amount_kobo: splitCardNum });
       return entries;
     }
-    return [{ method: paymentMode as 'cash' | 'card' | 'transfer', amount_kobo: totalAmount }];
+    const method = paymentMode as PaymentEntry['method'];
+    return [{ method, amount_kobo: totalAmount }];
   }, [paymentMode, splitValid, splitCashNum, splitCardNum, totalAmount]);
 
   // ── Checkout ──────────────────────────────────────────────────────────────
@@ -315,6 +425,10 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           })),
           payments,
           session_id: sessionToken,
+          ...(discountPctNum > 0 && { discount_pct: discountPctNum }),
+          ...(customerId && { customer_id: customerId }),
+          ...(customerPhone.trim() && !customerId && { customer_phone: customerPhone.trim() }),
+          include_vat: true,
         }),
       });
       const json = (await res.json()) as { success: boolean; data?: ReceiptData; error?: string };
@@ -355,12 +469,17 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       setTenderedKobo('');
       setSplitCashKobo('');
       setSplitCardKobo('');
+      setDiscountPct('');
+      setCustomerId(null);
+      setCustomerName(null);
+      setCustomerPhone('');
     } catch {
       setCheckoutError('Network error. Check connection and retry.');
     }
   }, [
     cart, isOnline, paymentMode, splitValid, splitTotal, totalAmount,
-    payments, buildPayments, setCart, clearPersistedCart, tenantId, sessionToken,
+    buildPayments, setCart, clearPersistedCart, tenantId, sessionToken,
+    discountPctNum, customerId, customerPhone,
   ]);
 
   // ── Receipt screen ─────────────────────────────────────────────────────────
@@ -591,8 +710,9 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       </header>
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* Product grid */}
+        {/* Product grid — virtualized for large catalogs */}
         <main
+          ref={productGridRef}
           style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}
           role="main"
           aria-label="Product catalogue"
@@ -606,68 +726,87 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               No products found.
             </p>
           ) : (
-            <ul
+            <div
               role="list"
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
-                gap: '0.75rem', listStyle: 'none', padding: 0, margin: 0,
-              }}
+              aria-label="Product list"
+              style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: 'relative' }}
             >
-              {products.map((product) => {
-                const lowStockThreshold = product.low_stock_threshold ?? 5;
-                const isLowStock = product.quantity > 0 && product.quantity <= lowStockThreshold;
-                const isOutOfStock = product.quantity === 0;
+              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                const rowProducts = products.slice(
+                  virtualRow.index * GRID_COLS,
+                  (virtualRow.index + 1) * GRID_COLS,
+                );
                 return (
-                  <li key={product.id} role="listitem" style={{ position: 'relative' }}>
-                    {/* Low-stock badge */}
-                    {isLowStock && (
-                      <span
-                        aria-label={`Low stock: ${product.quantity} remaining`}
-                        style={{
-                          position: 'absolute', top: '6px', right: '6px',
-                          background: '#f59e0b', color: '#000',
-                          fontSize: '0.6rem', fontWeight: 700,
-                          padding: '1px 5px', borderRadius: '99px',
-                          zIndex: 1, lineHeight: 1.5,
-                        }}
-                      >
-                        LOW
-                      </span>
-                    )}
-                    <button
-                      onClick={() => addToCart(product)}
-                      disabled={isOutOfStock}
-                      aria-label={`${product.name}, ₦${(product.price / 100).toFixed(2)}, ${isOutOfStock ? 'out of stock' : `${product.quantity} in stock`}`}
-                      style={{
-                        display: 'block', width: '100%', minHeight: '88px',
-                        padding: '0.75rem',
-                        border: `2px solid ${isOutOfStock ? '#e5e7eb' : isLowStock ? '#fcd34d' : '#e5e7eb'}`,
-                        borderRadius: '8px', textAlign: 'center',
-                        cursor: isOutOfStock ? 'not-allowed' : 'pointer',
-                        background: isOutOfStock ? '#f9fafb' : isLowStock ? '#fffbeb' : '#fff',
-                        opacity: isOutOfStock ? 0.55 : 1,
-                      }}
-                    >
-                      <div style={{ fontWeight: 600, fontSize: '0.9rem', marginBottom: '0.25rem' }}>
-                        {product.name}
-                      </div>
-                      <div style={{ color: '#16a34a', fontWeight: 'bold', fontSize: '0.95rem' }}>
-                        ₦{(product.price / 100).toFixed(2)}
-                      </div>
-                      <div
-                        style={{
-                          fontSize: '0.72rem', marginTop: '0.2rem',
-                          color: isOutOfStock ? '#ef4444' : isLowStock ? '#d97706' : '#9ca3af',
-                        }}
-                      >
-                        {isOutOfStock ? 'Out of stock' : isLowStock ? `Low: ${product.quantity}` : `Qty: ${product.quantity}`}
-                      </div>
-                    </button>
-                  </li>
+                  <div
+                    key={virtualRow.key}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      transform: `translateY(${virtualRow.start}px)`,
+                      display: 'grid',
+                      gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)`,
+                      gap: '0.75rem',
+                      paddingBottom: '0.75rem',
+                    }}
+                  >
+                    {rowProducts.map((product) => {
+                      const lowStockThreshold = product.low_stock_threshold ?? 5;
+                      const isLowStock = product.quantity > 0 && product.quantity <= lowStockThreshold;
+                      const isOutOfStock = product.quantity === 0;
+                      return (
+                        <div key={product.id} role="listitem" style={{ position: 'relative' }}>
+                          {isLowStock && (
+                            <span
+                              aria-label={`Low stock: ${product.quantity} remaining`}
+                              style={{
+                                position: 'absolute', top: '6px', right: '6px',
+                                background: '#f59e0b', color: '#000',
+                                fontSize: '0.6rem', fontWeight: 700,
+                                padding: '1px 5px', borderRadius: '99px',
+                                zIndex: 1, lineHeight: 1.5,
+                              }}
+                            >
+                              LOW
+                            </span>
+                          )}
+                          <button
+                            onClick={() => addToCart(product)}
+                            disabled={isOutOfStock}
+                            aria-label={`${product.name}, ₦${(product.price / 100).toFixed(2)}, ${isOutOfStock ? 'out of stock' : `${product.quantity} in stock`}`}
+                            style={{
+                              display: 'block', width: '100%', minHeight: '88px',
+                              padding: '0.75rem',
+                              border: `2px solid ${isOutOfStock ? '#e5e7eb' : isLowStock ? '#fcd34d' : '#e5e7eb'}`,
+                              borderRadius: '8px', textAlign: 'center',
+                              cursor: isOutOfStock ? 'not-allowed' : 'pointer',
+                              background: isOutOfStock ? '#f9fafb' : isLowStock ? '#fffbeb' : '#fff',
+                              opacity: isOutOfStock ? 0.55 : 1,
+                            }}
+                          >
+                            <div style={{ fontWeight: 600, fontSize: '0.9rem', marginBottom: '0.25rem' }}>
+                              {product.name}
+                            </div>
+                            <div style={{ color: '#16a34a', fontWeight: 'bold', fontSize: '0.95rem' }}>
+                              ₦{(product.price / 100).toFixed(2)}
+                            </div>
+                            <div
+                              style={{
+                                fontSize: '0.72rem', marginTop: '0.2rem',
+                                color: isOutOfStock ? '#ef4444' : isLowStock ? '#d97706' : '#9ca3af',
+                              }}
+                            >
+                              {isOutOfStock ? 'Out of stock' : isLowStock ? `Low: ${product.quantity}` : `Qty: ${product.quantity}`}
+                            </div>
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
                 );
               })}
-            </ul>
+            </div>
           )}
         </main>
 
@@ -679,14 +818,95 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           }}
           aria-label="Cart"
         >
+          {/* Cart header — count + hold/park */}
           <div
             style={{
               padding: '0.6rem 1rem', borderBottom: '1px solid #e5e7eb',
               fontWeight: 'bold', fontSize: '0.9rem',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
             }}
           >
-            Cart — {cart.reduce((s, i) => s + i.cartQuantity, 0)} item
-            {cart.reduce((s, i) => s + i.cartQuantity, 0) !== 1 ? 's' : ''}
+            <span>
+              Cart — {cart.reduce((s, i) => s + i.cartQuantity, 0)} item
+              {cart.reduce((s, i) => s + i.cartQuantity, 0) !== 1 ? 's' : ''}
+            </span>
+            <button
+              onClick={handleHoldCart}
+              disabled={cart.length === 0}
+              aria-label="Hold current sale and start a new one"
+              title="Hold sale"
+              style={{
+                padding: '0.25rem 0.55rem', border: '1px solid #d1d5db',
+                borderRadius: '4px', background: '#fff', cursor: cart.length === 0 ? 'not-allowed' : 'pointer',
+                fontSize: '0.72rem', color: cart.length === 0 ? '#9ca3af' : '#374151',
+              }}
+            >
+              ⏸ Hold
+            </button>
+          </div>
+
+          {/* Customer lookup panel */}
+          <div style={{ padding: '0.5rem 0.75rem', borderBottom: '1px solid #f3f4f6', background: '#f9fafb' }}>
+            <div style={{ display: 'flex', gap: '0.3rem' }}>
+              <input
+                type="tel"
+                placeholder="Customer phone (08xxxxxxxx)"
+                value={customerPhone}
+                onChange={(e) => setCustomerPhone(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleCustomerLookup(); }}
+                aria-label="Customer phone number for loyalty lookup"
+                style={{
+                  flex: 1, padding: '0.3rem 0.5rem', border: '1px solid #d1d5db',
+                  borderRadius: '4px', fontSize: '0.75rem', minWidth: 0,
+                }}
+              />
+              <button
+                onClick={handleCustomerLookup}
+                disabled={!customerPhone.trim() || customerSearching}
+                aria-label="Look up customer by phone"
+                style={{
+                  padding: '0.3rem 0.5rem', border: '1px solid #d1d5db',
+                  borderRadius: '4px', background: '#fff', cursor: 'pointer',
+                  fontSize: '0.72rem', whiteSpace: 'nowrap',
+                }}
+              >
+                {customerSearching ? '…' : 'Find'}
+              </button>
+            </div>
+            {customerName && (
+              <div
+                aria-live="polite"
+                style={{
+                  marginTop: '0.25rem', fontSize: '0.72rem',
+                  color: customerId ? '#16a34a' : '#6b7280',
+                }}
+              >
+                {customerId ? `✓ ${customerName}` : customerName}
+              </div>
+            )}
+            {heldCarts.length > 0 && (
+              <div style={{ marginTop: '0.4rem' }}>
+                <div style={{ fontSize: '0.68rem', color: '#9ca3af', marginBottom: '0.15rem' }}>
+                  Held sales ({heldCarts.length})
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem' }}>
+                  {heldCarts.map((hc) => (
+                    <button
+                      key={hc.id}
+                      onClick={() => handleRestoreCart(hc.id)}
+                      aria-label={`Restore held sale: ${hc.label}`}
+                      style={{
+                        padding: '0.2rem 0.45rem', border: '1px solid #fbbf24',
+                        borderRadius: '4px', background: '#fffbeb', cursor: 'pointer',
+                        fontSize: '0.68rem', color: '#92400e',
+                      }}
+                    >
+                      ▶ {hc.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Cart items */}
@@ -746,10 +966,38 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
           {/* Payment panel */}
           <div style={{ padding: '0.6rem 0.75rem', borderTop: '1px solid #e5e7eb' }}>
+            {/* Discount % input */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem' }}>
+              <label htmlFor="discount-pct" style={{ fontSize: '0.72rem', color: '#6b7280', whiteSpace: 'nowrap' }}>
+                Discount %
+              </label>
+              <input
+                id="discount-pct"
+                type="number"
+                min="0"
+                max="100"
+                step="0.5"
+                placeholder="0"
+                value={discountPct}
+                onChange={(e) => setDiscountPct(e.target.value)}
+                aria-label="Discount percentage (0–100)"
+                style={{
+                  width: '70px', padding: '0.25rem 0.4rem', border: '1px solid #d1d5db',
+                  borderRadius: '4px', fontSize: '0.82rem', textAlign: 'right',
+                }}
+              />
+              <span style={{ fontSize: '0.72rem', color: '#6b7280' }}>%</span>
+              {discountPctNum > 0 && (
+                <span aria-live="polite" style={{ fontSize: '0.72rem', color: '#dc2626', marginLeft: 'auto' }}>
+                  −₦{(discountKobo / 100).toFixed(2)}
+                </span>
+              )}
+            </div>
+
             <p style={{ margin: '0 0 0.4rem', fontSize: '0.75rem', color: '#6b7280' }}>Payment Method</p>
 
-            {/* Mode selector */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '0.3rem', marginBottom: '0.6rem' }}>
+            {/* Mode selector — row 1: cash, card, transfer, split */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '0.3rem', marginBottom: '0.3rem' }}>
               {(['cash', 'card', 'transfer', 'split'] as PaymentMode[]).map((mode) => (
                 <button
                   key={mode}
@@ -766,6 +1014,27 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
                   }}
                 >
                   {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                </button>
+              ))}
+            </div>
+
+            {/* Mode selector — row 2: COD, Agency Banking */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.3rem', marginBottom: '0.6rem' }}>
+              {(['cod', 'agency_banking'] as PaymentMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setPaymentMode(mode)}
+                  aria-pressed={paymentMode === mode}
+                  style={{
+                    padding: '0.4rem 0.25rem',
+                    border: `2px solid ${paymentMode === mode ? '#16a34a' : '#e5e7eb'}`,
+                    borderRadius: '6px',
+                    background: paymentMode === mode ? '#dcfce7' : '#fff',
+                    cursor: 'pointer', fontSize: '0.72rem',
+                    fontWeight: paymentMode === mode ? 700 : 400,
+                  }}
+                >
+                  {mode === 'cod' ? 'COD' : 'Agency Banking'}
                 </button>
               ))}
             </div>
@@ -838,10 +1107,24 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               </div>
             )}
 
-            {/* Total */}
+            {/* VAT breakdown */}
+            <div style={{ fontSize: '0.72rem', color: '#6b7280', marginBottom: '0.4rem' }}>
+              {discountPctNum > 0 && (
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.15rem' }}>
+                  <span>After {discountPctNum}% discount</span>
+                  <span>₦{(afterDiscountKobo / 100).toFixed(2)}</span>
+                </div>
+              )}
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.15rem' }}>
+                <span>VAT 7.5%</span>
+                <span>₦{(vatKobo / 100).toFixed(2)}</span>
+              </div>
+            </div>
+
+            {/* Grand total */}
             <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 'bold', fontSize: '1.05rem', marginBottom: '0.6rem' }}>
-              <span>Total</span>
-              <span aria-live="polite" aria-label={`Total: ₦${(totalAmount / 100).toFixed(2)}`}>
+              <span>Total (incl. VAT)</span>
+              <span aria-live="polite" aria-label={`Total including VAT: ₦${(totalAmount / 100).toFixed(2)}`}>
                 ₦{(totalAmount / 100).toFixed(2)}
               </span>
             </div>
