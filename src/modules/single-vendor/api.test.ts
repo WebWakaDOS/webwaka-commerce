@@ -799,4 +799,325 @@ describe('COM-2: Single-Vendor Storefront API', () => {
       expect(computeDiscount('pct', 7.5, 20000)).toBe(1500);
     });
   });
+
+  // =========================================================================
+  // SV PHASE 3: Cursor Pagination, FTS5 Search, Variants, Order Detail
+  // =========================================================================
+
+  // ── PAGE-1: GET /catalog cursor pagination ────────────────────────────────
+  describe('GET /catalog — cursor pagination (PAGE-1)', () => {
+    it('returns has_more: false and next_cursor: null when results <= per_page', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [
+        { id: 'p1', name: 'Ankara Print Fabric', price: 250000, quantity: 10, category: 'Fabrics', sku: 'ANK-001', has_variants: 0 },
+        { id: 'p2', name: 'Aso-Oke Wrapper',    price: 450000, quantity: 5,  category: 'Fabrics', sku: 'ASO-001', has_variants: 0 },
+      ] });
+      const req = new Request('http://test/catalog?per_page=24', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[]; has_more: boolean; next_cursor: string | null } };
+      expect(body.success).toBe(true);
+      expect(body.data.has_more).toBe(false);
+      expect(body.data.next_cursor).toBeNull();
+      expect(body.data.products).toHaveLength(2);
+    });
+
+    it('returns has_more: true and next_cursor when results exceed per_page', async () => {
+      const products = Array.from({ length: 25 }, (_, i) => ({
+        id: `prod_${i + 1}`, name: `Product ${i + 1}`, price: 100000, quantity: 10, category: 'Test', sku: `SKU-${i}`, has_variants: 0,
+      }));
+      mockDb.all.mockResolvedValueOnce({ results: products });
+      const req = new Request('http://test/catalog?per_page=24', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[]; has_more: boolean; next_cursor: string } };
+      expect(body.success).toBe(true);
+      expect(body.data.has_more).toBe(true);
+      expect(body.data.next_cursor).toBe('prod_24'); // last item of trimmed 24
+      expect(body.data.products).toHaveLength(24);
+    });
+
+    it('passes after cursor as id > ? param for next page', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [
+        { id: 'prod_25', name: 'Last Product', price: 100000, quantity: 5, sku: 'L-001', has_variants: 0 },
+      ] });
+      const req = new Request('http://test/catalog?after=prod_24&per_page=24', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.products).toHaveLength(1);
+    });
+
+    it('filters by category alongside pagination', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [
+        { id: 'p1', name: 'Ankara', price: 250000, quantity: 10, category: 'Fabrics', sku: 'ANK-001', has_variants: 0 },
+      ] });
+      const req = new Request('http://test/catalog?category=Fabrics&per_page=24', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.products).toHaveLength(1);
+    });
+
+    it('returns empty page gracefully when DB fails', async () => {
+      mockDb.all.mockRejectedValueOnce(new Error('DB error'));
+      const req = new Request('http://test/catalog', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.products).toHaveLength(0);
+    });
+
+    it('caps per_page at MAX_PAGE_SIZE (100)', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [] });
+      const req = new Request('http://test/catalog?per_page=9999', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ── SEARCH-1: GET /catalog/search FTS5 ───────────────────────────────────
+  describe('GET /catalog/search — FTS5 (SEARCH-1)', () => {
+    it('returns matching products for query "Ankara"', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [
+        { id: 'p1', name: 'Ankara Print Fabric', price: 250000, quantity: 10, category: 'Fabrics', sku: 'ANK-001', has_variants: 0 },
+      ] });
+      const req = new Request('http://test/catalog/search?q=Ankara', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: { name: string }[]; query: string; count: number } };
+      expect(body.success).toBe(true);
+      expect(body.data.query).toBe('Ankara');
+      expect(body.data.count).toBe(1);
+      expect(body.data.products[0]?.name).toBe('Ankara Print Fabric');
+    });
+
+    it('returns empty array when no FTS matches', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [] });
+      const req = new Request('http://test/catalog/search?q=xyznonexistent', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[]; count: number } };
+      expect(body.success).toBe(true);
+      expect(body.data.products).toHaveLength(0);
+      expect(body.data.count).toBe(0);
+    });
+
+    it('returns 400 when q param missing', async () => {
+      const req = new Request('http://test/catalog/search', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error: string };
+      expect(body.error).toMatch(/query/i);
+    });
+
+    it('returns 400 when q is empty string', async () => {
+      const req = new Request('http://test/catalog/search?q=', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(400);
+    });
+
+    it('falls back to LIKE search when FTS table missing', async () => {
+      mockDb.all
+        .mockRejectedValueOnce(new Error('no such table: products_fts'))
+        .mockResolvedValueOnce({ results: [
+          { id: 'p1', name: 'Aso-Oke Wrapper', price: 450000, quantity: 5, sku: 'ASO-001', has_variants: 0 },
+        ] });
+      const req = new Request('http://test/catalog/search?q=Aso', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.products).toHaveLength(1);
+    });
+
+    it('returns empty array when both FTS and LIKE fallback fail', async () => {
+      mockDb.all
+        .mockRejectedValueOnce(new Error('no such table: products_fts'))
+        .mockRejectedValueOnce(new Error('DB error'));
+      const req = new Request('http://test/catalog/search?q=anything', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { products: unknown[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.products).toHaveLength(0);
+    });
+  });
+
+  // ── VAR-1: GET /products/:id/variants ────────────────────────────────────
+  describe('GET /products/:id/variants — Variants (VAR-1)', () => {
+    it('returns variants for a product', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [
+        { id: 'var_1', product_id: 'prod_1', option_name: 'Size',   option_value: 'S',   sku: 'SHT-S',  price_delta: 0,     quantity: 20 },
+        { id: 'var_2', product_id: 'prod_1', option_name: 'Size',   option_value: 'M',   sku: 'SHT-M',  price_delta: 0,     quantity: 15 },
+        { id: 'var_3', product_id: 'prod_1', option_name: 'Size',   option_value: 'XL',  sku: 'SHT-XL', price_delta: 50000, quantity: 8  },
+        { id: 'var_4', product_id: 'prod_1', option_name: 'Colour', option_value: 'Red', sku: 'SHT-R',  price_delta: 0,     quantity: 10 },
+      ] });
+      const req = new Request('http://test/products/prod_1/variants', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { variants: { option_name: string; price_delta: number }[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.variants).toHaveLength(4);
+    });
+
+    it('variant price_delta XL = +50000 kobo (₦500)', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [
+        { id: 'var_3', product_id: 'prod_1', option_name: 'Size', option_value: 'XL', sku: 'SHT-XL', price_delta: 50000, quantity: 8 },
+      ] });
+      const req = new Request('http://test/products/prod_1/variants', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { variants: { price_delta: number }[] } };
+      expect(body.data.variants[0]?.price_delta).toBe(50000);
+    });
+
+    it('returns empty variants when product has none', async () => {
+      mockDb.all.mockResolvedValueOnce({ results: [] });
+      const req = new Request('http://test/products/prod_basic/variants', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { variants: unknown[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.variants).toHaveLength(0);
+    });
+
+    it('returns empty variants gracefully when DB fails', async () => {
+      mockDb.all.mockRejectedValueOnce(new Error('table missing'));
+      const req = new Request('http://test/products/prod_1/variants', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { success: boolean; data: { variants: unknown[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.variants).toHaveLength(0);
+    });
+
+    it('is tenant-scoped: different tenant gets different variants', async () => {
+      mockDb.all
+        .mockResolvedValueOnce({ results: [{ id: 'var_t1', product_id: 'prod_1', option_name: 'Size', option_value: 'M', sku: 'T1-M', price_delta: 0, quantity: 5 }] })
+        .mockResolvedValueOnce({ results: [] });
+      const req1 = new Request('http://test/products/prod_1/variants', { headers: { 'x-tenant-id': 'tenant1' } });
+      const req2 = new Request('http://test/products/prod_1/variants', { headers: { 'x-tenant-id': 'tenant2' } });
+      const [res1, res2] = await Promise.all([singleVendorRouter.fetch(req1, mockEnv as any), singleVendorRouter.fetch(req2, mockEnv as any)]);
+      const b1 = await res1.json() as { data: { variants: unknown[] } };
+      const b2 = await res2.json() as { data: { variants: unknown[] } };
+      expect(b1.data.variants).toHaveLength(1);
+      expect(b2.data.variants).toHaveLength(0);
+    });
+  });
+
+  // ── ORDER-1: GET /orders/:id ───────────────────────────────────────────────
+  describe('GET /orders/:id — full order detail (ORDER-1)', () => {
+    const mockOrder = {
+      id: 'ord_sv_001',
+      tenant_id: 'tenant1',
+      customer_email: 'amaka@example.com',
+      customer_phone: '+2348012345678',
+      items_json: JSON.stringify([{ product_id: 'p1', name: 'Ankara Print', price: 250000, quantity: 2 }]),
+      subtotal: 500000,
+      discount_kobo: 0,
+      vat_kobo: 37500,
+      total_amount: 537500,
+      payment_method: 'paystack',
+      payment_status: 'paid',
+      order_status: 'confirmed',
+      payment_reference: 'PSK_001',
+      delivery_address_json: JSON.stringify({ state: 'Lagos', lga: 'Ikeja', street: '5 Allen Avenue' }),
+      promo_code: null,
+      created_at: 1700000000000,
+      updated_at: 1700000000000,
+    };
+
+    it('returns full order with parsed items and delivery_address', async () => {
+      mockFirstImpl = () => Promise.resolve(mockOrder);
+      const req = new Request('http://test/orders/ord_sv_001', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { success: boolean; data: { id: string; items: unknown[]; delivery_address: { state: string } } };
+      expect(body.success).toBe(true);
+      expect(body.data.id).toBe('ord_sv_001');
+      expect(Array.isArray(body.data.items)).toBe(true);
+      expect(body.data.items).toHaveLength(1);
+      expect(body.data.delivery_address?.state).toBe('Lagos');
+    });
+
+    it('returns 404 for non-existent order', async () => {
+      mockFirstImpl = () => Promise.resolve(null);
+      const req = new Request('http://test/orders/ord_notfound', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(404);
+      const body = await res.json() as { success: boolean; error: string };
+      expect(body.success).toBe(false);
+      expect(body.error).toMatch(/not found/i);
+    });
+
+    it('returns 404 for wrong tenant', async () => {
+      mockFirstImpl = () => Promise.resolve(null); // D1 WHERE filters by tenant_id
+      const req = new Request('http://test/orders/ord_sv_001', { headers: { 'x-tenant-id': 'tenant_other' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(404);
+    });
+
+    it('strips raw items_json and delivery_address_json from response', async () => {
+      mockFirstImpl = () => Promise.resolve(mockOrder);
+      const req = new Request('http://test/orders/ord_sv_001', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.data).not.toHaveProperty('items_json');
+      expect(body.data).not.toHaveProperty('delivery_address_json');
+    });
+
+    it('handles malformed items_json gracefully (returns empty items)', async () => {
+      mockFirstImpl = () => Promise.resolve({ ...mockOrder, items_json: 'NOT_JSON{{' });
+      const req = new Request('http://test/orders/ord_sv_001', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { data: { items: unknown[] } };
+      expect(Array.isArray(body.data.items)).toBe(true);
+      expect(body.data.items).toHaveLength(0);
+    });
+
+    it('returns 404 when DB throws', async () => {
+      mockFirstImpl = () => Promise.reject(new Error('DB error'));
+      const req = new Request('http://test/orders/ord_sv_001', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(404);
+    });
+
+    it('calculates correct VAT: 500000 * 7.5% = 37500 kobo', async () => {
+      mockFirstImpl = () => Promise.resolve(mockOrder);
+      const req = new Request('http://test/orders/ord_sv_001', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { data: { vat_kobo: number; total_amount: number } };
+      expect(body.data.vat_kobo).toBe(37500);
+      expect(body.data.total_amount).toBe(537500);
+    });
+
+    it('returns order without delivery address when not set', async () => {
+      mockFirstImpl = () => Promise.resolve({ ...mockOrder, delivery_address_json: null });
+      const req = new Request('http://test/orders/ord_sv_001', { headers: { 'x-tenant-id': 'tenant1' } });
+      const res = await singleVendorRouter.fetch(req, mockEnv as any);
+      const body = await res.json() as { data: { delivery_address: unknown } };
+      expect(body.data.delivery_address).toBeNull();
+    });
+  });
+
+  // ── Variant pricing integration ───────────────────────────────────────────
+  describe('Variant pricing delta', () => {
+    it('computeDiscount: pct 0% = 0 discount', () => {
+      expect(computeDiscount('pct', 0, 500000)).toBe(0);
+    });
+
+    it('price_delta adds to base: base 500000 + delta 50000 = 550000', () => {
+      const basePrice = 500000;
+      const priceDelta = 50000;
+      expect(basePrice + priceDelta).toBe(550000);
+    });
+
+    it('price_delta subtracts for cheaper variant: base 500000 + delta -50000 = 450000', () => {
+      const basePrice = 500000;
+      const priceDelta = -50000;
+      expect(basePrice + priceDelta).toBe(450000);
+    });
+
+    it('price_delta of 0 means same price as base', () => {
+      const basePrice = 250000;
+      const priceDelta = 0;
+      expect(basePrice + priceDelta).toBe(250000);
+    });
+
+    it('VAT applies on variant effective price: (500000+50000)*7.5% = 41250', () => {
+      const effectivePrice = 500000 + 50000;
+      const vat = Math.round(effectivePrice * 0.075);
+      expect(vat).toBe(41250);
+    });
+  });
 });

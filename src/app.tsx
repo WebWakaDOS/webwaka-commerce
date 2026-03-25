@@ -3,7 +3,8 @@
  * Invariants: Mobile-First, PWA-First, Offline-First, Nigeria-First, Africa-First
  * Modules: POS (COM-1), Single-Vendor (COM-2), Multi-Vendor (COM-3)
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { getTranslations, getSupportedLanguages, getLanguageName, formatKoboToNaira, type Language } from './core/i18n';
 import { getCommerceDB, queueMutation, getPendingMutations } from './core/offline/db';
 import { useStorefrontCart } from './modules/single-vendor/useStorefrontCart';
@@ -15,10 +16,22 @@ interface Product {
   id: string;
   sku: string;
   name: string;
+  description?: string;
   price: number; // kobo
   quantity: number;
   category?: string;
   image_url?: string;
+  has_variants?: number; // 1 = has variants
+}
+
+interface ProductVariant {
+  id: string;
+  product_id: string;
+  option_name: string;
+  option_value: string;
+  sku: string;
+  price_delta: number; // kobo added to base price
+  quantity: number;
 }
 
 interface CartItem extends Product {
@@ -405,10 +418,110 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const vatKobo = Math.round(afterDiscount * VAT_RATE);
   const grandTotal = afterDiscount + vatKobo;
 
-  // ── Catalog ───────────────────────────────────────────────────────────────
+  // ── Catalog — paginated, search, category ────────────────────────────────
   const [products, setProducts] = useState<Product[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState('');
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [isFetchingMore, setIsFetchingMore] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchInput, setSearchInput] = useState('');
+  const [activeCategory, setActiveCategory] = useState('');
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const gridContainerRef = useRef<HTMLDivElement>(null);
+
+  // ── Product modal ─────────────────────────────────────────────────────────
+  const [modalProduct, setModalProduct] = useState<Product | null>(null);
+  const [modalVariants, setModalVariants] = useState<ProductVariant[]>([]);
+  const [modalVariantsLoading, setModalVariantsLoading] = useState(false);
+  const [selectedVariant, setSelectedVariant] = useState<ProductVariant | null>(null);
+  const [modalQty, setModalQty] = useState(1);
+
+  // Group variants by option_name for the picker
+  const variantGroups = useMemo(() => {
+    const groups: Record<string, ProductVariant[]> = {};
+    for (const v of modalVariants) {
+      if (!groups[v.option_name]) groups[v.option_name] = [];
+      groups[v.option_name].push(v);
+    }
+    return groups;
+  }, [modalVariants]);
+
+  // ── Catalog fetch helpers ─────────────────────────────────────────────────
+  const fetchCatalog = useCallback(async (opts: { after?: string; category?: string; search?: string; reset?: boolean }) => {
+    if (!tenantId) return;
+    if (opts.reset) { setCatalogLoading(true); setCatalogError(''); }
+    else setIsFetchingMore(true);
+    try {
+      let url: string;
+      if (opts.search) {
+        url = `/api/single-vendor/catalog/search?q=${encodeURIComponent(opts.search)}&per_page=24`;
+      } else {
+        const params = new URLSearchParams({ per_page: '24' });
+        if (opts.after) params.set('after', opts.after);
+        if (opts.category) params.set('category', opts.category);
+        url = `/api/single-vendor/catalog?${params}`;
+      }
+      const res = await fetch(url, { headers: { 'x-tenant-id': tenantId } });
+      const d = await res.json() as { success: boolean; data: { products: Product[]; next_cursor?: string | null; has_more?: boolean } };
+      if (d.success) {
+        const newProducts = d.data.products ?? [];
+        setProducts(prev => opts.reset ? newProducts : [...prev, ...newProducts]);
+        setNextCursor(d.data.next_cursor ?? null);
+        setHasMore(d.data.has_more ?? false);
+      } else {
+        if (opts.reset) setCatalogError('Failed to load products');
+      }
+    } catch {
+      if (opts.reset) setCatalogError('Network error. Check your connection.');
+    } finally {
+      setCatalogLoading(false);
+      setIsFetchingMore(false);
+    }
+  }, [tenantId]);
+
+  // ── Initial + query-change fetch ──────────────────────────────────────────
+  useEffect(() => {
+    fetchCatalog({ reset: true, category: activeCategory, search: searchQuery });
+  }, [tenantId, activeCategory, searchQuery, fetchCatalog]);
+
+  // ── IntersectionObserver — infinite scroll sentinel ───────────────────────
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(entries => {
+      if (entries[0]?.isIntersecting && hasMore && !isFetchingMore && !catalogLoading) {
+        fetchCatalog({ after: nextCursor ?? undefined, category: activeCategory, search: searchQuery });
+      }
+    }, { threshold: 0.1 });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore, isFetchingMore, catalogLoading, nextCursor, activeCategory, searchQuery, fetchCatalog]);
+
+  // ── Open product modal ────────────────────────────────────────────────────
+  const openModal = useCallback(async (p: Product) => {
+    setModalProduct(p);
+    setModalQty(1);
+    setSelectedVariant(null);
+    setModalVariants([]);
+    if (p.has_variants) {
+      setModalVariantsLoading(true);
+      try {
+        const res = await fetch(`/api/single-vendor/products/${p.id}/variants`, { headers: { 'x-tenant-id': tenantId } });
+        const d = await res.json() as { success: boolean; data: { variants: ProductVariant[] } };
+        if (d.success) setModalVariants(d.data.variants ?? []);
+      } catch { /* show modal without variants */ }
+      finally { setModalVariantsLoading(false); }
+    }
+  }, [tenantId]);
+
+  const closeModal = useCallback(() => {
+    setModalProduct(null);
+    setModalVariants([]);
+    setSelectedVariant(null);
+    setModalQty(1);
+  }, []);
 
   // ── Load Paystack Inline JS ───────────────────────────────────────────────
   useEffect(() => {
@@ -420,27 +533,23 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     document.head.appendChild(s);
   }, []);
 
-  useEffect(() => {
-    if (!tenantId) return;
-    setCatalogLoading(true);
-    setCatalogError('');
-    fetch(`/api/single-vendor/catalog?tenant_id=${encodeURIComponent(tenantId)}`, {
-      headers: { 'x-tenant-id': tenantId },
-    })
-      .then(r => r.json() as Promise<{ success: boolean; data: { products: Product[] } }>)
-      .then(d => {
-        if (d.success) setProducts(d.data.products ?? []);
-        else setCatalogError('Failed to load products');
-      })
-      .catch(() => setCatalogError('Network error. Check your connection.'))
-      .finally(() => setCatalogLoading(false));
-  }, [tenantId]);
+  // ── useVirtualizer: 2-column product grid ───────────────────────────────
+  const GRID_COLS = 2;
+  const productRows = useMemo(() => Math.ceil(products.length / GRID_COLS), [products.length]);
+  const rowVirtualizer = useVirtualizer({
+    count: productRows,
+    getScrollElement: () => gridContainerRef.current,
+    estimateSize: () => 220,
+    overscan: 3,
+  });
 
-  const handleAddToCart = (p: Product) => {
+  const handleAddToCart = (p: Product, variant?: ProductVariant | null, qty = 1) => {
+    const effectivePrice = p.price + (variant?.price_delta ?? 0);
+    const availableQty = variant ? variant.quantity : p.quantity;
     const existing = cart.find(i => i.id === p.id);
-    const cartQty = (existing?.cartQuantity ?? 0) + 1;
-    if (cartQty > p.quantity) return;
-    addToCart({ id: p.id, name: p.name, price: p.price, quantity: p.quantity, imageEmoji: '🛍️' });
+    const cartQty = (existing?.cartQuantity ?? 0) + qty;
+    if (cartQty > availableQty) return;
+    addToCart({ id: p.id, name: variant ? `${p.name} — ${variant.option_value}` : p.name, price: effectivePrice, quantity: availableQty, imageEmoji: '🛍️' });
   };
 
   const handlePromoValidate = async () => {
@@ -676,55 +785,205 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
 
   // ── Catalog view ──────────────────────────────────────────────────────────
   return (
-    <div style={{ padding: '12px' }}>
-      {catalogLoading && (
-        <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>Loading products…</div>
-      )}
-      {catalogError && !catalogLoading && (
-        <div style={{ padding: '12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', marginBottom: '12px' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+
+      {/* Search bar */}
+      <div style={{ padding: '10px 12px 0', display: 'flex', gap: '8px' }}>
+        <input
+          type="search"
+          placeholder="Search products… (e.g. Ankara)"
+          value={searchInput}
+          onChange={e => setSearchInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') { setSearchQuery(searchInput.trim()); setActiveCategory(''); } }}
+          style={{ flex: 1, padding: '9px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', outline: 'none' }}
+        />
+        <button
+          onClick={() => { setSearchQuery(searchInput.trim()); setActiveCategory(''); }}
+          style={{ padding: '9px 14px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600, fontSize: '13px' }}
+        >🔍</button>
+        {(searchQuery || activeCategory) && (
+          <button
+            onClick={() => { setSearchQuery(''); setSearchInput(''); setActiveCategory(''); }}
+            style={{ padding: '9px 12px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
+          >✕</button>
+        )}
+      </div>
+
+      {/* Category pills — derived from loaded products */}
+      {(() => {
+        const cats = [...new Set(products.map(p => p.category).filter(Boolean) as string[])].sort();
+        if (!cats.length) return null;
+        return (
+          <div style={{ padding: '8px 12px', display: 'flex', gap: '6px', overflowX: 'auto', scrollbarWidth: 'none' }}>
+            <button
+              onClick={() => setActiveCategory('')}
+              style={{ padding: '4px 12px', borderRadius: '20px', border: '1px solid #d1d5db', backgroundColor: !activeCategory ? '#16a34a' : '#fff', color: !activeCategory ? '#fff' : '#374151', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap', cursor: 'pointer' }}
+            >All</button>
+            {cats.map(cat => (
+              <button
+                key={cat}
+                onClick={() => { setActiveCategory(cat === activeCategory ? '' : cat); setSearchQuery(''); setSearchInput(''); }}
+                style={{ padding: '4px 12px', borderRadius: '20px', border: '1px solid #d1d5db', backgroundColor: activeCategory === cat ? '#16a34a' : '#fff', color: activeCategory === cat ? '#fff' : '#374151', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap', cursor: 'pointer' }}
+              >{cat}</button>
+            ))}
+          </div>
+        );
+      })()}
+
+      {/* Status */}
+      {catalogError && (
+        <div style={{ margin: '8px 12px', padding: '10px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px' }}>
           {catalogError}
         </div>
       )}
-      {!catalogLoading && products.length === 0 && !catalogError && (
-        <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>No products available.</div>
+      {catalogLoading && !products.length && (
+        <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>Loading products…</div>
       )}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '12px', marginBottom: '80px' }}>
-        {products.map(p => {
-          const cartEntry = cart.find(i => i.id === p.id);
-          const cartQty = cartEntry?.cartQuantity ?? 0;
-          const outOfStock = p.quantity === 0;
-          return (
-            <div key={p.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff' }}>
-              <div style={{ backgroundColor: '#f0fdf4', height: '100px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '32px' }}>
-                🛍️
+      {!catalogLoading && products.length === 0 && !catalogError && (
+        <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>
+          {searchQuery ? `No results for "${searchQuery}"` : 'No products available.'}
+        </div>
+      )}
+
+      {/* Virtualized 2-column grid */}
+      <div
+        ref={gridContainerRef}
+        style={{ flex: 1, overflowY: 'auto', padding: '8px 12px', paddingBottom: itemCount > 0 ? '120px' : '24px' }}
+      >
+        <div style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: 'relative' }}>
+          {rowVirtualizer.getVirtualItems().map(vRow => {
+            const rowStart = vRow.index * GRID_COLS;
+            const rowProducts = products.slice(rowStart, rowStart + GRID_COLS);
+            return (
+              <div
+                key={vRow.key}
+                style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${vRow.start}px)`, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '10px', padding: '0 2px' }}
+              >
+                {rowProducts.map(p => {
+                  const cartEntry = cart.find(i => i.id === p.id);
+                  const cartQty = cartEntry?.cartQuantity ?? 0;
+                  const outOfStock = p.quantity === 0;
+                  return (
+                    <div
+                      key={p.id}
+                      onClick={() => openModal(p)}
+                      style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', cursor: 'pointer', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}
+                    >
+                      <div style={{ backgroundColor: '#f0fdf4', height: '90px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '36px' }}>
+                        {p.image_url ? <img src={p.image_url} alt={p.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : '🛍️'}
+                      </div>
+                      <div style={{ padding: '8px' }}>
+                        <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '2px', lineHeight: '1.3', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{p.name}</div>
+                        <div style={{ fontSize: '14px', fontWeight: 700, color: '#16a34a', marginBottom: '4px' }}>{formatKoboToNaira(p.price)}</div>
+                        {p.has_variants ? (
+                          <div style={{ fontSize: '11px', color: '#7c3aed', fontWeight: 600 }}>Variants available</div>
+                        ) : (
+                          <div style={{ fontSize: '11px', color: outOfStock ? '#dc2626' : '#6b7280' }}>
+                            {outOfStock ? 'Out of stock' : `${p.quantity} in stock`}
+                          </div>
+                        )}
+                        {cartQty > 0 && <div style={{ fontSize: '11px', color: '#16a34a', fontWeight: 600, marginTop: '2px' }}>In cart: {cartQty}</div>}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-              <div style={{ padding: '10px' }}>
-                <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px' }}>{p.name}</div>
-                <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginBottom: '4px' }}>{formatKoboToNaira(p.price)}</div>
-                <div style={{ fontSize: '11px', color: outOfStock ? '#dc2626' : '#6b7280', marginBottom: '8px' }}>
-                  {outOfStock ? 'Out of stock' : `${p.quantity} in stock`}
-                </div>
-                {cartQty > 0 && (
-                  <div style={{ fontSize: '12px', color: '#16a34a', fontWeight: 600, marginBottom: '4px' }}>In cart: {cartQty}</div>
-                )}
-                <button
-                  onClick={() => handleAddToCart(p)}
-                  disabled={outOfStock || cartQty >= p.quantity}
-                  style={{ width: '100%', padding: '6px', backgroundColor: outOfStock || cartQty >= p.quantity ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: outOfStock || cartQty >= p.quantity ? 'not-allowed' : 'pointer', fontSize: '12px', fontWeight: 600 }}
-                >
-                  {t.storefront_add_to_cart}
-                </button>
-              </div>
-            </div>
-          );
-        })}
+            );
+          })}
+        </div>
+
+        {/* Infinite scroll sentinel */}
+        <div ref={sentinelRef} style={{ height: '1px' }} />
+        {isFetchingMore && <div style={{ textAlign: 'center', padding: '12px', color: '#6b7280', fontSize: '13px' }}>Loading more…</div>}
       </div>
+
+      {/* Cart bar */}
       {itemCount > 0 && (
-        <div style={{ position: 'fixed', bottom: '60px', left: 0, right: 0, backgroundColor: '#fff', borderTop: '2px solid #16a34a', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ fontSize: '14px' }}>{itemCount} items • {formatKoboToNaira(total)}</span>
-          <button onClick={() => setStep('checkout')} style={{ padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600 }}>
+        <div style={{ position: 'fixed', bottom: '60px', left: 0, right: 0, backgroundColor: '#fff', borderTop: '2px solid #16a34a', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', zIndex: 40 }}>
+          <span style={{ fontSize: '14px', fontWeight: 600 }}>{itemCount} items • {formatKoboToNaira(total)}</span>
+          <button onClick={() => setStep('checkout')} style={{ padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 700 }}>
             {t.storefront_checkout}
           </button>
+        </div>
+      )}
+
+      {/* Product modal */}
+      {modalProduct && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 100, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }} onClick={closeModal}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '20px 20px 0 0', width: '100%', maxWidth: '500px', padding: '20px', maxHeight: '85vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+            {/* Image gallery placeholder */}
+            <div style={{ backgroundColor: '#f0fdf4', borderRadius: '12px', height: '160px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '56px', marginBottom: '16px' }}>
+              {modalProduct.image_url ? <img src={modalProduct.image_url} alt={modalProduct.name} style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '12px' }} /> : '🛍️'}
+            </div>
+
+            <div style={{ fontSize: '17px', fontWeight: 700, marginBottom: '4px' }}>{modalProduct.name}</div>
+            {modalProduct.description && <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '10px', lineHeight: '1.5' }}>{modalProduct.description}</div>}
+            <div style={{ fontSize: '20px', fontWeight: 800, color: '#16a34a', marginBottom: '16px' }}>
+              {formatKoboToNaira(modalProduct.price + (selectedVariant?.price_delta ?? 0))}
+              {selectedVariant?.price_delta ? (
+                <span style={{ fontSize: '12px', color: selectedVariant.price_delta > 0 ? '#dc2626' : '#16a34a', marginLeft: '8px' }}>
+                  {selectedVariant.price_delta > 0 ? '+' : ''}{formatKoboToNaira(selectedVariant.price_delta)}
+                </span>
+              ) : null}
+            </div>
+
+            {/* Variant picker */}
+            {modalVariantsLoading && <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '12px' }}>Loading options…</div>}
+            {Object.entries(variantGroups).map(([optionName, variants]) => (
+              <div key={optionName} style={{ marginBottom: '14px' }}>
+                <div style={{ fontSize: '12px', fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>{optionName}</div>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  {variants.map(v => (
+                    <button
+                      key={v.id}
+                      onClick={() => setSelectedVariant(prev => prev?.id === v.id ? null : v)}
+                      disabled={v.quantity === 0}
+                      style={{
+                        padding: '6px 14px', borderRadius: '20px', fontSize: '13px', fontWeight: 600, cursor: v.quantity === 0 ? 'not-allowed' : 'pointer',
+                        border: `2px solid ${selectedVariant?.id === v.id ? '#16a34a' : '#e5e7eb'}`,
+                        backgroundColor: selectedVariant?.id === v.id ? '#f0fdf4' : v.quantity === 0 ? '#f9fafb' : '#fff',
+                        color: v.quantity === 0 ? '#9ca3af' : '#111827',
+                        textDecoration: v.quantity === 0 ? 'line-through' : 'none',
+                      }}
+                    >{v.option_value}{v.price_delta !== 0 ? ` (${v.price_delta > 0 ? '+' : ''}${formatKoboToNaira(v.price_delta)})` : ''}</button>
+                  ))}
+                </div>
+              </div>
+            ))}
+
+            {/* Quantity stepper */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+              <div style={{ fontSize: '13px', fontWeight: 600, color: '#374151' }}>Quantity</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', backgroundColor: '#f3f4f6', borderRadius: '10px', padding: '4px 8px' }}>
+                <button onClick={() => setModalQty(q => Math.max(1, q - 1))} style={{ width: '28px', height: '28px', border: 'none', backgroundColor: 'transparent', fontSize: '18px', cursor: 'pointer', color: '#374151', fontWeight: 700 }}>−</button>
+                <span style={{ fontSize: '15px', fontWeight: 700, minWidth: '24px', textAlign: 'center' }}>{modalQty}</span>
+                <button
+                  onClick={() => setModalQty(q => q + 1)}
+                  style={{ width: '28px', height: '28px', border: 'none', backgroundColor: 'transparent', fontSize: '18px', cursor: 'pointer', color: '#374151', fontWeight: 700 }}
+                >+</button>
+              </div>
+              <div style={{ fontSize: '12px', color: '#6b7280' }}>
+                {selectedVariant ? `${selectedVariant.quantity} avail.` : `${modalProduct.quantity} in stock`}
+              </div>
+            </div>
+
+            {/* Add to cart */}
+            <button
+              onClick={() => { handleAddToCart(modalProduct, selectedVariant, modalQty); closeModal(); }}
+              disabled={modalProduct.quantity === 0 || (!!modalProduct.has_variants && modalVariants.length > 0 && !selectedVariant)}
+              style={{
+                width: '100%', padding: '14px', fontSize: '15px', fontWeight: 700, borderRadius: '10px', border: 'none', cursor: 'pointer',
+                backgroundColor: (modalProduct.quantity === 0 || (!!modalProduct.has_variants && modalVariants.length > 0 && !selectedVariant)) ? '#d1d5db' : '#16a34a',
+                color: '#fff',
+              }}
+            >
+              {modalProduct.quantity === 0 ? 'Out of Stock' : (!!modalProduct.has_variants && modalVariants.length > 0 && !selectedVariant) ? 'Select an option' : `Add ${modalQty > 1 ? `${modalQty}x ` : ''}to Cart — ${formatKoboToNaira((modalProduct.price + (selectedVariant?.price_delta ?? 0)) * modalQty)}`}
+            </button>
+
+            <button onClick={closeModal} style={{ width: '100%', marginTop: '10px', padding: '12px', fontSize: '14px', fontWeight: 600, borderRadius: '10px', border: '1px solid #e5e7eb', backgroundColor: '#fff', color: '#374151', cursor: 'pointer' }}>
+              Close
+            </button>
+          </div>
         </div>
       )}
     </div>
