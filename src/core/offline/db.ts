@@ -4,6 +4,7 @@
  * Uses IndexedDB via Dexie for client-side offline storage
  * v2: Added pos_receipts, pos_sessions tables for POS Phase 2
  * v3: Added heldCarts for park/hold sale (POS Phase 4)
+ * v4: Added storefrontCarts for single-vendor cart persistence (SV Phase 1)
  */
 import Dexie, { type Table } from 'dexie';
 
@@ -105,6 +106,23 @@ export interface HeldCart {
   sessionId?: string;
 }
 
+// ─── Storefront cart session (Single-Vendor, SV Phase 1) ──────────────────────
+export interface StorefrontCartItem {
+  productId: string;
+  productName: string;
+  price: number;      // kobo — server-verified price at time of add
+  quantity: number;
+  imageEmoji?: string;
+}
+
+export interface StorefrontCartSession {
+  id: string;         // `sv_cart_${tenantId}`
+  tenantId: string;
+  token: string;      // server session_token (tok_...)
+  items: StorefrontCartItem[];
+  updatedAt: number;
+}
+
 // ─── Database class ───────────────────────────────────────────────────────────
 export class CommerceOfflineDB extends Dexie {
   mutations!: Table<CommerceMutation, number>;
@@ -114,6 +132,7 @@ export class CommerceOfflineDB extends Dexie {
   posReceipts!: Table<PosReceipt, string>;
   posSessions!: Table<PosLocalSession, string>;
   heldCarts!: Table<HeldCart, string>;
+  storefrontCarts!: Table<StorefrontCartSession, string>;
 
   constructor(tenantId: string) {
     super(`WebWakaCommerce_${tenantId}`);
@@ -145,6 +164,18 @@ export class CommerceOfflineDB extends Dexie {
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
+    });
+
+    // v4 — adds storefrontCarts for single-vendor cart persistence (SV Phase 1)
+    this.version(4).stores({
+      mutations: '++id, tenantId, entityType, entityId, status, timestamp',
+      cartItems: '++id, tenantId, sessionToken, productId',
+      offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
+      products: 'id, tenantId, sku, category, cachedAt',
+      posReceipts: 'id, orderId, tenantId, createdAt',
+      posSessions: 'id, tenantId, status, openedAt',
+      heldCarts: 'id, tenantId, heldAt',
+      storefrontCarts: 'id, tenantId, updatedAt',
     });
   }
 }
@@ -275,4 +306,37 @@ export async function restoreHeldCart(tenantId: string, heldCartId: string): Pro
 export async function deleteHeldCart(tenantId: string, heldCartId: string): Promise<void> {
   const db = getCommerceDB(tenantId);
   await db.heldCarts.delete(heldCartId);
+}
+
+// ─── Storefront cart helpers (SV Phase 1) ─────────────────────────────────────
+
+/** Persist storefront cart to IndexedDB (one session per tenantId). */
+export async function saveStorefrontCart(
+  tenantId: string,
+  items: StorefrontCartItem[],
+  token: string,
+): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  await db.storefrontCarts.put({
+    id: `sv_cart_${tenantId}`,
+    tenantId,
+    token,
+    items,
+    updatedAt: Date.now(),
+  });
+}
+
+/** Load persisted storefront cart. Returns null if none saved. */
+export async function loadStorefrontCart(
+  tenantId: string,
+): Promise<StorefrontCartSession | null> {
+  const db = getCommerceDB(tenantId);
+  const session = await db.storefrontCarts.get(`sv_cart_${tenantId}`);
+  return session ?? null;
+}
+
+/** Clear storefront cart after successful checkout. */
+export async function clearStorefrontCart(tenantId: string): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  await db.storefrontCarts.delete(`sv_cart_${tenantId}`);
 }
