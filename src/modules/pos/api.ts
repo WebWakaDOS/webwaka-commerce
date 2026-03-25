@@ -1,7 +1,8 @@
 /**
- * COM-1: Point of Sale (POS) API
+ * COM-1: Point of Sale (POS) API — Phase 1
  * Hono router for in-store POS operations
- * Invariants: Nigeria-First (Paystack), Offline-First (sync mutations), Multi-tenancy
+ * Phase 1 additions: Session/shift management, split payments, rate limiting, void, PCI hardening
+ * Invariants: Nigeria-First (Paystack), Offline-First (sync), Multi-tenancy, PCI-DSS error hygiene
  */
 import { Hono } from 'hono';
 import { getTenantId, requireRole } from '@webwaka/core';
@@ -9,7 +10,34 @@ import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
 
-// Tenant middleware
+// ─── Rate limiter ────────────────────────────────────────────────────────────
+// In-memory per Cloudflare isolate. Keyed by `tenantId:sessionId` (10 req/min).
+// Exported for test teardown only — do NOT use in production code.
+const _rateLimitStore = new Map<string, { count: number; windowStart: number }>();
+export const _resetRateLimitStore = () => _rateLimitStore.clear();
+const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const entry = _rateLimitStore.get(key);
+  if (!entry || now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    _rateLimitStore.set(key, { count: 1, windowStart: now });
+    return true;
+  }
+  if (entry.count >= RATE_LIMIT_MAX) return false;
+  entry.count++;
+  return true;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const VALID_PAYMENT_METHODS = ['cash', 'card', 'transfer', 'cod', 'split', 'agency_banking'] as const;
+type PaymentMethod = (typeof VALID_PAYMENT_METHODS)[number];
+
+const generatePayRef = () =>
+  `PAY_${crypto.randomUUID().replace(/-/g, '').toUpperCase().slice(0, 12)}`;
+
+// ─── Tenant middleware ─────────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
   const tenantId = getTenantId(c);
   if (!tenantId) {
@@ -19,66 +47,205 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// GET /api/pos/ - List products for POS
+// ──────────────────────────────────────────────────────────────────────────────
+// SESSION / SHIFT MANAGEMENT
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/pos/sessions — Current open session for tenant
+app.get('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  try {
+    const session = await c.env.DB.prepare(
+      "SELECT id, cashier_id, initial_float_kobo, status, opened_at FROM pos_sessions WHERE tenant_id = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1",
+    )
+      .bind(tenantId)
+      .first();
+    return c.json({ success: true, data: session ?? null });
+  } catch {
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
+  }
+});
+
+// POST /api/pos/sessions — Open a new cashier shift
+app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    cashier_id: string;
+    cashier_pin?: string;
+    initial_float_kobo?: number;
+  }>();
+
+  if (!body.cashier_id || typeof body.cashier_id !== 'string' || !body.cashier_id.trim()) {
+    return c.json({ success: false, error: 'cashier_id is required' }, 400);
+  }
+
+  const id = `sess_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const now = Date.now();
+  const floatKobo = body.initial_float_kobo ?? 0;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO pos_sessions (id, tenant_id, cashier_id, initial_float_kobo, status, opened_at)
+       VALUES (?, ?, ?, ?, 'open', ?)`,
+    )
+      .bind(id, tenantId, body.cashier_id.trim(), floatKobo, now)
+      .run();
+
+    return c.json(
+      {
+        success: true,
+        data: {
+          id,
+          tenant_id: tenantId,
+          cashier_id: body.cashier_id.trim(),
+          initial_float_kobo: floatKobo,
+          status: 'open',
+          opened_at: now,
+        },
+      },
+      201,
+    );
+  } catch {
+    return c.json({ success: false, error: 'Failed to open session' }, 500);
+  }
+});
+
+// PATCH /api/pos/sessions/:id/close — Close shift and generate Z-report
+app.patch(
+  '/sessions/:id/close',
+  requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
+  async (c) => {
+    const tenantId = getTenantId(c);
+    const id = c.req.param('id');
+    const now = Date.now();
+
+    try {
+      const session = await c.env.DB.prepare(
+        'SELECT id, cashier_id, initial_float_kobo, status, opened_at FROM pos_sessions WHERE id = ? AND tenant_id = ?',
+      )
+        .bind(id, tenantId)
+        .first<{
+          id: string;
+          cashier_id: string;
+          initial_float_kobo: number;
+          status: string;
+          opened_at: number;
+        }>();
+
+      if (!session) return c.json({ success: false, error: 'Session not found' }, 404);
+
+      // Idempotent: already closed → return existing report
+      if (session.status === 'closed') {
+        const existing = await c.env.DB.prepare(
+          'SELECT z_report_json FROM pos_sessions WHERE id = ? AND tenant_id = ?',
+        )
+          .bind(id, tenantId)
+          .first<{ z_report_json: string }>();
+        const report = existing?.z_report_json ? JSON.parse(existing.z_report_json) : {};
+        return c.json({ success: true, data: report });
+      }
+
+      // Compute session sales totals
+      const salesSummary = await c.env.DB.prepare(
+        `SELECT
+           COUNT(*) as order_count,
+           COALESCE(SUM(total_amount), 0) as total_sales_kobo,
+           COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN total_amount ELSE 0 END), 0) as cash_sales_kobo
+         FROM orders
+         WHERE session_id = ? AND tenant_id = ? AND order_status != 'voided'`,
+      )
+        .bind(id, tenantId)
+        .first<{ order_count: number; total_sales_kobo: number; cash_sales_kobo: number }>();
+
+      const totalSales = salesSummary?.total_sales_kobo ?? 0;
+      const cashSales = salesSummary?.cash_sales_kobo ?? 0;
+      const orderCount = salesSummary?.order_count ?? 0;
+      // Cash variance: cash collected vs opening float (spec: sales - float)
+      const cashVarianceKobo = cashSales - session.initial_float_kobo;
+
+      const zReport = {
+        id,
+        cashier_id: session.cashier_id,
+        status: 'closed',
+        opened_at: session.opened_at,
+        closed_at: now,
+        initial_float_kobo: session.initial_float_kobo,
+        total_sales_kobo: totalSales,
+        cash_sales_kobo: cashSales,
+        order_count: orderCount,
+        cash_variance_kobo: cashVarianceKobo,
+      };
+
+      await c.env.DB.prepare(
+        `UPDATE pos_sessions SET status = 'closed', closed_at = ?, total_sales_kobo = ?, order_count = ?, z_report_json = ? WHERE id = ? AND tenant_id = ?`,
+      )
+        .bind(now, totalSales, orderCount, JSON.stringify(zReport), id, tenantId)
+        .run();
+
+      return c.json({ success: true, data: zReport });
+    } catch {
+      return c.json({ success: false, error: 'Failed to close session' }, 500);
+    }
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PRODUCT MANAGEMENT
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/pos/ — List products for POS
 app.get('/', async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
-    ).bind(tenantId).all();
+      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, is_active FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC',
+    )
+      .bind(tenantId)
+      .all();
     return c.json({ success: true, data: results });
   } catch {
-    return c.json({ success: true, data: [], message: 'DB not yet initialized' });
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
 
-// GET /api/pos/products - List products
+// GET /api/pos/products — List products with filters and pagination
 app.get('/products', async (c) => {
   const tenantId = getTenantId(c);
   const category = c.req.query('category');
   const search = c.req.query('search');
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10), 500);
+  const offset = parseInt(c.req.query('offset') ?? '0', 10);
   try {
-    let query = 'SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL';
-    const params: string[] = [tenantId!];
-    if (category) { query += ' AND category = ?'; params.push(category); }
-    if (search) { query += ' AND (name LIKE ? OR sku LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
-    query += ' ORDER BY name ASC';
+    let query =
+      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL';
+    const params: (string | number)[] = [tenantId!];
+    if (category) {
+      query += ' AND category = ?';
+      params.push(category);
+    }
+    if (search) {
+      query += ' AND (name LIKE ? OR sku LIKE ? OR barcode LIKE ?)';
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+    }
+    query += ' ORDER BY name ASC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
     const { results } = await c.env.DB.prepare(query).bind(...params).all();
     return c.json({ success: true, data: results });
   } catch {
-    return c.json({ success: true, data: [], message: 'DB not yet initialized' });
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
 
-// POST /api/pos/products - Create product
-app.post('/products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// GET /api/pos/products/barcode/:code — Barcode / SKU lookup
+app.get('/products/barcode/:code', async (c) => {
   const tenantId = getTenantId(c);
-  const body = await c.req.json<{
-    sku: string; name: string; price: number; quantity: number;
-    description?: string; category?: string; barcode?: string;
-  }>();
-  const id = `prod_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-  const now = Date.now();
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO products (id, tenant_id, sku, name, description, category, price, quantity, barcode, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(id, tenantId, body.sku, body.name, body.description ?? null, body.category ?? null,
-      body.price, body.quantity, body.barcode ?? null, now, now).run();
-    return c.json({ success: true, data: { id, ...body, tenant_id: tenantId } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
-  }
-});
-
-// GET /api/pos/products/:id - Get product
-app.get('/products/:id', async (c) => {
-  const tenantId = getTenantId(c);
-  const id = c.req.param('id');
+  const code = c.req.param('code');
   try {
     const product = await c.env.DB.prepare(
-      'SELECT * FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
-    ).bind(id, tenantId).first();
+      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold FROM products WHERE tenant_id = ? AND (barcode = ? OR sku = ?) AND is_active = 1 AND deleted_at IS NULL',
+    )
+      .bind(tenantId, code, code)
+      .first();
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
     return c.json({ success: true, data: product });
   } catch {
@@ -86,112 +253,460 @@ app.get('/products/:id', async (c) => {
   }
 });
 
-// PATCH /api/pos/products/:id - Update product
+// POST /api/pos/products — Create product
+app.post('/products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    sku: string;
+    name: string;
+    price: number;
+    quantity: number;
+    description?: string;
+    category?: string;
+    barcode?: string;
+    low_stock_threshold?: number;
+  }>();
+  const id = `prod_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const now = Date.now();
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO products (id, tenant_id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        id,
+        tenantId,
+        body.sku,
+        body.name,
+        body.description ?? null,
+        body.category ?? null,
+        body.price,
+        body.quantity,
+        body.barcode ?? null,
+        body.low_stock_threshold ?? 5,
+        now,
+        now,
+      )
+      .run();
+    return c.json({ success: true, data: { id, ...body, tenant_id: tenantId } }, 201);
+  } catch {
+    return c.json({ success: false, error: 'Failed to create product' }, 500);
+  }
+});
+
+// GET /api/pos/products/:id — Get product by ID
+app.get('/products/:id', async (c) => {
+  const tenantId = getTenantId(c);
+  const id = c.req.param('id');
+  try {
+    const product = await c.env.DB.prepare(
+      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, is_active FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+    )
+      .bind(id, tenantId)
+      .first();
+    if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+    return c.json({ success: true, data: product });
+  } catch {
+    return c.json({ success: false, error: 'Product not found' }, 404);
+  }
+});
+
+// PATCH /api/pos/products/:id — Update product fields
 app.patch('/products/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const id = c.req.param('id');
   const body = await c.req.json<Record<string, unknown>>();
   const now = Date.now();
-  const allowed = ['name', 'price', 'quantity', 'description', 'category', 'barcode', 'is_active'];
-  const fields = Object.keys(body).filter(k => allowed.includes(k));
+  const allowed = [
+    'name',
+    'price',
+    'quantity',
+    'description',
+    'category',
+    'barcode',
+    'is_active',
+    'low_stock_threshold',
+  ];
+  const fields = Object.keys(body).filter((k) => allowed.includes(k));
   if (fields.length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400);
-  const setClause = fields.map(f => `${f} = ?`).join(', ');
-  const values = fields.map(f => body[f]);
+  const setClause = fields.map((f) => `${f} = ?`).join(', ');
+  const values = fields.map((f) => body[f]);
   try {
     await c.env.DB.prepare(
-      `UPDATE products SET ${setClause}, updated_at = ? WHERE id = ? AND tenant_id = ?`
-    ).bind(...values, now, id, tenantId).run();
+      `UPDATE products SET ${setClause}, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+    )
+      .bind(...values, now, id, tenantId)
+      .run();
     return c.json({ success: true, data: { id, ...body } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch {
+    return c.json({ success: false, error: 'Failed to update product' }, 500);
   }
 });
 
-// POST /api/pos/checkout - Process POS sale
+// ──────────────────────────────────────────────────────────────────────────────
+// CHECKOUT — Split payments + stock validation + atomic deduction
+// ──────────────────────────────────────────────────────────────────────────────
 app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
+
+  type LineItem = { product_id: string; quantity: number; price: number; name: string };
+  type PaymentEntry = { method: string; amount_kobo: number; reference?: string };
+
   const body = await c.req.json<{
-    items: Array<{ product_id: string; quantity: number; price: number; name: string }>;
-    payment_method: string;
+    line_items?: LineItem[];
+    items?: LineItem[];
+    payments?: PaymentEntry[];
+    payment_method?: string;
+    session_id?: string;
     customer_email?: string;
     customer_phone?: string;
     discount?: number;
   }>();
-  const id = `ord_pos_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-  const now = Date.now();
-  const subtotal = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
-  const discount = body.discount ?? 0;
-  const total = subtotal - discount;
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal, discount, total_amount, payment_method, payment_status, order_status, channel, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`
-    ).bind(id, tenantId, body.customer_email ?? null, body.customer_phone ?? null,
-      JSON.stringify(body.items), subtotal, discount, total, body.payment_method, now, now).run();
-    return c.json({ success: true, data: { id, total_amount: total, payment_status: 'paid', order_status: 'fulfilled' } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
-  }
-});
 
-// GET /api/pos/orders - List POS orders
-app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
-  const tenantId = getTenantId(c);
-  try {
-    const { results } = await c.env.DB.prepare(
-      "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
-    ).bind(tenantId).all();
-    return c.json({ success: true, data: results });
-  } catch {
-    return c.json({ success: true, data: [] });
-  }
-});
+  // Normalize: accept line_items or items (backward compat)
+  const lineItems: LineItem[] = body.line_items ?? body.items ?? [];
 
-// POST /api/pos/sync - Offline sync endpoint
-app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
-  const tenantId = getTenantId(c);
-  const body = await c.req.json<{ mutations: Array<{ entity_type: string; entity_id: string; action: string; payload: unknown; version: number }> }>();
+  if (lineItems.length === 0) {
+    return c.json({ success: false, error: 'Cart is empty' }, 400);
+  }
+
+  // Rate limit: 10 checkouts/min per session_id (PCI hardening)
+  if (body.session_id) {
+    const rateLimitKey = `${tenantId}:${body.session_id}`;
+    if (!checkRateLimit(rateLimitKey)) {
+      return c.json({ success: false, error: 'Too many requests. Please wait before retrying.' }, 429);
+    }
+  }
+
+  // Validate payment info is present
+  if (!body.payments && !body.payment_method) {
+    return c.json({ success: false, error: 'Payment information required' }, 400);
+  }
+
+  // Validate payment methods
+  const paymentEntries: PaymentEntry[] = body.payments ?? [
+    { method: body.payment_method!, amount_kobo: 0 },
+  ];
+  for (const p of paymentEntries) {
+    if (!VALID_PAYMENT_METHODS.includes(p.method as PaymentMethod)) {
+      return c.json(
+        { success: false, error: `Invalid payment method: ${p.method}. Allowed: ${VALID_PAYMENT_METHODS.join(', ')}` },
+        400,
+      );
+    }
+  }
+
   const now = Date.now();
-  const applied: string[] = [];
+  const orderId = `ord_pos_${now}_${crypto.randomUUID().slice(0, 8)}`;
+
   try {
-    for (const m of body.mutations) {
-      if (m.entity_type === 'order' && m.action === 'CREATE') {
-        const payload = m.payload as Record<string, unknown>;
-        const id = `ord_sync_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-        await c.env.DB.prepare(
-          `INSERT INTO orders (id, tenant_id, items_json, subtotal, discount, total_amount, payment_method, payment_status, order_status, channel, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 0, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`
-        ).bind(id, tenantId, JSON.stringify(payload.items ?? []),
-          payload.subtotal ?? 0, payload.total_amount ?? 0,
-          payload.payment_method ?? 'cash', now, now).run();
-        applied.push(m.entity_id);
+    // Step 1 — Batch stock validation
+    const stockResults = await c.env.DB.batch(
+      lineItems.map((item) =>
+        c.env.DB.prepare(
+          'SELECT id, quantity, name FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+        ).bind(item.product_id, tenantId),
+      ),
+    );
+
+    // Step 2 — Accumulate stock failures
+    const insufficientItems: Array<{ product_id: string; available: number; requested: number }> =
+      [];
+    for (let i = 0; i < lineItems.length; i++) {
+      const rows = stockResults[i].results as Array<{ id: string; quantity: number; name: string }>;
+      if (rows.length === 0) {
+        return c.json(
+          { success: false, error: `Product not found: ${lineItems[i].product_id}` },
+          404,
+        );
+      }
+      const available = rows[0].quantity;
+      if (available < lineItems[i].quantity) {
+        insufficientItems.push({
+          product_id: lineItems[i].product_id,
+          available,
+          requested: lineItems[i].quantity,
+        });
       }
     }
-    return c.json({ success: true, data: { applied, synced_at: now } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+    if (insufficientItems.length > 0) {
+      return c.json(
+        { success: false, error: 'Insufficient stock', insufficient_items: insufficientItems },
+        409,
+      );
+    }
+
+    // Step 3 — Compute totals (all in kobo — Nigeria-First invariant)
+    const subtotal = lineItems.reduce((s, i) => s + i.price * i.quantity, 0);
+    const discount = body.discount ?? 0;
+    const total = subtotal - discount;
+
+    // Step 4 — Validate payment amounts when payments[] is provided
+    if (body.payments) {
+      const paymentsTotal = body.payments.reduce((s, p) => s + p.amount_kobo, 0);
+      if (paymentsTotal !== total) {
+        return c.json(
+          {
+            success: false,
+            error: `Payment total (${paymentsTotal}) does not match order total (${total})`,
+          },
+          400,
+        );
+      }
+    }
+
+    // Step 5 — Resolve payment entries: generate Paystack ref for card/transfer
+    const resolvedPayments: PaymentEntry[] = paymentEntries.map((p) => ({
+      ...p,
+      amount_kobo: body.payments ? p.amount_kobo : total,
+      reference:
+        p.reference ??
+        (p.method === 'card' || p.method === 'transfer' || p.method === 'agency_banking'
+          ? generatePayRef()
+          : undefined),
+    }));
+
+    // Derive primary payment_method for backward-compat column
+    const primaryMethod =
+      resolvedPayments.length === 1 ? resolvedPayments[0].method : 'split';
+
+    // Step 6 — Atomic D1 batch: deduct stock + insert order
+    const deductStmts = lineItems.map((item) =>
+      c.env.DB.prepare(
+        'UPDATE products SET quantity = quantity - ?, version = version + 1, updated_at = ? WHERE id = ? AND tenant_id = ? AND quantity >= ?',
+      ).bind(item.quantity, now, item.product_id, tenantId, item.quantity),
+    );
+
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal, discount, total_amount, payment_method, payments_json, session_id, payment_status, order_status, channel, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`,
+    ).bind(
+      orderId,
+      tenantId,
+      body.customer_email ?? null,
+      body.customer_phone ?? null,
+      JSON.stringify(lineItems),
+      subtotal,
+      discount,
+      total,
+      primaryMethod,
+      JSON.stringify(resolvedPayments),
+      body.session_id ?? null,
+      now,
+      now,
+    );
+
+    const batchResults = await c.env.DB.batch([...deductStmts, insertStmt]);
+
+    // Step 7 — Detect stock race condition
+    for (let i = 0; i < lineItems.length; i++) {
+      if ((batchResults[i] as { meta: { changes: number } }).meta.changes === 0) {
+        return c.json(
+          { success: false, error: 'Stock changed during checkout, please retry', code: 'STOCK_RACE' },
+          409,
+        );
+      }
+    }
+
+    // Step 8 — Return receipt
+    const payRef = resolvedPayments.find((p) => p.reference)?.reference;
+    return c.json(
+      {
+        success: true,
+        data: {
+          id: orderId,
+          total_amount: total,
+          payment_status: 'paid',
+          order_status: 'fulfilled',
+          payment_method: primaryMethod,
+          payments: resolvedPayments,
+          ...(payRef ? { payment_reference: payRef } : {}),
+        },
+      },
+      201,
+    );
+  } catch {
+    // PCI hardening: never leak internal error details
+    return c.json({ success: false, error: 'Transaction failed' }, 500);
   }
 });
 
-// GET /api/pos/dashboard - Sales summary
+// ──────────────────────────────────────────────────────────────────────────────
+// VOID ORDER — PCI: requires reason, RBAC STAFF+, idempotent
+// ──────────────────────────────────────────────────────────────────────────────
+app.post('/orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const orderId = c.req.param('id');
+  const body = await c.req.json<{ reason?: string; session_id?: string }>();
+
+  if (!body.reason || typeof body.reason !== 'string' || !body.reason.trim()) {
+    return c.json({ success: false, error: 'Void reason is required' }, 400);
+  }
+
+  const now = Date.now();
+
+  try {
+    const order = await c.env.DB.prepare(
+      "SELECT id, order_status, total_amount FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL",
+    )
+      .bind(orderId, tenantId)
+      .first<{ id: string; order_status: string; total_amount: number }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    // Idempotent: already voided → return current state
+    if (order.order_status === 'voided') {
+      return c.json({
+        success: true,
+        data: { id: orderId, voided: true, order_status: 'voided', reason: body.reason.trim() },
+      });
+    }
+
+    await c.env.DB.prepare(
+      "UPDATE orders SET order_status = 'voided', void_reason = ?, voided_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?",
+    )
+      .bind(body.reason.trim(), now, now, orderId, tenantId)
+      .run();
+
+    return c.json({
+      success: true,
+      data: {
+        id: orderId,
+        voided: true,
+        order_status: 'voided',
+        voided_at: now,
+        reason: body.reason.trim(),
+        total_amount: order.total_amount,
+      },
+    });
+  } catch {
+    return c.json({ success: false, error: 'Transaction failed' }, 500);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ORDERS
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/pos/orders — List POS orders
+app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10), 500);
+  const offset = parseInt(c.req.query('offset') ?? '0', 10);
+  try {
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ? OFFSET ?",
+    )
+      .bind(tenantId, limit, offset)
+      .all();
+    return c.json({ success: true, data: results });
+  } catch {
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OFFLINE SYNC
+// ──────────────────────────────────────────────────────────────────────────────
+
+// POST /api/pos/sync — Offline mutation replay (idempotent)
+app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    mutations: Array<{
+      entity_type: string;
+      entity_id: string;
+      action: string;
+      payload: unknown;
+      version: number;
+    }>;
+  }>();
+  const now = Date.now();
+  const applied: string[] = [];
+  const skipped: string[] = [];
+  const failed: string[] = [];
+
+  for (const m of body.mutations) {
+    if (m.entity_type === 'order' && m.action === 'CREATE') {
+      const payload = m.payload as Record<string, unknown>;
+      try {
+        const existing = await c.env.DB.prepare(
+          "SELECT id FROM orders WHERE tenant_id = ? AND channel = 'pos' AND id LIKE ?",
+        )
+          .bind(tenantId, `%${m.entity_id}%`)
+          .first();
+
+        if (existing) {
+          skipped.push(m.entity_id);
+          continue;
+        }
+
+        const id = `ord_sync_${now}_${crypto.randomUUID().slice(0, 8)}`;
+        await c.env.DB.prepare(
+          `INSERT INTO orders (id, tenant_id, items_json, subtotal, discount, total_amount, payment_method, payment_status, order_status, channel, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 0, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`,
+        )
+          .bind(
+            id,
+            tenantId,
+            JSON.stringify(payload.items ?? []),
+            payload.subtotal ?? 0,
+            payload.total_amount ?? 0,
+            payload.payment_method ?? 'cash',
+            now,
+            now,
+          )
+          .run();
+        applied.push(m.entity_id);
+      } catch {
+        failed.push(m.entity_id);
+      }
+    }
+  }
+
+  return c.json({ success: true, data: { applied, skipped, failed, synced_at: now } });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ──────────────────────────────────────────────────────────────────────────────
+
 app.get('/dashboard', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   try {
-    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
     const todayTs = today.getTime();
+
     const summary = await c.env.DB.prepare(
-      "SELECT COUNT(*) as order_count, COALESCE(SUM(total_amount), 0) as total_revenue FROM orders WHERE tenant_id = ? AND channel = 'pos' AND payment_status = 'paid' AND created_at >= ?"
-    ).bind(tenantId, todayTs).first<{ order_count: number; total_revenue: number }>();
+      "SELECT COUNT(*) as order_count, COALESCE(SUM(total_amount), 0) as total_revenue FROM orders WHERE tenant_id = ? AND channel = 'pos' AND payment_status = 'paid' AND order_status != 'voided' AND created_at >= ?",
+    )
+      .bind(tenantId, todayTs)
+      .first<{ order_count: number; total_revenue: number }>();
+
     const productCount = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL'
-    ).bind(tenantId).first<{ count: number }>();
-    return c.json({ success: true, data: {
-      today_orders: summary?.order_count ?? 0,
-      today_revenue_kobo: summary?.total_revenue ?? 0,
-      product_count: productCount?.count ?? 0,
-    }});
+      'SELECT COUNT(*) as count FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+    )
+      .bind(tenantId)
+      .first<{ count: number }>();
+
+    const lowStockCount = await c.env.DB.prepare(
+      'SELECT COUNT(*) as count FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL AND quantity <= low_stock_threshold',
+    )
+      .bind(tenantId)
+      .first<{ count: number }>();
+
+    return c.json({
+      success: true,
+      data: {
+        today_orders: summary?.order_count ?? 0,
+        today_revenue_kobo: summary?.total_revenue ?? 0,
+        product_count: productCount?.count ?? 0,
+        low_stock_count: lowStockCount?.count ?? 0,
+      },
+    });
   } catch {
-    return c.json({ success: true, data: { today_orders: 0, today_revenue_kobo: 0, product_count: 0 } });
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
 
