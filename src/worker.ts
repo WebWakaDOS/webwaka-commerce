@@ -20,6 +20,7 @@ export interface Env {
   TENANT_CONFIG: KVNamespace;
   EVENTS: KVNamespace;
   SESSIONS_KV: KVNamespace;
+  PAYSTACK_SECRET: string;   // Cloudflare Worker secret (sk_test_... or sk_live_...)
 }
 
 const app = new Hono<{ Bindings: Env }>();

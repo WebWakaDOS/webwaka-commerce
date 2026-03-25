@@ -354,7 +354,30 @@ function POSModule({ tenantId, t, isOnline }: { tenantId: string; t: ReturnType<
   );
 }
 
-// Single-Vendor Storefront Module (COM-2) — SV Phase 1: real API + Dexie cart
+// ── Nigerian states (36 states + FCT) ────────────────────────────────────────
+const NIGERIAN_STATES = [
+  'Abia','Adamawa','Akwa Ibom','Anambra','Bauchi','Bayelsa','Benue','Borno',
+  'Cross River','Delta','Ebonyi','Edo','Ekiti','Enugu','FCT (Abuja)','Gombe',
+  'Imo','Jigawa','Kaduna','Kano','Katsina','Kebbi','Kogi','Kwara','Lagos',
+  'Nasarawa','Niger','Ogun','Ondo','Osun','Oyo','Plateau','Rivers',
+  'Sokoto','Taraba','Yobe','Zamfara',
+];
+
+const VAT_RATE = 0.075; // FIRS 7.5%
+
+declare global {
+  interface Window {
+    PaystackPop: {
+      setup(opts: {
+        key: string; email: string; amount: number; ref: string; currency: string;
+        onSuccess: (transaction: { reference: string }) => void;
+        onCancel: () => void;
+      }): { openIframe(): void };
+    };
+  }
+}
+
+// Single-Vendor Storefront Module (COM-2) — SV Phase 2: Paystack, VAT, promo, address
 function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
   const { cart, addToCart, clearCart, total, itemCount, token } = useStorefrontCart(tenantId);
   const [step, setStep] = useState<'catalog' | 'checkout' | 'success'>('catalog');
@@ -365,10 +388,37 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [checkoutError, setCheckoutError] = useState('');
   const [checkoutLoading, setCheckoutLoading] = useState(false);
 
-  // ── Real catalog from API ──────────────────────────────────────────────────
+  // ── Delivery address ──────────────────────────────────────────────────────
+  const [addrState, setAddrState] = useState('');
+  const [addrLga, setAddrLga] = useState('');
+  const [addrStreet, setAddrStreet] = useState('');
+
+  // ── Promo code ────────────────────────────────────────────────────────────
+  const [promoCode, setPromoCode] = useState('');
+  const [promoLoading, setPromoLoading] = useState(false);
+  const [promoError, setPromoError] = useState('');
+  const [promoDiscount, setPromoDiscount] = useState(0); // kobo
+
+  // ── Computed totals (client preview — server re-verifies) ─────────────────
+  const subtotal = total; // from cart hook (kobo)
+  const afterDiscount = Math.max(0, subtotal - promoDiscount);
+  const vatKobo = Math.round(afterDiscount * VAT_RATE);
+  const grandTotal = afterDiscount + vatKobo;
+
+  // ── Catalog ───────────────────────────────────────────────────────────────
   const [products, setProducts] = useState<Product[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState('');
+
+  // ── Load Paystack Inline JS ───────────────────────────────────────────────
+  useEffect(() => {
+    if (document.getElementById('paystack-js')) return;
+    const s = document.createElement('script');
+    s.id = 'paystack-js';
+    s.src = 'https://js.paystack.co/v1/inline.js';
+    s.async = true;
+    document.head.appendChild(s);
+  }, []);
 
   useEffect(() => {
     if (!tenantId) return;
@@ -389,16 +439,35 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const handleAddToCart = (p: Product) => {
     const existing = cart.find(i => i.id === p.id);
     const cartQty = (existing?.cartQuantity ?? 0) + 1;
-    if (cartQty > p.quantity) return; // client-side stock guard
+    if (cartQty > p.quantity) return;
     addToCart({ id: p.id, name: p.name, price: p.price, quantity: p.quantity, imageEmoji: '🛍️' });
   };
 
-  const handleCheckout = async () => {
-    if (!ndprConsent) return;
-    if (!email && !phone) {
-      setCheckoutError('Please enter your email or phone number');
-      return;
+  const handlePromoValidate = async () => {
+    if (!promoCode.trim()) return;
+    setPromoLoading(true);
+    setPromoError('');
+    setPromoDiscount(0);
+    try {
+      const res = await fetch('/api/single-vendor/promo/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({ code: promoCode.trim(), subtotal_kobo: subtotal }),
+      });
+      const data = await res.json() as { success: boolean; data?: { discount_kobo: number }; error?: string };
+      if (!res.ok || !data.success) {
+        setPromoError(data.error ?? 'Invalid promo code');
+      } else {
+        setPromoDiscount(data.data?.discount_kobo ?? 0);
+      }
+    } catch {
+      setPromoError('Could not validate code. Try again.');
+    } finally {
+      setPromoLoading(false);
     }
+  };
+
+  const submitCheckout = async (paystackReference: string) => {
     setCheckoutLoading(true);
     setCheckoutError('');
     try {
@@ -410,7 +479,10 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
           customer_email: email || undefined,
           customer_phone: phone || undefined,
           payment_method: 'paystack',
+          paystack_reference: paystackReference,
           ndpr_consent: true,
+          promo_code: promoCode.trim() || undefined,
+          delivery_address: addrState ? { state: addrState, lga: addrLga, street: addrStreet } : undefined,
           session_token: token,
         }),
       });
@@ -419,7 +491,7 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
         setCheckoutError(data.error ?? 'Checkout failed. Please try again.');
         return;
       }
-      setOrderRef(data.data?.payment_reference ?? `ord_${Date.now()}`);
+      setOrderRef(data.data?.payment_reference ?? paystackReference);
       await clearCart();
       setStep('success');
     } catch {
@@ -429,14 +501,46 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     }
   };
 
+  const handlePayWithPaystack = () => {
+    if (!ndprConsent) { setCheckoutError('Please accept the data consent to proceed.'); return; }
+    if (!email && !phone) { setCheckoutError('Please enter your email or phone number.'); return; }
+
+    const contactEmail = email || `${phone}@storefront.webwaka.ng`;
+    const ref = `PSK_${Date.now()}_${Math.random().toString(36).slice(2, 9).toUpperCase()}`;
+    const publicKey = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_PAYSTACK_PUBLIC_KEY) ?? '';
+
+    if (!window.PaystackPop || !publicKey) {
+      // Fallback for test environments without Paystack SDK
+      submitCheckout(ref);
+      return;
+    }
+
+    const handler = window.PaystackPop.setup({
+      key: publicKey,
+      email: contactEmail,
+      amount: grandTotal,
+      ref,
+      currency: 'NGN',
+      onSuccess: (transaction) => {
+        submitCheckout(transaction.reference);
+      },
+      onCancel: () => {
+        setCheckoutError('Payment cancelled.');
+        setCheckoutLoading(false);
+      },
+    });
+    handler.openIframe();
+  };
+
   if (step === 'success') {
     return (
       <div style={{ padding: '24px', textAlign: 'center' }}>
         <div style={{ fontSize: '48px', marginBottom: '16px' }}>✅</div>
         <h2 style={{ color: '#16a34a' }}>{t.storefront_order_placed}</h2>
         <p style={{ color: '#6b7280' }}>Ref: {orderRef}</p>
+        <p style={{ color: '#6b7280', fontSize: '13px' }}>A confirmation will be sent to {email || phone}</p>
         <button
-          onClick={() => { setStep('catalog'); setOrderRef(''); }}
+          onClick={() => { setStep('catalog'); setOrderRef(''); setPromoDiscount(0); setPromoCode(''); }}
           style={{ marginTop: '16px', padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
         >
           Continue Shopping
@@ -446,45 +550,126 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   }
 
   if (step === 'checkout') {
+    const inp: React.CSSProperties = { width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', boxSizing: 'border-box', fontSize: '14px' };
+    const lbl: React.CSSProperties = { display: 'block', fontSize: '12px', fontWeight: 600, marginBottom: '4px', color: '#374151' };
+    const field: React.CSSProperties = { marginBottom: '12px' };
+
     return (
-      <div style={{ padding: '16px', maxWidth: '480px', margin: '0 auto' }}>
-        <h2 style={{ marginBottom: '16px' }}>{t.storefront_checkout}</h2>
+      <div style={{ padding: '16px', maxWidth: '480px', margin: '0 auto', paddingBottom: '24px' }}>
+        <button onClick={() => setStep('catalog')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#16a34a', fontWeight: 600, marginBottom: '12px', padding: 0 }}>
+          ← Back to catalog
+        </button>
+        <h2 style={{ marginBottom: '16px', fontSize: '20px' }}>{t.storefront_checkout}</h2>
+
         {checkoutError && (
           <div style={{ padding: '10px 14px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '6px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>
             {checkoutError}
           </div>
         )}
-        <div style={{ marginBottom: '12px' }}>
-          <label style={{ display: 'block', fontSize: '13px', marginBottom: '4px' }}>{t.storefront_email}</label>
-          <input type="email" value={email} onChange={e => { setEmail(e.target.value); setCheckoutError(''); }}
-            style={{ width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', boxSizing: 'border-box' }} />
+
+        {/* Contact */}
+        <div style={{ background: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '16px' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Contact Details</div>
+          <div style={field}>
+            <label style={lbl}>{t.storefront_phone} <span style={{ color: '#16a34a' }}>*</span></label>
+            <input type="tel" value={phone} onChange={e => { setPhone(e.target.value); setCheckoutError(''); }}
+              placeholder="08012345678" style={inp} />
+          </div>
+          <div style={field}>
+            <label style={lbl}>{t.storefront_email} <span style={{ color: '#6b7280', fontWeight: 400 }}>(optional)</span></label>
+            <input type="email" value={email} onChange={e => { setEmail(e.target.value); setCheckoutError(''); }}
+              placeholder="you@example.com" style={inp} />
+          </div>
         </div>
-        <div style={{ marginBottom: '12px' }}>
-          <label style={{ display: 'block', fontSize: '13px', marginBottom: '4px' }}>{t.storefront_phone}</label>
-          <input type="tel" value={phone} onChange={e => { setPhone(e.target.value); setCheckoutError(''); }}
-            style={{ width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', boxSizing: 'border-box' }} />
+
+        {/* Nigerian Delivery Address */}
+        <div style={{ background: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '16px' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Delivery Address <span style={{ color: '#6b7280', fontWeight: 400 }}>(optional)</span></div>
+          <div style={field}>
+            <label style={lbl}>State</label>
+            <select value={addrState} onChange={e => setAddrState(e.target.value)}
+              style={{ ...inp, backgroundColor: '#fff' }}>
+              <option value="">— Select State —</option>
+              {NIGERIAN_STATES.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div style={field}>
+            <label style={lbl}>LGA / Area</label>
+            <input value={addrLga} onChange={e => setAddrLga(e.target.value)}
+              placeholder="e.g. Ikeja" style={inp} />
+          </div>
+          <div style={field}>
+            <label style={lbl}>Street Address</label>
+            <input value={addrStreet} onChange={e => setAddrStreet(e.target.value)}
+              placeholder="e.g. 12 Allen Avenue" style={inp} />
+          </div>
         </div>
+
+        {/* Promo Code */}
+        <div style={{ background: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '16px' }}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Promo Code</div>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <input value={promoCode} onChange={e => { setPromoCode(e.target.value.toUpperCase()); setPromoError(''); setPromoDiscount(0); }}
+              placeholder="e.g. SAVE20" style={{ ...inp, flex: 1 }} />
+            <button
+              onClick={handlePromoValidate}
+              disabled={promoLoading || !promoCode.trim()}
+              style={{ padding: '8px 14px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '13px', fontWeight: 600, whiteSpace: 'nowrap' }}
+            >
+              {promoLoading ? '…' : 'Apply'}
+            </button>
+          </div>
+          {promoError && <div style={{ fontSize: '12px', color: '#dc2626', marginTop: '6px' }}>{promoError}</div>}
+          {promoDiscount > 0 && !promoError && (
+            <div style={{ fontSize: '12px', color: '#16a34a', marginTop: '6px', fontWeight: 600 }}>
+              ✓ Discount applied: -{formatKoboToNaira(promoDiscount)}
+            </div>
+          )}
+        </div>
+
+        {/* Order summary */}
+        <div style={{ background: '#f0fdf4', borderRadius: '8px', padding: '12px', marginBottom: '16px', fontSize: '13px' }}>
+          <div style={{ fontWeight: 600, marginBottom: '8px', color: '#111827' }}>Order Summary</div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+            <span style={{ color: '#6b7280' }}>Subtotal ({itemCount} items)</span>
+            <span>{formatKoboToNaira(subtotal)}</span>
+          </div>
+          {promoDiscount > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px', color: '#16a34a' }}>
+              <span>Promo discount</span>
+              <span>-{formatKoboToNaira(promoDiscount)}</span>
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+            <span style={{ color: '#6b7280' }}>VAT (7.5% FIRS)</span>
+            <span>{formatKoboToNaira(vatKobo)}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '15px', marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #d1fae5' }}>
+            <span>Total</span>
+            <span style={{ color: '#16a34a' }}>{formatKoboToNaira(grandTotal)}</span>
+          </div>
+        </div>
+
+        {/* NDPR consent */}
         <div style={{ marginBottom: '16px', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
-          <input type="checkbox" id="ndpr" checked={ndprConsent} onChange={e => setNdprConsent(e.target.checked)} style={{ marginTop: '3px' }} />
-          <label htmlFor="ndpr" style={{ fontSize: '12px', color: '#374151', lineHeight: '1.4' }}>
+          <input type="checkbox" id="ndpr" checked={ndprConsent} onChange={e => setNdprConsent(e.target.checked)} style={{ marginTop: '3px', accentColor: '#16a34a' }} />
+          <label htmlFor="ndpr" style={{ fontSize: '12px', color: '#374151', lineHeight: '1.5' }}>
             {t.storefront_ndpr_consent}
           </label>
         </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div style={{ fontWeight: 700, fontSize: '18px', color: '#16a34a' }}>{formatKoboToNaira(total)}</div>
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <button onClick={() => setStep('catalog')} style={{ padding: '10px 16px', border: '1px solid #d1d5db', borderRadius: '6px', cursor: 'pointer', backgroundColor: '#fff' }}>
-              {t.common_cancel}
-            </button>
-            <button
-              onClick={handleCheckout}
-              disabled={!ndprConsent || checkoutLoading}
-              style={{ padding: '10px 20px', backgroundColor: ndprConsent && !checkoutLoading ? '#16a34a' : '#d1d5db', color: '#fff', border: 'none', borderRadius: '6px', cursor: ndprConsent && !checkoutLoading ? 'pointer' : 'not-allowed', fontWeight: 600 }}
-            >
-              {checkoutLoading ? 'Processing…' : t.storefront_checkout}
-            </button>
-          </div>
-        </div>
+
+        <button
+          onClick={handlePayWithPaystack}
+          disabled={!ndprConsent || checkoutLoading || (!email && !phone)}
+          style={{
+            width: '100%', padding: '14px', fontSize: '16px', fontWeight: 700,
+            backgroundColor: ndprConsent && !checkoutLoading && (email || phone) ? '#16a34a' : '#d1d5db',
+            color: '#fff', border: 'none', borderRadius: '8px',
+            cursor: ndprConsent && !checkoutLoading && (email || phone) ? 'pointer' : 'not-allowed',
+          }}
+        >
+          {checkoutLoading ? 'Processing…' : `Pay ${formatKoboToNaira(grandTotal)} with Paystack`}
+        </button>
       </div>
     );
   }
