@@ -577,4 +577,349 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.error).toMatch(/6 digits/i);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-2: VENDOR-AUTH ALIAS ENDPOINTS (/vendor-auth/*)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('POST /vendor-auth/request-otp — alias endpoint', () => {
+    it('returns 404 when vendor not registered with this phone', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/request-otp', { phone: '+2348099999999' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('returns 403 when vendor account is suspended', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', status: 'suspended' });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/request-otp', { phone: '+2348012345678' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(403);
+    });
+
+    it('sends OTP when vendor is active', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', status: 'active' });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/request-otp', { phone: '+2348012345678' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.expires_in).toBe(600);
+    });
+
+    it('accepts local Nigerian format (0xxx)', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', status: 'active' });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/request-otp', { phone: '08012345678' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('returns 400 for invalid phone format', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/request-otp', { phone: '123' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('POST /vendor-auth/verify-otp — alias endpoint', () => {
+    it('returns 401 when OTP not found in DB', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/verify-otp', { phone: '+2348012345678', otp: '123456' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 400 for non-6-digit OTP', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/verify-otp', { phone: '+2348012345678', otp: 'abc' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it('returns 400 when phone or otp missing', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendor-auth/verify-otp', { phone: '+2348012345678' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/otp/i);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-2: KYC SUBMISSION ENDPOINT
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('POST /vendors/:id/kyc — KYC submission (vendor JWT required)', () => {
+    const validBvnHash = 'a'.repeat(64);
+    const validNinHash = 'b'.repeat(64);
+
+    it('returns 401 without vendor JWT', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/vendors/vnd_1/kyc', { rc_number: 'RC-123456' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 403 when vendor tries to submit KYC for another vendor', async () => {
+      const token = await makeVendorToken('vnd_A', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_B/kyc', token, { rc_number: 'RC-123456' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(403);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/own vendor account/i);
+    });
+
+    it('returns 403 when JWT tenant does not match header tenant', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_OTHER');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }, 'tnt_test'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(403);
+    });
+
+    it('returns 400 when no KYC identifiers provided', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {}),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/rc_number|bvn_hash|nin_hash/i);
+    });
+
+    it('returns 400 when bvn_hash is not a valid SHA-256 hex string', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: 'not-a-hash' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/SHA-256/i);
+    });
+
+    it('returns 400 when nin_hash is not 64 hex chars', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { nin_hash: 'tooshort' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/SHA-256/i);
+    });
+
+    it('returns 400 when bank_details account_number is not 10 digits', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+          rc_number: 'RC-123456',
+          bank_details: { bank_code: '058', account_number: '12345', account_name: 'ADE STORES' },
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/10 digits/i);
+    });
+
+    it('returns 400 when bank_details is missing account_name', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+          rc_number: 'RC-123456',
+          bank_details: { bank_code: '058', account_number: '0123456789', account_name: '' },
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/account_name/i);
+    });
+
+    it('returns 409 when KYC already submitted and awaiting review', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'submitted' });
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(409);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/submitted/i);
+    });
+
+    it('returns 409 when KYC is under_review', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'under_review' });
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(409);
+    });
+
+    it('returns 409 when KYC already approved', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'approved' });
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(409);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/approved/i);
+    });
+
+    it('returns 404 when vendor not found in this marketplace', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const token = await makeVendorToken('vnd_ghost', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_ghost/kyc', token, { rc_number: 'RC-123456' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('submits KYC successfully with rc_number only', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'none' });
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.kyc_status).toBe('submitted');
+    });
+
+    it('submits KYC successfully with all fields including bank_details', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' }); // re-submission after rejection
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+          rc_number: 'RC-1234567',
+          bvn_hash: validBvnHash,
+          nin_hash: validNinHash,
+          cac_docs_url: 'https://storage.example.com/cac.pdf',
+          bank_details: { bank_code: '058', account_number: '0123456789', account_name: 'ADE FASHION HOUSE' },
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.data.kyc_status).toBe('submitted');
+      expect(data.data.message).toMatch(/submitted successfully/i);
+    });
+
+    it('allows re-submission after KYC rejection', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' });
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: validBvnHash }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('generated kyc_submitted_at is a current epoch ms timestamp', async () => {
+      mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'none' });
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      const before = Date.now();
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        mockEnv as any,
+      );
+      const after = Date.now();
+      const data = await res.json() as any;
+      expect(data.data.kyc_submitted_at).toBeGreaterThanOrEqual(before);
+      expect(data.data.kyc_submitted_at).toBeLessThanOrEqual(after);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-2: DASHBOARD SCOPING (additional ledger / orders validation)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('Dashboard scoping — GET /ledger revenue aggregation', () => {
+    it('returns empty data array when vendor has no ledger entries', async () => {
+      const token = await makeVendorToken('vnd_new', 'tnt_test');
+      mockDb.all.mockResolvedValue({ results: [] });
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('GET', '/ledger', token),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.data).toHaveLength(0);
+    });
+
+    it('ledger entries include account_type and amount fields for revenue calculation', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      mockDb.all.mockResolvedValue({
+        results: [
+          { id: 'led_1', vendor_id: 'vnd_1', account_type: 'revenue', amount: 90000, type: 'CREDIT', order_id: 'ord_1' },
+          { id: 'led_2', vendor_id: 'vnd_1', account_type: 'commission', amount: 10000, type: 'CREDIT', order_id: 'ord_1' },
+        ],
+      });
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('GET', '/ledger', token),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data).toHaveLength(2);
+      const revenue = data.data.filter((e: { account_type: string }) => e.account_type === 'revenue')[0];
+      expect(revenue.amount).toBe(90000);
+    });
+  });
+
+  describe('Dashboard scoping — GET /orders vendor filter', () => {
+    it('only returns orders from the marketplace channel', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      mockDb.all.mockResolvedValue({
+        results: [
+          { id: 'ord_1', channel: 'marketplace', items_json: '[{"vendor_id":"vnd_1"}]', total_amount: 50000 },
+        ],
+      });
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('GET', '/orders', token),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data[0].channel).toBe('marketplace');
+    });
+
+    it('DB query uses vendor LIKE pattern for vendor-scoping', async () => {
+      const token = await makeVendorToken('vnd_xyz', 'tnt_test');
+      mockDb.all.mockResolvedValue({ results: [] });
+      await multiVendorRouter.fetch(
+        makeVendorRequest('GET', '/orders', token),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain('%"vendor_id":"vnd_xyz"%');
+    });
+  });
 });
+

@@ -1301,9 +1301,9 @@ function AccountPage({
   );
 }
 
-// Multi-Vendor Marketplace Module (COM-3)
+// Multi-Vendor Marketplace Module (COM-3 — MV-2 updated)
 function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
-  const [activeTab, setActiveTab] = useState<'browse' | 'vendors'>('browse');
+  const [activeTab, setActiveTab] = useState<'browse' | 'vendors' | 'vendor-dashboard'>('browse');
   const [vendors] = useState([
     { id: 'vnd_1', name: 'Ade Fashion House', slug: 'ade-fashion', status: 'active', commission_rate: 1000 },
     { id: 'vnd_2', name: 'Chidi Electronics', slug: 'chidi-elec', status: 'active', commission_rate: 800 },
@@ -1316,29 +1316,36 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
     { id: 'mp_4', vendor_id: 'vnd_1', name: 'Kaftan (XL)', price: 1800000, vendor_name: 'Ade Fashion House' },
   ]);
 
+  const tabs: Array<{ id: typeof activeTab; label: string }> = [
+    { id: 'browse', label: t.marketplace_products },
+    { id: 'vendors', label: t.marketplace_vendors },
+    { id: 'vendor-dashboard', label: '🏪 Vendor' },
+  ];
+
   return (
-    <div style={{ padding: '12px' }}>
+    <div>
       {/* Tabs */}
-      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', marginBottom: '16px' }}>
-        {(['browse', 'vendors'] as const).map(tab => (
+      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', padding: '0 12px' }}>
+        {tabs.map(tab => (
           <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
             style={{
-              padding: '8px 16px', border: 'none', cursor: 'pointer',
+              padding: '10px 12px', border: 'none', cursor: 'pointer',
               backgroundColor: 'transparent',
-              borderBottom: activeTab === tab ? '2px solid #16a34a' : '2px solid transparent',
-              color: activeTab === tab ? '#16a34a' : '#6b7280',
-              fontWeight: activeTab === tab ? 600 : 400,
+              borderBottom: activeTab === tab.id ? '2px solid #16a34a' : '2px solid transparent',
+              color: activeTab === tab.id ? '#16a34a' : '#6b7280',
+              fontWeight: activeTab === tab.id ? 600 : 400,
+              fontSize: '13px',
             }}
           >
-            {tab === 'browse' ? t.marketplace_products : t.marketplace_vendors}
+            {tab.label}
           </button>
         ))}
       </div>
 
       {activeTab === 'browse' && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '12px' }}>
+        <div style={{ padding: '12px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '12px' }}>
           {products.map(p => (
             <div key={p.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff' }}>
               <div style={{ backgroundColor: '#fef9c3', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px' }}>
@@ -1355,7 +1362,7 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
       )}
 
       {activeTab === 'vendors' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+        <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
           {vendors.map(v => (
             <div key={v.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', padding: '14px', backgroundColor: '#fff', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
@@ -1374,6 +1381,339 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
           ))}
         </div>
       )}
+
+      {activeTab === 'vendor-dashboard' && (
+        <MarketplaceVendorDashboard tenantId={tenantId} />
+      )}
+    </div>
+  );
+}
+
+// ── MarketplaceVendorDashboard (COM-3 MV-2) ──────────────────────────────────
+/**
+ * Vendor dashboard: OTP login, then Overview/Orders/KYC tabs.
+ * Uses /api/multi-vendor/* endpoints with vendor JWT bearer token.
+ * All kobo amounts converted to Naira (÷ 100). Nigeria-First: uses WebWaka green.
+ */
+function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
+  const [authToken, setAuthToken] = useState<string | null>(() =>
+    sessionStorage.getItem(`ww_vtok_${tenantId}`)
+  );
+  const [vendorId, setVendorId] = useState<string | null>(() =>
+    sessionStorage.getItem(`ww_vid_${tenantId}`)
+  );
+  const [vendorName, setVendorName] = useState<string | null>(() =>
+    sessionStorage.getItem(`ww_vname_${tenantId}`)
+  );
+  const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'kyc'>('overview');
+
+  const [otpStep, setOtpStep] = useState<'phone' | 'code'>('phone');
+  const [otpPhone, setOtpPhone] = useState('');
+  const [otpCode, setOtpCode] = useState('');
+  const [otpLoading, setOtpLoading] = useState(false);
+  const [otpError, setOtpError] = useState('');
+
+  const [overview, setOverview] = useState<{ total_revenue: number; total_orders: number; pending_payout: number } | null>(null);
+  const [orders, setOrders] = useState<Array<{
+    id: string; total_amount: number; payment_status: string; order_status: string;
+    created_at: number; items_json: string;
+  }>>([]);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+
+  const [kycStatus, setKycStatus] = useState<string>('');
+  const [kycForm, setKycForm] = useState({ rc_number: '', bvn_hash: '', nin_hash: '', cac_docs_url: '', bank_code: '', account_number: '', account_name: '' });
+  const [kycSubmitting, setKycSubmitting] = useState(false);
+  const [kycMessage, setKycMessage] = useState('');
+  const [kycError, setKycError] = useState('');
+
+  const apiHeaders = useCallback((extraHeaders?: Record<string, string>) => ({
+    'Content-Type': 'application/json',
+    'x-tenant-id': tenantId,
+    ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+    ...extraHeaders,
+  }), [tenantId, authToken]);
+
+  const handleRequestOtp = async () => {
+    setOtpLoading(true); setOtpError('');
+    try {
+      const res = await fetch('/api/multi-vendor/vendor-auth/request-otp', {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify({ phone: otpPhone }),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) setOtpStep('code');
+      else setOtpError(d.error ?? 'Could not send OTP');
+    } catch { setOtpError('Network error. Try again.'); }
+    finally { setOtpLoading(false); }
+  };
+
+  const handleVerifyOtp = async () => {
+    setOtpLoading(true); setOtpError('');
+    try {
+      const res = await fetch('/api/multi-vendor/vendor-auth/verify-otp', {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify({ phone: otpPhone, otp: otpCode }),
+      });
+      const d = await res.json() as {
+        success: boolean;
+        data?: { token: string; vendor_id: string; vendor_name: string };
+        error?: string;
+      };
+      if (d.success && d.data) {
+        setAuthToken(d.data.token);
+        setVendorId(d.data.vendor_id);
+        setVendorName(d.data.vendor_name);
+        sessionStorage.setItem(`ww_vtok_${tenantId}`, d.data.token);
+        sessionStorage.setItem(`ww_vid_${tenantId}`, d.data.vendor_id);
+        sessionStorage.setItem(`ww_vname_${tenantId}`, d.data.vendor_name);
+        setOtpStep('phone'); setOtpCode(''); setOtpPhone(''); setOtpError('');
+      } else setOtpError(d.error ?? 'Invalid OTP');
+    } catch { setOtpError('Network error. Try again.'); }
+    finally { setOtpLoading(false); }
+  };
+
+  const handleLogout = () => {
+    setAuthToken(null); setVendorId(null); setVendorName(null);
+    sessionStorage.removeItem(`ww_vtok_${tenantId}`);
+    sessionStorage.removeItem(`ww_vid_${tenantId}`);
+    sessionStorage.removeItem(`ww_vname_${tenantId}`);
+    setOverview(null); setOrders([]);
+  };
+
+  useEffect(() => {
+    if (!authToken || !vendorId || activeTab !== 'overview') return;
+    fetch('/api/multi-vendor/ledger', { headers: apiHeaders() })
+      .then(r => r.json() as Promise<{ success: boolean; data: Array<{ account_type: string; amount: number; type: string }> }>)
+      .then(d => {
+        if (!d.success) return;
+        const revenue = d.data.filter(e => e.account_type === 'revenue' && e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
+        const commission = d.data.filter(e => e.account_type === 'commission' && e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
+        const totalOrders = new Set(d.data.filter(e => e.account_type === 'revenue').map((e: { order_id?: string }) => e.order_id)).size;
+        setOverview({ total_revenue: revenue, total_orders: totalOrders, pending_payout: revenue - commission });
+      })
+      .catch(() => {});
+  }, [authToken, vendorId, activeTab, apiHeaders]);
+
+  useEffect(() => {
+    if (!authToken || !vendorId || activeTab !== 'orders') return;
+    setOrdersLoading(true);
+    fetch('/api/multi-vendor/orders', { headers: apiHeaders() })
+      .then(r => r.json() as Promise<{ success: boolean; data: typeof orders }>)
+      .then(d => { if (d.success) setOrders(d.data ?? []); })
+      .catch(() => {})
+      .finally(() => setOrdersLoading(false));
+  }, [authToken, vendorId, activeTab, apiHeaders]);
+
+  const handleKycSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!vendorId || !authToken) return;
+    setKycSubmitting(true); setKycError(''); setKycMessage('');
+    try {
+      const body: Record<string, unknown> = {};
+      if (kycForm.rc_number.trim()) body.rc_number = kycForm.rc_number.trim();
+      if (kycForm.bvn_hash.trim()) body.bvn_hash = kycForm.bvn_hash.trim();
+      if (kycForm.nin_hash.trim()) body.nin_hash = kycForm.nin_hash.trim();
+      if (kycForm.cac_docs_url.trim()) body.cac_docs_url = kycForm.cac_docs_url.trim();
+      if (kycForm.bank_code.trim() && kycForm.account_number.trim() && kycForm.account_name.trim()) {
+        body.bank_details = {
+          bank_code: kycForm.bank_code.trim(),
+          account_number: kycForm.account_number.trim(),
+          account_name: kycForm.account_name.trim(),
+        };
+      }
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/kyc`, {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify(body),
+      });
+      const d = await res.json() as { success: boolean; data?: { kyc_status: string; message: string }; error?: string };
+      if (d.success && d.data) {
+        setKycStatus(d.data.kyc_status);
+        setKycMessage(d.data.message);
+      } else setKycError(d.error ?? 'KYC submission failed');
+    } catch { setKycError('Network error. Try again.'); }
+    finally { setKycSubmitting(false); }
+  };
+
+  const S = {
+    card: { backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: '10px', padding: '16px', marginBottom: '12px' } as React.CSSProperties,
+    tab: (active: boolean): React.CSSProperties => ({
+      flex: 1, padding: '10px 0', border: 'none', backgroundColor: 'transparent',
+      borderBottom: `3px solid ${active ? '#16a34a' : 'transparent'}`,
+      color: active ? '#16a34a' : '#6b7280', fontWeight: active ? 700 : 500,
+      cursor: 'pointer', fontSize: '13px',
+    }),
+    input: { width: '100%', padding: '10px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', boxSizing: 'border-box' as const, marginBottom: '10px' },
+    label: { fontSize: '12px', fontWeight: 600, color: '#374151', display: 'block', marginBottom: '4px' } as React.CSSProperties,
+  };
+
+  if (!authToken) {
+    return (
+      <div style={{ padding: '16px', maxWidth: '400px', margin: '0 auto' }}>
+        <div style={{ textAlign: 'center', marginBottom: '24px' }}>
+          <div style={{ fontSize: '32px', marginBottom: '8px' }}>🏪</div>
+          <div style={{ fontWeight: 700, fontSize: '18px' }}>Vendor Sign In</div>
+          <div style={{ fontSize: '13px', color: '#6b7280', marginTop: '4px' }}>Access your vendor dashboard with your registered phone number.</div>
+        </div>
+        {otpError && <div style={{ padding: '10px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>{otpError}</div>}
+        {otpStep === 'phone' ? (
+          <div style={S.card}>
+            <label style={S.label}>Phone Number</label>
+            <input type="tel" placeholder="08012345678 or +2348012345678" value={otpPhone}
+              onChange={e => setOtpPhone(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleRequestOtp(); }}
+              style={S.input} />
+            <button onClick={handleRequestOtp} disabled={otpLoading || !otpPhone.trim()}
+              style={{ width: '100%', padding: '12px', backgroundColor: otpLoading || !otpPhone.trim() ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '15px' }}>
+              {otpLoading ? 'Sending…' : 'Send OTP'}
+            </button>
+          </div>
+        ) : (
+          <div style={S.card}>
+            <label style={S.label}>6-Digit Code</label>
+            <input type="text" placeholder="Enter code" value={otpCode} maxLength={6}
+              onChange={e => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              onKeyDown={e => { if (e.key === 'Enter') handleVerifyOtp(); }}
+              style={{ ...S.input, textAlign: 'center', fontSize: '22px', letterSpacing: '0.3em' }} />
+            <button onClick={handleVerifyOtp} disabled={otpLoading || otpCode.length !== 6}
+              style={{ width: '100%', padding: '12px', backgroundColor: otpLoading || otpCode.length !== 6 ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '15px', marginBottom: '8px' }}>
+              {otpLoading ? 'Verifying…' : 'Verify & Sign In'}
+            </button>
+            <button onClick={() => { setOtpStep('phone'); setOtpCode(''); setOtpError(''); }}
+              style={{ width: '100%', padding: '10px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '14px', fontWeight: 600 }}>
+              ← Change Number
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ paddingBottom: '80px' }}>
+      <div style={{ padding: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #e5e7eb' }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: '15px' }}>{vendorName ?? 'My Store'}</div>
+          <div style={{ fontSize: '11px', color: '#6b7280' }}>{vendorId}</div>
+        </div>
+        <button onClick={handleLogout} style={{ padding: '6px 10px', border: '1px solid #fecaca', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '12px', cursor: 'pointer', fontWeight: 600 }}>
+          Sign Out
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb' }}>
+        <button style={S.tab(activeTab === 'overview')} onClick={() => setActiveTab('overview')}>📊 Overview</button>
+        <button style={S.tab(activeTab === 'orders')} onClick={() => setActiveTab('orders')}>📦 Orders</button>
+        <button style={S.tab(activeTab === 'kyc')} onClick={() => setActiveTab('kyc')}>🔖 KYC</button>
+      </div>
+
+      <div style={{ padding: '16px' }}>
+        {activeTab === 'overview' && (
+          overview ? (
+            <div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '16px' }}>
+                <div style={{ ...S.card, borderLeft: '4px solid #16a34a', marginBottom: 0 }}>
+                  <div style={{ fontSize: '12px', color: '#6b7280' }}>Total Revenue</div>
+                  <div style={{ fontSize: '20px', fontWeight: 700, color: '#16a34a' }}>₦{(overview.total_revenue / 100).toLocaleString()}</div>
+                </div>
+                <div style={{ ...S.card, borderLeft: '4px solid #3b82f6', marginBottom: 0 }}>
+                  <div style={{ fontSize: '12px', color: '#6b7280' }}>Total Orders</div>
+                  <div style={{ fontSize: '20px', fontWeight: 700, color: '#3b82f6' }}>{overview.total_orders}</div>
+                </div>
+                <div style={{ ...S.card, borderLeft: '4px solid #f59e0b', marginBottom: 0, gridColumn: '1 / -1' }}>
+                  <div style={{ fontSize: '12px', color: '#6b7280' }}>Pending Payout</div>
+                  <div style={{ fontSize: '24px', fontWeight: 700, color: '#f59e0b' }}>₦{(overview.pending_payout / 100).toLocaleString()}</div>
+                  <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '4px' }}>Settlement T+{7} days after order completion</div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>Loading overview…</div>
+          )
+        )}
+
+        {activeTab === 'orders' && (
+          ordersLoading ? (
+            <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>Loading orders…</div>
+          ) : orders.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>No marketplace orders yet.</div>
+          ) : (
+            orders.map(o => {
+              let items: Array<{ name: string; quantity: number }> = [];
+              try { items = JSON.parse(o.items_json); } catch { items = []; }
+              return (
+                <div key={o.id} style={S.card}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <div style={{ fontSize: '13px', fontWeight: 700 }}>{o.id.slice(0, 20)}…</div>
+                    <div style={{ fontSize: '14px', fontWeight: 700, color: '#16a34a' }}>₦{(o.total_amount / 100).toLocaleString()}</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '6px', marginBottom: '6px' }}>
+                    <span style={{ padding: '2px 8px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, backgroundColor: o.payment_status === 'paid' ? '#dcfce7' : '#fef9c3', color: o.payment_status === 'paid' ? '#16a34a' : '#ca8a04' }}>
+                      {o.payment_status}
+                    </span>
+                    <span style={{ padding: '2px 8px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, backgroundColor: '#f3f4f6', color: '#374151' }}>
+                      {o.order_status}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#6b7280' }}>
+                    {items.slice(0, 2).map((i: { name: string; quantity: number }) => `${i.name} ×${i.quantity}`).join(' · ')}
+                    {items.length > 2 ? ` +${items.length - 2} more` : ''}
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '4px' }}>
+                    {new Date(o.created_at).toLocaleDateString('en-NG', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  </div>
+                </div>
+              );
+            })
+          )
+        )}
+
+        {activeTab === 'kyc' && (
+          <div>
+            {kycStatus === 'submitted' || kycMessage ? (
+              <div style={{ padding: '12px 16px', backgroundColor: '#dcfce7', border: '1px solid #bbf7d0', borderRadius: '8px', color: '#15803d', marginBottom: '16px', fontSize: '13px' }}>
+                {kycMessage || 'KYC submitted. Awaiting admin review (1-2 business days).'}
+              </div>
+            ) : null}
+            {kycError && <div style={{ padding: '10px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>{kycError}</div>}
+            <div style={S.card}>
+              <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '12px' }}>KYC Verification</div>
+              <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '16px', lineHeight: '1.5' }}>
+                Required to activate payouts. BVN and NIN should be pre-hashed with SHA-256 before submission.
+              </div>
+              <form onSubmit={handleKycSubmit}>
+                <label style={S.label}>CAC Registration Number</label>
+                <input type="text" placeholder="RC-1234567" value={kycForm.rc_number}
+                  onChange={e => setKycForm(f => ({ ...f, rc_number: e.target.value }))} style={S.input} />
+                <label style={S.label}>BVN Hash (SHA-256 hex)</label>
+                <input type="text" placeholder="64-char hex string" value={kycForm.bvn_hash}
+                  onChange={e => setKycForm(f => ({ ...f, bvn_hash: e.target.value }))} style={S.input} />
+                <label style={S.label}>NIN Hash (SHA-256 hex)</label>
+                <input type="text" placeholder="64-char hex string" value={kycForm.nin_hash}
+                  onChange={e => setKycForm(f => ({ ...f, nin_hash: e.target.value }))} style={S.input} />
+                <label style={S.label}>CAC Certificate URL</label>
+                <input type="url" placeholder="https://..." value={kycForm.cac_docs_url}
+                  onChange={e => setKycForm(f => ({ ...f, cac_docs_url: e.target.value }))} style={S.input} />
+                <div style={{ fontWeight: 600, fontSize: '13px', color: '#374151', margin: '12px 0 8px' }}>Bank Account Details</div>
+                <label style={S.label}>Bank Code (3 digits)</label>
+                <input type="text" placeholder="058" value={kycForm.bank_code}
+                  onChange={e => setKycForm(f => ({ ...f, bank_code: e.target.value }))} style={S.input} />
+                <label style={S.label}>Account Number (10 digits)</label>
+                <input type="text" placeholder="0123456789" value={kycForm.account_number}
+                  onChange={e => setKycForm(f => ({ ...f, account_number: e.target.value.replace(/\D/g, '').slice(0, 10) }))} style={S.input} />
+                <label style={S.label}>Account Name</label>
+                <input type="text" placeholder="ADE FASHION HOUSE" value={kycForm.account_name}
+                  onChange={e => setKycForm(f => ({ ...f, account_name: e.target.value }))} style={S.input} />
+                <button type="submit" disabled={kycSubmitting}
+                  style={{ width: '100%', padding: '12px', backgroundColor: kycSubmitting ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: kycSubmitting ? 'wait' : 'pointer', fontSize: '15px' }}>
+                  {kycSubmitting ? 'Submitting…' : 'Submit KYC'}
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

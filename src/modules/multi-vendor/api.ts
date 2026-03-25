@@ -1,12 +1,18 @@
 /**
- * COM-3: Multi-Vendor Marketplace API — Phase MV-1
- * Auth, security hardening, KYC schema, vendor isolation
- * Invariants: Nigeria-First (Paystack split in MV-2), Multi-tenancy, NDPR, Build Once Use Infinitely
+ * COM-3: Multi-Vendor Marketplace API — Phase MV-1 + MV-2
+ * Auth, security hardening, KYC schema, vendor isolation, vendor onboarding
+ * Invariants: Nigeria-First (Paystack split in MV-3), Multi-tenancy, NDPR, Build Once Use Infinitely
  *
  * Auth model:
  *   Public  : GET /vendors (active only), GET /vendors/:id/products, GET /, POST /checkout
  *   Admin   : POST /vendors, PATCH /vendors/:id  (x-admin-key header)
- *   Vendor  : POST /vendors/:id/products, GET /orders, GET /ledger  (Bearer JWT, role='vendor')
+ *   Vendor  : POST /vendors/:id/products, GET /orders, GET /ledger,
+ *             POST /vendors/:id/kyc  (Bearer JWT, role='vendor')
+ *
+ * MV-2 additions:
+ *   POST /vendor-auth/request-otp  — alias for /auth/vendor-request-otp (canonical path)
+ *   POST /vendor-auth/verify-otp   — alias for /auth/vendor-verify-otp
+ *   POST /vendors/:id/kyc          — vendor submits rc_number, bvn_hash, nin_hash, bank_details
  */
 import { Hono } from 'hono';
 import type { Env } from '../../worker';
@@ -659,6 +665,259 @@ app.post('/checkout', async (c) => {
         vendor_count: Object.keys(vendorGroups).length,
       },
     }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-2: VENDOR-AUTH ALIAS ENDPOINTS
+// These paths mirror /auth/vendor-request-otp and /auth/vendor-verify-otp
+// (canonical MV-1 paths) for clients that prefer the /vendor-auth/ prefix.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /vendor-auth/request-otp — Alias for /auth/vendor-request-otp
+ * Sends a 6-digit OTP to the vendor's registered phone (same Termii flow).
+ */
+app.post('/vendor-auth/request-otp', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const body = await c.req.json<{ phone: string }>();
+  const phone = body.phone?.trim();
+
+  if (!phone) return c.json({ success: false, error: 'phone is required' }, 400);
+  if (!/^\+234[0-9]{10}$/.test(phone) && !/^0[0-9]{10}$/.test(phone)) {
+    return c.json({ success: false, error: 'Invalid Nigerian phone number. Use E.164 (+234...) or local (0...)' }, 400);
+  }
+
+  const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+
+  try {
+    const vendor = await c.env.DB.prepare(
+      "SELECT id, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+    ).bind(tenantId, e164).first<{ id: string; status: string }>();
+
+    if (!vendor) return c.json({ success: false, error: 'No vendor account found with this phone number' }, 404);
+    if (vendor.status === 'suspended') return c.json({ success: false, error: 'Vendor account is suspended.' }, 403);
+
+    const otpCode = String(Math.floor(Math.random() * 900000) + 100000);
+    const otpHash = await hashOtp(otpCode);
+    const now = Date.now();
+    const expiresAt = now + 10 * 60 * 1000;
+    const otpId = `votp_${now}_${Math.random().toString(36).slice(2, 8)}`;
+
+    await c.env.DB.prepare(
+      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
+    ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
+
+    if (c.env.TERMII_API_KEY) {
+      await fetch('https://api.ng.termii.com/api/sms/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: c.env.TERMII_API_KEY, to: e164, from: 'WebWaka',
+          sms: `Your WebWaka Vendor code is: ${otpCode}. Valid 10 minutes. Do not share.`,
+          type: 'plain', channel: 'dnd',
+        }),
+      });
+    }
+
+    return c.json({
+      success: true,
+      data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 },
+    });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+/**
+ * POST /vendor-auth/verify-otp — Alias for /auth/vendor-verify-otp
+ * Verifies the OTP and returns a vendor JWT cookie.
+ */
+app.post('/vendor-auth/verify-otp', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const body = await c.req.json<{ phone: string; otp: string }>();
+  const phone = body.phone?.trim();
+  const otp = body.otp?.trim();
+
+  if (!phone || !otp) return c.json({ success: false, error: 'phone and otp are required' }, 400);
+  if (!/^\d{6}$/.test(otp)) return c.json({ success: false, error: 'OTP must be 6 digits' }, 400);
+
+  const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+
+  try {
+    interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
+    const otpRow = await c.env.DB.prepare(
+      `SELECT id, otp_hash, is_used, attempts, expires_at
+       FROM customer_otps
+       WHERE tenant_id = ? AND phone = ? AND is_used = 0
+       ORDER BY created_at DESC LIMIT 1`
+    ).bind(tenantId, e164).first<OtpRow>();
+
+    if (!otpRow) return c.json({ success: false, error: 'OTP not found or already used' }, 401);
+    if (otpRow.expires_at < Date.now()) return c.json({ success: false, error: 'OTP expired. Request a new one.' }, 401);
+    if (otpRow.attempts >= 5) return c.json({ success: false, error: 'Too many failed attempts.' }, 429);
+
+    const inputHash = await hashOtp(otp);
+    if (inputHash !== otpRow.otp_hash) {
+      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      return c.json({ success: false, error: 'Incorrect OTP' }, 401);
+    }
+
+    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+
+    const vendor = await c.env.DB.prepare(
+      "SELECT id, name, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+    ).bind(tenantId, e164).first<{ id: string; name: string; status: string }>();
+
+    if (!vendor) return c.json({ success: false, error: 'Vendor account not found' }, 404);
+    if (vendor.status === 'suspended') return c.json({ success: false, error: 'Vendor account suspended' }, 403);
+
+    const now = Date.now();
+    const token = await signJwt(
+      {
+        sub: vendor.id, role: 'vendor', vendor_id: vendor.id,
+        tenant: tenantId, phone: e164,
+        iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400,
+      },
+      c.env.JWT_SECRET ?? 'dev-secret-change-me',
+    );
+
+    c.header(
+      'Set-Cookie',
+      `mv_vendor_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/multi-vendor; Max-Age=604800`,
+    );
+
+    return c.json({ success: true, data: { token, vendor_id: vendor.id, vendor_name: vendor.name, phone: e164 } });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-2: KYC SUBMISSION ENDPOINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /vendors/:id/kyc — Submit KYC documents (vendor JWT required)
+ * Vendor submits their CAC registration, hashed BVN/NIN, and bank details.
+ * Status changes from 'none' → 'submitted'; admin review sets 'approved'/'rejected'.
+ *
+ * Security rules:
+ *   - Vendor JWT required (role='vendor')
+ *   - Ownership: JWT vendor_id must match URL :id (SEC-8 pattern)
+ *   - Tenant isolation: JWT tenant must match x-tenant-id
+ *   - Idempotent: re-submission allowed while status = 'none' | 'rejected'
+ *   - bvn_hash and nin_hash must be pre-hashed by client (SHA-256 hex)
+ *
+ * Fields:
+ *   rc_number       — CAC registration number (e.g., RC-1234567)
+ *   bvn_hash        — SHA-256 hex of Bank Verification Number (11 digits)
+ *   nin_hash        — SHA-256 hex of National Identification Number (11 digits)
+ *   cac_docs_url    — URL to uploaded CAC certificate (R2/S3)
+ *   bank_details    — { bank_code: string, account_number: string, account_name: string }
+ */
+app.post('/vendors/:id/kyc', async (c) => {
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const vendorId = c.req.param('id');
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+
+  if (vendor.vendorId !== vendorId) {
+    return c.json({ success: false, error: 'You may only submit KYC for your own vendor account' }, 403);
+  }
+  if (vendor.tenantId !== tenantId) {
+    return c.json({ success: false, error: 'Tenant mismatch' }, 403);
+  }
+
+  const body = await c.req.json<{
+    rc_number?: string;
+    bvn_hash?: string;
+    nin_hash?: string;
+    cac_docs_url?: string;
+    bank_details?: { bank_code: string; account_number: string; account_name: string };
+  }>();
+
+  // At least one KYC identifier required
+  if (!body.rc_number?.trim() && !body.bvn_hash?.trim() && !body.nin_hash?.trim()) {
+    return c.json({
+      success: false,
+      error: 'At least one of rc_number, bvn_hash, or nin_hash is required',
+    }, 400);
+  }
+
+  // Validate hash lengths (SHA-256 = 64 hex chars)
+  if (body.bvn_hash && !/^[0-9a-f]{64}$/i.test(body.bvn_hash)) {
+    return c.json({ success: false, error: 'bvn_hash must be a valid SHA-256 hex string (64 chars)' }, 400);
+  }
+  if (body.nin_hash && !/^[0-9a-f]{64}$/i.test(body.nin_hash)) {
+    return c.json({ success: false, error: 'nin_hash must be a valid SHA-256 hex string (64 chars)' }, 400);
+  }
+
+  // Validate bank_details structure if provided
+  if (body.bank_details) {
+    const { bank_code, account_number, account_name } = body.bank_details;
+    if (!bank_code?.trim() || !account_number?.trim() || !account_name?.trim()) {
+      return c.json({ success: false, error: 'bank_details requires bank_code, account_number, and account_name' }, 400);
+    }
+    if (!/^\d{10}$/.test(account_number)) {
+      return c.json({ success: false, error: 'bank_details.account_number must be 10 digits' }, 400);
+    }
+  }
+
+  try {
+    const existing = await c.env.DB.prepare(
+      "SELECT id, kyc_status FROM vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
+    ).bind(vendorId, tenantId).first<{ id: string; kyc_status: string }>();
+
+    if (!existing) return c.json({ success: false, error: 'Vendor not found' }, 404);
+
+    // Only allow re-submission when rejected or never submitted
+    if (existing.kyc_status === 'submitted' || existing.kyc_status === 'under_review') {
+      return c.json({
+        success: false,
+        error: `KYC already ${existing.kyc_status}. Await admin review before resubmitting.`,
+      }, 409);
+    }
+    if (existing.kyc_status === 'approved') {
+      return c.json({ success: false, error: 'KYC already approved. No resubmission needed.' }, 409);
+    }
+
+    const now = Date.now();
+    await c.env.DB.prepare(
+      `UPDATE vendors
+       SET rc_number = COALESCE(?, rc_number),
+           bvn_hash = COALESCE(?, bvn_hash),
+           nin_hash = COALESCE(?, nin_hash),
+           cac_docs_url = COALESCE(?, cac_docs_url),
+           bank_details_json = COALESCE(?, bank_details_json),
+           kyc_status = 'submitted',
+           kyc_submitted_at = ?,
+           kyc_rejection_reason = NULL,
+           updated_at = ?
+       WHERE id = ? AND marketplace_tenant_id = ?`
+    ).bind(
+      body.rc_number?.trim() ?? null,
+      body.bvn_hash?.trim() ?? null,
+      body.nin_hash?.trim() ?? null,
+      body.cac_docs_url?.trim() ?? null,
+      body.bank_details ? JSON.stringify(body.bank_details) : null,
+      now, now,
+      vendorId, tenantId,
+    ).run();
+
+    return c.json({
+      success: true,
+      data: {
+        vendor_id: vendorId,
+        kyc_status: 'submitted',
+        kyc_submitted_at: now,
+        message: 'KYC submitted successfully. Admin review typically takes 1-2 business days.',
+      },
+    });
   } catch (e) {
     return c.json({ success: false, error: String(e) }, 500);
   }
