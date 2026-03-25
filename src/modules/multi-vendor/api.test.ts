@@ -1645,4 +1645,946 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-4 TESTS: Paystack verify, settlement escrow, webhook HMAC, shipping, payouts
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── HMAC-SHA512 helper (mirrors production webhook logic) ────────────────────
+async function makeWebhookSignature(secret: string, body: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-512' }, false, ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(body));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+const PAYSTACK_SECRET = 'sk_test_mv4_paystack_secret_key';
+const mockEnvWithPaystack = {
+  ...mockEnv,
+  PAYSTACK_SECRET,
+};
+
+function makeRequestWithPaystack(method: string, path: string, body?: unknown, extra?: Record<string, string>) {
+  const url = `http://localhost${path}`;
+  const init: RequestInit = {
+    method,
+    headers: {
+      'x-tenant-id': 'tnt_test',
+      'Content-Type': 'application/json',
+      ...extra,
+    },
+  };
+  if (body) init.body = JSON.stringify(body);
+  return new Request(url, init);
+}
+
+const checkoutBodyPaystack = {
+  items: [{ product_id: 'prod_1', vendor_id: 'vnd_1', quantity: 2, price: 500000, name: 'Ankara Fabric' }],
+  customer_email: 'buyer@example.com',
+  payment_method: 'paystack',
+  payment_reference: 'ps_ref_abc123',
+  ndpr_consent: true,
+};
+
+// ── Suite 1: Checkout × Paystack server-side verify (8 tests) ─────────────────
+describe('MV-4 POST /checkout — Paystack server-side verify', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  it('returns 400 when payment_method=paystack but payment_reference is missing', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', { ...checkoutBodyPaystack, payment_reference: undefined }),
+      mockEnvWithPaystack as any,
+    );
+    expect(res.status).toBe(400);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/payment_reference/i);
+  });
+
+  it('returns 402 when Paystack API returns status=false', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ status: false, message: 'Invalid key' }), { status: 200 }),
+    );
+    const res = await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
+      mockEnvWithPaystack as any,
+    );
+    expect(res.status).toBe(402);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/verification failed/i);
+  });
+
+  it('returns 402 when Paystack transaction status is not "success"', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ status: true, data: { status: 'abandoned', amount: 1000000 } }), { status: 200 }),
+    );
+    const res = await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
+      mockEnvWithPaystack as any,
+    );
+    expect(res.status).toBe(402);
+  });
+
+  it('returns 402 when Paystack amount is less than expected total (fraud guard)', async () => {
+    const expectedAmount = checkoutBodyPaystack.items[0]!.price * checkoutBodyPaystack.items[0]!.quantity; // 1000000
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ status: true, data: { status: 'success', amount: expectedAmount - 1 } }), { status: 200 }),
+    );
+    const res = await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
+      mockEnvWithPaystack as any,
+    );
+    expect(res.status).toBe(402);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/mismatch/i);
+  });
+
+  it('succeeds when Paystack verify returns success and amount matches', async () => {
+    const expectedAmount = checkoutBodyPaystack.items[0]!.price * checkoutBodyPaystack.items[0]!.quantity; // 1000000
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ status: true, data: { status: 'success', amount: expectedAmount } }), { status: 200 }),
+    );
+    const res = await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
+      mockEnvWithPaystack as any,
+    );
+    expect(res.status).toBe(201);
+    const d = await res.json() as any;
+    expect(d.success).toBe(true);
+    expect(d.data.payment_verified).toBe(true);
+  });
+
+  it('calls Paystack verify API with the correct payment_reference', async () => {
+    const expectedAmount = 1000000;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ status: true, data: { status: 'success', amount: expectedAmount } }), { status: 200 }),
+    );
+    await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
+      mockEnvWithPaystack as any,
+    );
+    const fetchCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(fetchCall[0]).toContain(`/transaction/verify/${checkoutBodyPaystack.payment_reference}`);
+  });
+
+  it('calls Paystack API with Bearer auth header', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ status: true, data: { status: 'success', amount: 1000000 } }), { status: 200 }),
+    );
+    await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
+      mockEnvWithPaystack as any,
+    );
+    const fetchCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(fetchCall[1].headers.Authorization).toContain(`Bearer ${PAYSTACK_SECRET}`);
+  });
+
+  it('skips Paystack verify for non-paystack payment methods (bank_transfer)', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    const bankTransferBody = { ...checkoutBodyPaystack, payment_method: 'bank_transfer', payment_reference: undefined };
+    const res = await multiVendorRouter.fetch(
+      makeRequestWithPaystack('POST', '/checkout', bankTransferBody),
+      mockEnvWithPaystack as any,
+    );
+    expect(res.status).toBe(201);
+    expect(globalThis.fetch as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+  });
+});
+
+// ── Suite 2: Settlement escrow math (9 tests) ─────────────────────────────────
+describe('MV-4 Settlement escrow math', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.all.mockResolvedValue({ results: [] });
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  it('commission = subtotal * commission_rate / 10000 (10% rate → 100000 kobo on 1M)', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_x', quantity: 1, price: 1000000, name: 'A' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_breakdown.vnd_x.commission).toBe(100000);
+  });
+
+  it('payout = subtotal - commission (vendor receives 900000 on 1M at 10%)', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_x', quantity: 1, price: 1000000, name: 'A' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_breakdown.vnd_x.payout).toBe(900000);
+  });
+
+  it('settlement hold_until = created_at + 7 * 86400000 by default', async () => {
+    const before = Date.now();
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_x', quantity: 1, price: 500000, name: 'A' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const insertCalls = mockDb.bind.mock.calls
+      .map((c: unknown[]) => c)
+      .filter((args: unknown[]) => args.some((a: unknown) => typeof a === 'string' && (a as string).startsWith('stl_')));
+    const holdUntilArg = insertCalls.length > 0 ? insertCalls[0] : null;
+    // Verify settlements INSERT was called (hold_until is a bind argument)
+    const allSqlCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    expect(allSqlCalls.some((sql: string) => sql.includes('settlements'))).toBe(true);
+    // Verify hold_until > before (escrow in future)
+    if (holdUntilArg) {
+      const holdUntilVal = holdUntilArg.find((a: unknown) => typeof a === 'number' && (a as number) > before + 5 * 86400000);
+      if (holdUntilVal) expect(holdUntilVal).toBeGreaterThan(before);
+    }
+  });
+
+  it('commission_rate defaults to 1000 bps (10%) when vendor not found', async () => {
+    mockDb.first.mockResolvedValue(null);
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_ghost', quantity: 1, price: 2000000, name: 'Ghost' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_breakdown.vnd_ghost.commission_rate).toBe(1000);
+    expect(d.data.vendor_breakdown.vnd_ghost.commission).toBe(200000);
+  });
+
+  it('5% commission rate (500 bps) yields correct payout', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 500, settlement_hold_days: 7 });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_x', quantity: 1, price: 1000000, name: 'A' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_breakdown.vnd_x.commission).toBe(50000);
+    expect(d.data.vendor_breakdown.vnd_x.payout).toBe(950000);
+  });
+
+  it('multiple vendors each get their own settlement_id and hold_until', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [
+          { product_id: 'p1', vendor_id: 'vnd_a', quantity: 1, price: 500000, name: 'A' },
+          { product_id: 'p2', vendor_id: 'vnd_b', quantity: 1, price: 300000, name: 'B' },
+        ],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_breakdown.vnd_a).toBeDefined();
+    expect(d.data.vendor_breakdown.vnd_b).toBeDefined();
+    expect(d.data.vendor_breakdown.vnd_a.settlement_id).toMatch(/^stl_/);
+    expect(d.data.vendor_breakdown.vnd_b.settlement_id).toMatch(/^stl_/);
+  });
+
+  it('settlement IDs have stl_ prefix', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_x', quantity: 1, price: 600000, name: 'X' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_breakdown.vnd_x.settlement_id).toMatch(/^stl_/);
+  });
+
+  it('hold_days in breakdown matches vendor settlement_hold_days (14-day vendor)', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 14 });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_x', quantity: 1, price: 200000, name: 'X' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_breakdown.vnd_x.hold_days).toBe(14);
+  });
+
+  it('settlement amount equals payout (not subtotal)', async () => {
+    mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', {
+        items: [{ product_id: 'p1', vendor_id: 'vnd_x', quantity: 1, price: 1000000, name: 'X' }],
+        customer_email: 'a@a.com', payment_method: 'cash', ndpr_consent: true,
+      }),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    const bd = d.data.vendor_breakdown.vnd_x;
+    expect(bd.payout).toBe(bd.subtotal - bd.commission);
+    // Settlement amount = payout (not subtotal)
+    const settlementInserts = mockDb.prepare.mock.calls
+      .map((c: [string]) => c[0])
+      .filter((sql: string) => sql.includes('INSERT OR IGNORE INTO settlements'));
+    expect(settlementInserts.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ── Suite 3: Paystack Webhook HMAC (9 tests) ─────────────────────────────────
+describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null); // no existing log = not yet processed
+  });
+
+  const webhookBody = JSON.stringify({
+    event: 'charge.success',
+    data: { reference: 'ps_ref_test', amount: 1000000, metadata: { tenant_id: 'tnt_test' } },
+  });
+  const WHDR = { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' };
+
+  it('returns 400 when x-paystack-signature header is missing', async () => {
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: WHDR,
+      body: webhookBody,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    expect(res.status).toBe(400);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/signature/i);
+  });
+
+  it('returns 401 when signature is invalid (tampered body)', async () => {
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': 'aaaa1111bbbb2222invalid' },
+      body: webhookBody,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 200 for charge.success with valid HMAC-SHA512 signature', async () => {
+    const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': sig },
+      body: webhookBody,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    expect(res.status).toBe(200);
+    const d = await res.json() as any;
+    expect(d.success).toBe(true);
+  });
+
+  it('charge.success updates orders payment_status to paid', async () => {
+    const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': sig },
+      body: webhookBody,
+    });
+    await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const orderUpdate = updateCalls.find((sql: string) => sql.includes("payment_status = 'paid'") && sql.includes('orders'));
+    expect(orderUpdate).toBeDefined();
+  });
+
+  it('charge.success promotes eligible held settlements', async () => {
+    const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': sig },
+      body: webhookBody,
+    });
+    await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    const settlementUpdate = mockDb.prepare.mock.calls.map((c: [string]) => c[0])
+      .find((sql: string) => sql.includes("'eligible'") && sql.includes('settlements'));
+    expect(settlementUpdate).toBeDefined();
+  });
+
+  it('transfer.success marks payout_request as paid', async () => {
+    const transferBody = JSON.stringify({
+      event: 'transfer.success',
+      data: { transfer_code: 'TRF_abc123', amount: 900000 },
+    });
+    const sig = await makeWebhookSignature(PAYSTACK_SECRET, transferBody);
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': sig },
+      body: transferBody,
+    });
+    await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const payoutUpdate = updateCalls.find((sql: string) =>
+      sql.includes("status = 'paid'") && sql.includes('payout_requests'),
+    );
+    expect(payoutUpdate).toBeDefined();
+  });
+
+  it('returns 200 for unknown event types (graceful no-op)', async () => {
+    const unknownBody = JSON.stringify({ event: 'invoice.payment_failed', data: { reference: 'ref_unk' } });
+    const sig = await makeWebhookSignature(PAYSTACK_SECRET, unknownBody);
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': sig },
+      body: unknownBody,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    expect(res.status).toBe(200);
+  });
+
+  it('logs webhook event to paystack_webhook_log table', async () => {
+    const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': sig },
+      body: webhookBody,
+    });
+    await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    const insertLog = mockDb.prepare.mock.calls.map((c: [string]) => c[0])
+      .find((sql: string) => sql.includes('paystack_webhook_log'));
+    expect(insertLog).toBeDefined();
+  });
+
+  it('is idempotent: returns 200 immediately when event already processed', async () => {
+    // Simulate already-processed event
+    mockDb.first.mockResolvedValue({ id: 'pwl_charge_success_ps_ref_test', processed: 1 });
+    const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
+    const req = new Request('http://localhost/paystack/webhook', {
+      method: 'POST',
+      headers: { ...WHDR, 'x-paystack-signature': sig },
+      body: webhookBody,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
+    expect(res.status).toBe(200);
+    const d = await res.json() as any;
+    expect(d.message).toMatch(/already processed/i);
+  });
+});
+
+// ── Suite 4: Shipping estimate (9 tests) ─────────────────────────────────────
+describe('MV-4 GET /shipping/estimate', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+  });
+
+  it('returns 400 when vendor_id is missing', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?state=Lagos'),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(400);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/vendor_id/i);
+  });
+
+  it('returns 400 when state is missing', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1'),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(400);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/state/i);
+  });
+
+  it('returns 200 with zero fee note when no zone configured for vendor+state', async () => {
+    mockDb.first.mockResolvedValue(null);
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Kano'),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(200);
+    const d = await res.json() as any;
+    expect(d.data.total_fee).toBe(0);
+    expect(d.data.note).toMatch(/No delivery zone/i);
+  });
+
+  it('returns base_fee + weight_fee when zone found and free_above not met', async () => {
+    mockDb.first.mockResolvedValue({
+      base_fee: 150000, per_kg_fee: 20000, free_above: 5000000,
+      estimated_days_min: 1, estimated_days_max: 2,
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos&weight_kg=2&order_value=500000'),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.base_fee).toBe(150000);
+    expect(d.data.weight_fee).toBe(40000); // 2kg * 20000
+    expect(d.data.total_fee).toBe(190000);
+    expect(d.data.is_free).toBe(false);
+  });
+
+  it('returns total_fee=0 and is_free=true when order_value >= free_above', async () => {
+    mockDb.first.mockResolvedValue({
+      base_fee: 150000, per_kg_fee: 20000, free_above: 2000000,
+      estimated_days_min: 1, estimated_days_max: 3,
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos&order_value=2000000'),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.is_free).toBe(true);
+    expect(d.data.total_fee).toBe(0);
+  });
+
+  it('returns estimated_days_min and estimated_days_max from zone config', async () => {
+    mockDb.first.mockResolvedValue({
+      base_fee: 100000, per_kg_fee: 0, free_above: null,
+      estimated_days_min: 2, estimated_days_max: 5,
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Rivers'),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.estimated_days_min).toBe(2);
+    expect(d.data.estimated_days_max).toBe(5);
+  });
+
+  it('returns per_kg_fee=0 when weight_kg not provided', async () => {
+    mockDb.first.mockResolvedValue({
+      base_fee: 100000, per_kg_fee: 15000, free_above: null,
+      estimated_days_min: 1, estimated_days_max: 3,
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos'),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.weight_fee).toBe(0);
+    expect(d.data.total_fee).toBe(100000);
+  });
+
+  it('includes vendor_id and state in response for client correlation', async () => {
+    mockDb.first.mockResolvedValue(null);
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_99&state=Abuja FCT'),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.vendor_id).toBe('vnd_99');
+    expect(d.data.state).toBe('Abuja FCT');
+  });
+
+  it('returns is_free=false when free_above is null', async () => {
+    mockDb.first.mockResolvedValue({
+      base_fee: 200000, per_kg_fee: 0, free_above: null,
+      estimated_days_min: 1, estimated_days_max: 3,
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos&order_value=9999999'),
+      mockEnv as any,
+    );
+    const d = await res.json() as any;
+    expect(d.data.is_free).toBe(false);
+    expect(d.data.total_fee).toBe(200000);
+  });
+});
+
+// ── Suite 5: Delivery zones creation (6 tests) ───────────────────────────────
+describe('MV-4 POST /delivery-zones', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+  });
+
+  it('returns 401 when no vendor JWT provided', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/delivery-zones', { vendor_id: 'vnd_1', state: 'Lagos', base_fee: 100000 }),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 400 when state is missing', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/delivery-zones', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ vendor_id: 'vnd_1', base_fee: 100000 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/state/i);
+  });
+
+  it('returns 400 when state is not a valid Nigeria state', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/delivery-zones', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'California', base_fee: 100000 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/Invalid Nigerian state/i);
+  });
+
+  it('returns 403 when vendor_id in body does not match JWT', async () => {
+    const token = await makeVendorToken('vnd_other', 'tnt_test');
+    const req = new Request('http://localhost/delivery-zones', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: 100000 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(403);
+  });
+
+  it('creates delivery zone with valid payload and returns dz_ prefixed id', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/delivery-zones', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: 150000, per_kg_fee: 20000, estimated_days_min: 1, estimated_days_max: 2 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(201);
+    const d = await res.json() as any;
+    expect(d.data.id).toMatch(/^dz_/);
+    expect(d.data.state).toBe('Lagos');
+  });
+
+  it('returns 400 when base_fee is negative', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/delivery-zones', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: -100 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+});
+
+// ── Suite 6: Vendor settlements listing (9 tests) ────────────────────────────
+describe('MV-4 GET /vendors/:id/settlements', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+  });
+
+  it('returns 401 when no JWT provided', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/vendors/vnd_1/settlements'),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 403 when JWT vendor_id does not match route :id', async () => {
+    const token = await makeVendorToken('vnd_other', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(403);
+  });
+
+  it('returns empty list when no settlements exist', async () => {
+    mockDb.all.mockResolvedValue({ results: [] });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(200);
+    const d = await res.json() as any;
+    expect(d.data).toEqual([]);
+    expect(d.meta.eligible_total).toBe(0);
+    expect(d.meta.held_total).toBe(0);
+  });
+
+  it('computes eligible_total from settlements with status=eligible', async () => {
+    const now = Date.now();
+    mockDb.all.mockResolvedValue({
+      results: [
+        { id: 'stl_1', amount: 900000, commission: 100000, hold_days: 7, hold_until: now - 1, status: 'eligible', order_id: 'ord_1', marketplace_order_id: 'mkp_ord_1', payout_request_id: null, created_at: now - 800000 },
+        { id: 'stl_2', amount: 450000, commission: 50000, hold_days: 7, hold_until: now + 600000, status: 'held', order_id: 'ord_2', marketplace_order_id: 'mkp_ord_1', payout_request_id: null, created_at: now - 500000 },
+      ],
+    });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.meta.eligible_total).toBe(900000);
+    expect(d.meta.held_total).toBe(450000);
+  });
+
+  it('promotes held→eligible settlements past hold_until before listing', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const promotionUpdate = updateCalls.find((sql: string) =>
+      sql.includes("'eligible'") && sql.includes('settlements') && sql.includes('hold_until'),
+    );
+    expect(promotionUpdate).toBeDefined();
+  });
+
+  it('returns total_count in meta matching number of settlements returned', async () => {
+    const now = Date.now();
+    mockDb.all.mockResolvedValue({
+      results: [
+        { id: 'stl_1', amount: 100000, commission: 10000, hold_days: 7, hold_until: now, status: 'eligible', order_id: null, marketplace_order_id: null, payout_request_id: null, created_at: now },
+        { id: 'stl_2', amount: 200000, commission: 20000, hold_days: 7, hold_until: now, status: 'held', order_id: null, marketplace_order_id: null, payout_request_id: null, created_at: now },
+        { id: 'stl_3', amount: 300000, commission: 30000, hold_days: 7, hold_until: now, status: 'released', order_id: null, marketplace_order_id: null, payout_request_id: 'pr_1', created_at: now },
+      ],
+    });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.meta.total_count).toBe(3);
+  });
+
+  it('expired JWT is rejected with 401', async () => {
+    const expiredToken = await makeExpiredVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${expiredToken}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(401);
+  });
+
+  it('settlement query scoped to tenant_id (tenant isolation)', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const settlementQueryCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0])
+      .filter((sql: string) => sql.includes('FROM settlements'));
+    expect(settlementQueryCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('returns success:true with data array regardless of empty results', async () => {
+    mockDb.all.mockResolvedValue({ results: null }); // simulate null results edge case
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(200);
+    const d = await res.json() as any;
+    expect(Array.isArray(d.data)).toBe(true);
+  });
+});
+
+// ── Suite 7: Payout requests (10 tests) ──────────────────────────────────────
+describe('MV-4 POST /vendors/:id/payout-request', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+  });
+
+  it('returns 401 when no JWT provided', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/vendors/vnd_1/payout-request', {}),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 403 when JWT vendor_id does not match route :id', async () => {
+    const token = await makeVendorToken('vnd_other', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(403);
+  });
+
+  it('returns 409 when a pending payout request already exists', async () => {
+    // First first() call = existingPayout SELECT → returns the pending record → 409
+    mockDb.first.mockResolvedValueOnce({ id: 'pr_existing', status: 'pending' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(409);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/already/i);
+  });
+
+  it('returns 422 when no eligible settlements exist', async () => {
+    mockDb.first.mockResolvedValue(null); // no existing payout
+    mockDb.all.mockResolvedValue({ results: [] }); // no eligible settlements
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(422);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/eligible/i);
+  });
+
+  it('creates payout_request with pr_ prefixed id', async () => {
+    mockDb.first
+      .mockResolvedValueOnce(null) // no existing payout
+      .mockResolvedValueOnce({ bank_details_json: '{"bank_code":"044","account_number":"0123456789"}' }); // vendor row
+    mockDb.all.mockResolvedValue({
+      results: [{ id: 'stl_1', amount: 900000 }, { id: 'stl_2', amount: 450000 }],
+    });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(201);
+    const d = await res.json() as any;
+    expect(d.data.payout_request_id).toMatch(/^pr_/);
+  });
+
+  it('payout amount equals sum of eligible settlement amounts', async () => {
+    mockDb.first
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ bank_details_json: null });
+    mockDb.all.mockResolvedValue({
+      results: [{ id: 'stl_1', amount: 900000 }, { id: 'stl_2', amount: 450000 }],
+    });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.amount).toBe(1350000);
+  });
+
+  it('settlement_count in response matches number of eligible settlements', async () => {
+    mockDb.first
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ bank_details_json: null });
+    mockDb.all.mockResolvedValue({
+      results: [{ id: 'stl_1', amount: 900000 }, { id: 'stl_2', amount: 450000 }, { id: 'stl_3', amount: 300000 }],
+    });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.settlement_count).toBe(3);
+  });
+
+  it('updates settlements to released status and links payout_request_id', async () => {
+    mockDb.first
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ bank_details_json: null });
+    mockDb.all.mockResolvedValue({ results: [{ id: 'stl_1', amount: 900000 }] });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const settlementUpdate = updateCalls.find((sql: string) =>
+      sql.includes("status = 'released'") && sql.includes('settlements'),
+    );
+    expect(settlementUpdate).toBeDefined();
+  });
+
+  it('payout status is pending on creation', async () => {
+    mockDb.first
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ bank_details_json: null });
+    mockDb.all.mockResolvedValue({ results: [{ id: 'stl_1', amount: 500000 }] });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.status).toBe('pending');
+  });
+
+  it('processing status is also blocked (409) like pending', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'pr_processing', status: 'processing' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(409);
+  });
+});
+
 

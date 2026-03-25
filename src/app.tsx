@@ -1626,7 +1626,7 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   const [vendorName, setVendorName] = useState<string | null>(() =>
     sessionStorage.getItem(`ww_vname_${tenantId}`)
   );
-  const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'kyc'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'kyc' | 'payouts'>('overview');
 
   const [otpStep, setOtpStep] = useState<'phone' | 'code'>('phone');
   const [otpPhone, setOtpPhone] = useState('');
@@ -1646,6 +1646,17 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   const [kycSubmitting, setKycSubmitting] = useState(false);
   const [kycMessage, setKycMessage] = useState('');
   const [kycError, setKycError] = useState('');
+
+  const [settlements, setSettlements] = useState<Array<{
+    id: string; order_id: string | null; marketplace_order_id: string | null;
+    amount: number; commission: number; hold_days: number; hold_until: number;
+    status: string; payout_request_id: string | null; created_at: number;
+  }>>([]);
+  const [payoutsMeta, setPayoutsMeta] = useState<{ eligible_total: number; held_total: number } | null>(null);
+  const [payoutsLoading, setPayoutsLoading] = useState(false);
+  const [payoutRequesting, setPayoutRequesting] = useState(false);
+  const [payoutMessage, setPayoutMessage] = useState('');
+  const [payoutError, setPayoutError] = useState('');
 
   const apiHeaders = useCallback((extraHeaders?: Record<string, string>) => ({
     'Content-Type': 'application/json',
@@ -1700,7 +1711,7 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
     sessionStorage.removeItem(`ww_vtok_${tenantId}`);
     sessionStorage.removeItem(`ww_vid_${tenantId}`);
     sessionStorage.removeItem(`ww_vname_${tenantId}`);
-    setOverview(null); setOrders([]);
+    setOverview(null); setOrders([]); setSettlements([]); setPayoutsMeta(null);
   };
 
   useEffect(() => {
@@ -1726,6 +1737,46 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
       .catch(() => {})
       .finally(() => setOrdersLoading(false));
   }, [authToken, vendorId, activeTab, apiHeaders]);
+
+  useEffect(() => {
+    if (!authToken || !vendorId || activeTab !== 'payouts') return;
+    setPayoutsLoading(true); setPayoutMessage(''); setPayoutError('');
+    fetch(`/api/multi-vendor/vendors/${vendorId}/settlements`, { headers: apiHeaders() })
+      .then(r => r.json() as Promise<{
+        success: boolean;
+        data: typeof settlements;
+        meta: { eligible_total: number; held_total: number };
+      }>)
+      .then(d => {
+        if (d.success) {
+          setSettlements(d.data ?? []);
+          setPayoutsMeta(d.meta ?? { eligible_total: 0, held_total: 0 });
+        }
+      })
+      .catch(() => {})
+      .finally(() => setPayoutsLoading(false));
+  }, [authToken, vendorId, activeTab, apiHeaders]);
+
+  const handleRequestPayout = async () => {
+    if (!vendorId || !authToken) return;
+    setPayoutRequesting(true); setPayoutMessage(''); setPayoutError('');
+    try {
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/payout-request`, {
+        method: 'POST',
+        headers: apiHeaders(),
+      });
+      const d = await res.json() as {
+        success: boolean;
+        data?: { payout_request_id: string; amount: number; settlement_count: number };
+        error?: string;
+      };
+      if (d.success && d.data) {
+        setPayoutMessage(`Payout request ${d.data.payout_request_id} submitted for ₦${(d.data.amount / 100).toLocaleString()} (${d.data.settlement_count} settlement${d.data.settlement_count !== 1 ? 's' : ''}).`);
+        setActiveTab('payouts');
+      } else setPayoutError(d.error ?? 'Payout request failed');
+    } catch { setPayoutError('Network error. Try again.'); }
+    finally { setPayoutRequesting(false); }
+  };
 
   const handleKycSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1827,6 +1878,7 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
         <button style={S.tab(activeTab === 'overview')} onClick={() => setActiveTab('overview')}>📊 Overview</button>
         <button style={S.tab(activeTab === 'orders')} onClick={() => setActiveTab('orders')}>📦 Orders</button>
         <button style={S.tab(activeTab === 'kyc')} onClick={() => setActiveTab('kyc')}>🔖 KYC</button>
+        <button style={S.tab(activeTab === 'payouts')} onClick={() => setActiveTab('payouts')}>💸 Payouts</button>
       </div>
 
       <div style={{ padding: '16px' }}>
@@ -1888,6 +1940,89 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
               );
             })
           )
+        )}
+
+        {activeTab === 'payouts' && (
+          <div>
+            {payoutMessage && (
+              <div style={{ padding: '12px 16px', backgroundColor: '#dcfce7', border: '1px solid #bbf7d0', borderRadius: '8px', color: '#15803d', marginBottom: '16px', fontSize: '13px' }}>
+                {payoutMessage}
+              </div>
+            )}
+            {payoutError && (
+              <div style={{ padding: '10px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>
+                {payoutError}
+              </div>
+            )}
+            {payoutsLoading ? (
+              <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>Loading payouts…</div>
+            ) : (
+              <>
+                {payoutsMeta && (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '16px' }}>
+                    <div style={{ ...S.card, borderLeft: '4px solid #16a34a', marginBottom: 0 }}>
+                      <div style={{ fontSize: '12px', color: '#6b7280' }}>Eligible for Payout</div>
+                      <div style={{ fontSize: '20px', fontWeight: 700, color: '#16a34a' }}>
+                        ₦{(payoutsMeta.eligible_total / 100).toLocaleString()}
+                      </div>
+                    </div>
+                    <div style={{ ...S.card, borderLeft: '4px solid #f59e0b', marginBottom: 0 }}>
+                      <div style={{ fontSize: '12px', color: '#6b7280' }}>In Escrow (Held)</div>
+                      <div style={{ fontSize: '20px', fontWeight: 700, color: '#f59e0b' }}>
+                        ₦{(payoutsMeta.held_total / 100).toLocaleString()}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {payoutsMeta && payoutsMeta.eligible_total > 0 && (
+                  <button
+                    onClick={handleRequestPayout}
+                    disabled={payoutRequesting}
+                    style={{
+                      width: '100%', padding: '13px',
+                      backgroundColor: payoutRequesting ? '#d1d5db' : '#16a34a',
+                      color: '#fff', border: 'none', borderRadius: '8px',
+                      fontWeight: 700, cursor: payoutRequesting ? 'wait' : 'pointer',
+                      fontSize: '15px', marginBottom: '16px',
+                    }}>
+                    {payoutRequesting ? 'Requesting…' : `Request Payout — ₦${(payoutsMeta.eligible_total / 100).toLocaleString()}`}
+                  </button>
+                )}
+                {settlements.length === 0 ? (
+                  <div style={{ textAlign: 'center', padding: '24px', color: '#9ca3af', fontSize: '13px' }}>
+                    No settlement records yet. Settlements are created after each marketplace order and released after the hold period (T+7 default).
+                  </div>
+                ) : (
+                  settlements.map(s => {
+                    const statusColor = s.status === 'eligible' ? '#16a34a'
+                      : s.status === 'released' ? '#3b82f6'
+                      : s.status === 'held' ? '#f59e0b' : '#6b7280';
+                    const statusBg = s.status === 'eligible' ? '#dcfce7'
+                      : s.status === 'released' ? '#dbeafe'
+                      : s.status === 'held' ? '#fef9c3' : '#f3f4f6';
+                    const releaseDate = new Date(s.hold_until).toLocaleDateString('en-NG', { day: 'numeric', month: 'short', year: 'numeric' });
+                    return (
+                      <div key={s.id} style={S.card}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                          <div style={{ fontSize: '13px', fontWeight: 600 }}>₦{(s.amount / 100).toLocaleString()}</div>
+                          <span style={{ padding: '2px 8px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, backgroundColor: statusBg, color: statusColor }}>
+                            {s.status.toUpperCase()}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: '11px', color: '#6b7280' }}>Commission: ₦{(s.commission / 100).toLocaleString()}</div>
+                        <div style={{ fontSize: '11px', color: '#6b7280' }}>
+                          {s.status === 'held' ? `Releases: ${releaseDate} (T+${s.hold_days})` : `Released: ${releaseDate}`}
+                        </div>
+                        {s.marketplace_order_id && (
+                          <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '3px' }}>{s.marketplace_order_id.slice(0, 24)}…</div>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+              </>
+            )}
+          </div>
         )}
 
         {activeTab === 'kyc' && (

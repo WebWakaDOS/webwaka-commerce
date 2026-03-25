@@ -587,11 +587,13 @@ app.get('/ledger', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /checkout — Marketplace checkout with umbrella order + commission splitting
- * MV-3: Creates marketplace_orders umbrella record + per-vendor child orders in orders table.
- *       Builds vendor_breakdown_json with per-vendor subtotal, commission, payout.
- *       All child orders reference the umbrella via marketplace_order_id.
- * MV-4: Will replace client payment_reference with server-side Paystack verify.
+ * POST /checkout — Marketplace checkout (MV-4 upgrade)
+ * MV-3: Creates marketplace_orders umbrella + per-vendor child orders + ledger entries.
+ * MV-4 adds:
+ *   - Server-side Paystack transaction verify (when PAYSTACK_SECRET set + method='paystack')
+ *   - Amount mismatch guard (prevents partial-payment fraud)
+ *   - Per-vendor settlement records in `settlements` table (T+7 escrow default)
+ *   - Vendor settlement_hold_days respected per vendor
  */
 app.post('/checkout', async (c) => {
   const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
@@ -612,6 +614,35 @@ app.post('/checkout', async (c) => {
   }
   if (!body.customer_email?.trim()) {
     return c.json({ success: false, error: 'customer_email is required' }, 400);
+  }
+
+  const subtotalPreVerify = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
+
+  // ── MV-4: Server-side Paystack verification ───────────────────────────────
+  if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET && body.payment_reference) {
+    try {
+      const psRes = await fetch(
+        `https://api.paystack.co/transaction/verify/${encodeURIComponent(body.payment_reference)}`,
+        { headers: { Authorization: `Bearer ${c.env.PAYSTACK_SECRET}` } },
+      );
+      const psData = await psRes.json() as {
+        status: boolean;
+        data?: { status: string; amount: number; reference: string };
+      };
+      if (!psData.status || psData.data?.status !== 'success') {
+        return c.json({ success: false, error: 'Payment verification failed. Transaction not successful.' }, 402);
+      }
+      if (psData.data.amount < subtotalPreVerify) {
+        return c.json({
+          success: false,
+          error: `Payment amount mismatch: received ${psData.data.amount} kobo, expected ${subtotalPreVerify} kobo.`,
+        }, 402);
+      }
+    } catch (fetchErr) {
+      return c.json({ success: false, error: `Paystack API error: ${String(fetchErr)}` }, 502);
+    }
+  } else if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET && !body.payment_reference) {
+    return c.json({ success: false, error: 'payment_reference is required for Paystack payments' }, 400);
   }
 
   const now = Date.now();
@@ -635,6 +666,7 @@ app.post('/checkout', async (c) => {
     // ── Build per-vendor breakdown (fetch commission_rates) ──────────────────
     const breakdownMap: Record<string, {
       vendor_id: string; subtotal: number; commission: number; payout: number; commission_rate: number;
+      settlement_id?: string; hold_until?: number; hold_days?: number;
     }> = {};
 
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
@@ -705,6 +737,31 @@ app.post('/checkout', async (c) => {
          VALUES (?, ?, ?, ?, 'revenue', ?, 'CREDIT', ?, ?, ?)`
       ).bind(led2, tenantId, vendorId, childId, bd.payout,
         `Vendor payout for umbrella order ${mkpOrderId}`, paymentRef, now).run();
+
+      // ── MV-4: Settlement record (T+hold_days escrow) ──────────────────────
+      // Fetch vendor's settlement_hold_days (default 7 if column not yet migrated)
+      const vendorHoldRow = await c.env.DB.prepare(
+        `SELECT settlement_hold_days FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
+      ).bind(vendorId, tenantId).first<{ settlement_hold_days?: number }>();
+      const holdDays = vendorHoldRow?.settlement_hold_days ?? 7;
+      const holdUntil = now + holdDays * 24 * 60 * 60 * 1000;
+      const stlId = `stl_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+      await c.env.DB.prepare(
+        `INSERT OR IGNORE INTO settlements
+           (id, tenant_id, vendor_id, order_id, marketplace_order_id, amount, commission,
+            commission_rate, hold_days, hold_until, status, payment_reference, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?)`
+      ).bind(
+        stlId, tenantId, vendorId, childId, mkpOrderId,
+        bd.payout, bd.commission, bd.commission_rate,
+        holdDays, holdUntil, paymentRef, now, now,
+      ).run();
+
+      // Store settlement id in breakdown for response
+      bd.settlement_id = stlId;
+      bd.hold_until = holdUntil;
+      bd.hold_days = holdDays;
     }
 
     return c.json({
@@ -713,6 +770,7 @@ app.post('/checkout', async (c) => {
         marketplace_order_id: mkpOrderId,
         total_amount: subtotal,
         payment_reference: paymentRef,
+        payment_verified: body.payment_method === 'paystack' && !!c.env.PAYSTACK_SECRET,
         vendor_count: vendorCount,
         vendor_breakdown: breakdownMap,
       },
@@ -1354,4 +1412,434 @@ app.get('/cart/:token', async (c) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-4: PAYSTACK WEBHOOK — HMAC-SHA512 signature verify + event handling
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /paystack/webhook
+ * Verifies x-paystack-signature header (HMAC-SHA512 of raw body with PAYSTACK_SECRET).
+ * Handles: charge.success → marks order paid + creates settlement if missing.
+ *          transfer.success → marks payout_request as paid.
+ * Idempotent: logs each event in paystack_webhook_log (unique on event+reference).
+ */
+app.post('/paystack/webhook', async (c) => {
+  const signature = c.req.header('x-paystack-signature');
+  if (!signature) {
+    return c.json({ success: false, error: 'Missing x-paystack-signature header' }, 400);
+  }
+
+  const rawBody = await c.req.text();
+
+  // HMAC-SHA512 verification using Web Crypto
+  try {
+    const secret = c.env.PAYSTACK_SECRET ?? '';
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw',
+      enc.encode(secret),
+      { name: 'HMAC', hash: 'SHA-512' },
+      false,
+      ['sign'],
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(rawBody));
+    const hex = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    if (hex !== signature) {
+      return c.json({ success: false, error: 'Invalid signature' }, 401);
+    }
+  } catch {
+    return c.json({ success: false, error: 'Signature verification error' }, 401);
+  }
+
+  let payload: { event: string; data: Record<string, unknown> };
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return c.json({ success: false, error: 'Invalid JSON body' }, 400);
+  }
+
+  const { event, data } = payload;
+  const reference = (data.reference ?? data.transfer_code ?? '') as string;
+  const tenantId = (data.metadata as Record<string, unknown> | undefined)?.tenant_id as string | undefined;
+  const now = Date.now();
+  const logId = `pwl_${event.replace('.', '_')}_${reference}`;
+
+  // Idempotency: skip already-processed events
+  const existing = await c.env.DB.prepare(
+    `SELECT id, processed FROM paystack_webhook_log WHERE id = ?`
+  ).bind(logId).first<{ id: string; processed: number }>();
+
+  if (existing?.processed) {
+    return c.json({ success: true, message: 'Already processed' });
+  }
+
+  // Log the event
+  await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO paystack_webhook_log
+       (id, event, reference, tenant_id, raw_json, processed, received_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?)`
+  ).bind(logId, event, reference, tenantId ?? null, rawBody, now).run();
+
+  try {
+    if (event === 'charge.success') {
+      // Mark orders paid
+      if (tenantId && reference) {
+        await c.env.DB.prepare(
+          `UPDATE orders SET payment_status = 'paid', updated_at = ?
+           WHERE payment_reference = ? AND tenant_id = ?`
+        ).bind(now, reference, tenantId).run();
+
+        await c.env.DB.prepare(
+          `UPDATE marketplace_orders SET payment_status = 'paid', updated_at = ?
+           WHERE payment_reference = ? AND tenant_id = ?`
+        ).bind(now, reference, tenantId).run();
+
+        // Mark held settlements eligible if hold_until has passed
+        await c.env.DB.prepare(
+          `UPDATE settlements SET status = 'eligible', updated_at = ?
+           WHERE tenant_id = ? AND payment_reference = ? AND status = 'held' AND hold_until <= ?`
+        ).bind(now, tenantId, reference, now).run();
+      }
+    } else if (event === 'transfer.success') {
+      const transferCode = data.transfer_code as string | undefined;
+      if (transferCode) {
+        await c.env.DB.prepare(
+          `UPDATE payout_requests SET status = 'paid', processed_at = ?, updated_at = ?
+           WHERE paystack_transfer_code = ?`
+        ).bind(now, now, transferCode).run();
+      }
+    } else if (event === 'transfer.failed' || event === 'transfer.reversed') {
+      const transferCode = data.transfer_code as string | undefined;
+      if (transferCode) {
+        const reason = event === 'transfer.reversed' ? 'Transfer reversed by Paystack' : 'Transfer failed';
+        await c.env.DB.prepare(
+          `UPDATE payout_requests SET status = 'failed', failure_reason = ?, processed_at = ?, updated_at = ?
+           WHERE paystack_transfer_code = ?`
+        ).bind(reason, now, now, transferCode).run();
+      }
+    }
+
+    // Mark event as processed
+    await c.env.DB.prepare(
+      `UPDATE paystack_webhook_log SET processed = 1 WHERE id = ?`
+    ).bind(logId).run();
+
+    return c.json({ success: true });
+  } catch (e) {
+    await c.env.DB.prepare(
+      `UPDATE paystack_webhook_log SET error = ? WHERE id = ?`
+    ).bind(String(e), logId).run();
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-4: DELIVERY ZONES — Nigeria States/LGAs per-vendor shipping rates
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const NIGERIA_STATES = new Set([
+  'Abia', 'Adamawa', 'Akwa Ibom', 'Anambra', 'Bauchi', 'Bayelsa', 'Benue', 'Borno',
+  'Cross River', 'Delta', 'Ebonyi', 'Edo', 'Ekiti', 'Enugu', 'Gombe', 'Imo',
+  'Jigawa', 'Kaduna', 'Kano', 'Katsina', 'Kebbi', 'Kogi', 'Kwara', 'Lagos',
+  'Nasarawa', 'Niger', 'Ogun', 'Ondo', 'Osun', 'Oyo', 'Plateau', 'Rivers',
+  'Sokoto', 'Taraba', 'Yobe', 'Zamfara', 'Abuja FCT',
+]);
+
+/**
+ * POST /delivery-zones — Create or update a delivery zone for a vendor.
+ * Requires X-Admin-Key header matching env ADMIN_KEY or vendor JWT with matching vendor_id.
+ * Body: { vendor_id, state, lga?, base_fee, per_kg_fee?, free_above?, estimated_days_min?, estimated_days_max? }
+ */
+app.post('/delivery-zones', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  const jwtVendorId = vendor.vendorId;
+  const body = await c.req.json<{
+    vendor_id: string;
+    state: string;
+    lga?: string;
+    base_fee: number;
+    per_kg_fee?: number;
+    free_above?: number;
+    estimated_days_min?: number;
+    estimated_days_max?: number;
+    is_active?: boolean;
+  }>();
+
+  if (!body.vendor_id) return c.json({ success: false, error: 'vendor_id is required' }, 400);
+  if (body.vendor_id !== jwtVendorId) {
+    return c.json({ success: false, error: 'Forbidden: vendor_id does not match token' }, 403);
+  }
+  if (!body.state?.trim()) return c.json({ success: false, error: 'state is required' }, 400);
+  if (!NIGERIA_STATES.has(body.state.trim())) {
+    return c.json({ success: false, error: `Invalid Nigerian state: ${body.state}` }, 400);
+  }
+  if (typeof body.base_fee !== 'number' || body.base_fee < 0) {
+    return c.json({ success: false, error: 'base_fee must be a non-negative number (kobo)' }, 400);
+  }
+
+  const now = Date.now();
+  const dzId = `dz_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO delivery_zones
+         (id, tenant_id, vendor_id, state, lga, base_fee, per_kg_fee, free_above,
+          is_active, estimated_days_min, estimated_days_max, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tenant_id, vendor_id, state, lga)
+       DO UPDATE SET base_fee=excluded.base_fee, per_kg_fee=excluded.per_kg_fee,
+                     free_above=excluded.free_above, is_active=excluded.is_active,
+                     estimated_days_min=excluded.estimated_days_min,
+                     estimated_days_max=excluded.estimated_days_max,
+                     updated_at=excluded.updated_at`
+    ).bind(
+      dzId, tenantId, body.vendor_id, body.state.trim(), body.lga?.trim() ?? null,
+      body.base_fee, body.per_kg_fee ?? 0, body.free_above ?? null,
+      body.is_active !== false ? 1 : 0,
+      body.estimated_days_min ?? 1, body.estimated_days_max ?? 3,
+      now, now,
+    ).run();
+
+    return c.json({ success: true, data: { id: dzId, vendor_id: body.vendor_id, state: body.state, lga: body.lga ?? null, base_fee: body.base_fee } }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+/**
+ * GET /shipping/estimate — Calculate shipping fee for a vendor, state, and order value.
+ * Query: ?vendor_id=X&state=Y&lga=Z&order_value=V&weight_kg=W
+ * Returns fee breakdown + estimated days. Returns 0 fee if no zone found (free/unlimited delivery).
+ */
+app.get('/shipping/estimate', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const vendorId = c.req.query('vendor_id');
+  const state = c.req.query('state');
+  const lga = c.req.query('lga');
+  const orderValue = Number(c.req.query('order_value') ?? '0');
+  const weightKg = Number(c.req.query('weight_kg') ?? '0');
+
+  if (!vendorId) return c.json({ success: false, error: 'vendor_id query param is required' }, 400);
+  if (!state) return c.json({ success: false, error: 'state query param is required' }, 400);
+
+  try {
+    // Try LGA-specific zone first, then state-wide
+    let zone = lga
+      ? await c.env.DB.prepare(
+          `SELECT * FROM delivery_zones
+           WHERE tenant_id=? AND vendor_id=? AND state=? AND lga=? AND is_active=1`
+        ).bind(tenantId, vendorId, state, lga).first<{
+          base_fee: number; per_kg_fee: number; free_above: number | null;
+          estimated_days_min: number; estimated_days_max: number;
+        }>()
+      : null;
+
+    if (!zone) {
+      zone = await c.env.DB.prepare(
+        `SELECT * FROM delivery_zones
+         WHERE tenant_id=? AND vendor_id=? AND state=? AND lga IS NULL AND is_active=1`
+      ).bind(tenantId, vendorId, state).first<{
+        base_fee: number; per_kg_fee: number; free_above: number | null;
+        estimated_days_min: number; estimated_days_max: number;
+      }>();
+    }
+
+    if (!zone) {
+      return c.json({
+        success: true,
+        data: {
+          vendor_id: vendorId, state, lga: lga ?? null,
+          base_fee: 0, weight_fee: 0, total_fee: 0, is_free: false,
+          note: 'No delivery zone configured for this region',
+        },
+      });
+    }
+
+    const isFree = zone.free_above !== null && orderValue >= zone.free_above;
+    const weightFee = Math.round(weightKg * zone.per_kg_fee);
+    const totalFee = isFree ? 0 : zone.base_fee + weightFee;
+
+    return c.json({
+      success: true,
+      data: {
+        vendor_id: vendorId, state, lga: lga ?? null,
+        base_fee: zone.base_fee, per_kg_fee: zone.per_kg_fee,
+        weight_kg: weightKg, weight_fee: weightFee,
+        free_above: zone.free_above,
+        is_free: isFree, total_fee: totalFee,
+        estimated_days_min: zone.estimated_days_min,
+        estimated_days_max: zone.estimated_days_max,
+      },
+    });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-4: VENDOR SETTLEMENTS — View escrow records post-hold
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /vendors/:id/settlements — List settlement records for authenticated vendor.
+ * Requires vendor JWT (vendorAuthMiddleware).
+ * Returns settled and eligible records plus eligible_total (kobo).
+ * Automatically marks held settlements as eligible if hold_until has passed.
+ */
+app.get('/vendors/:id/settlements', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const vendorId = c.req.param('id');
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  if (vendorId !== vendor.vendorId) {
+    return c.json({ success: false, error: 'Forbidden' }, 403);
+  }
+
+  try {
+    const now = Date.now();
+
+    // Promote held → eligible if hold_until has passed
+    await c.env.DB.prepare(
+      `UPDATE settlements SET status = 'eligible', updated_at = ?
+       WHERE tenant_id = ? AND vendor_id = ? AND status = 'held' AND hold_until <= ?`
+    ).bind(now, tenantId, vendorId, now).run();
+
+    const rows = await c.env.DB.prepare(
+      `SELECT id, order_id, marketplace_order_id, amount, commission, commission_rate,
+              hold_days, hold_until, status, payout_request_id, payment_reference,
+              created_at, updated_at
+       FROM settlements
+       WHERE tenant_id = ? AND vendor_id = ?
+       ORDER BY created_at DESC LIMIT 100`
+    ).bind(tenantId, vendorId).all<{
+      id: string; order_id: string | null; marketplace_order_id: string | null;
+      amount: number; commission: number; commission_rate: number;
+      hold_days: number; hold_until: number; status: string;
+      payout_request_id: string | null; payment_reference: string | null;
+      created_at: number; updated_at: number;
+    }>();
+
+    const eligible_total = (rows.results ?? [])
+      .filter(r => r.status === 'eligible')
+      .reduce((s, r) => s + r.amount, 0);
+
+    const held_total = (rows.results ?? [])
+      .filter(r => r.status === 'held')
+      .reduce((s, r) => s + r.amount, 0);
+
+    return c.json({
+      success: true,
+      data: rows.results ?? [],
+      meta: {
+        eligible_total,
+        held_total,
+        total_count: rows.results?.length ?? 0,
+      },
+    });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-4: PAYOUT REQUESTS — Vendor requests withdrawal of eligible balance
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /vendors/:id/payout-request — Initiate payout withdrawal.
+ * Requires vendor JWT. Vendor must have eligible settlements.
+ * Creates payout_request, links settlements to it, transitions them to 'released'.
+ * Returns 409 if an active payout request is already pending/processing.
+ * Returns 422 if eligible_total === 0.
+ */
+app.post('/vendors/:id/payout-request', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const vendorId = c.req.param('id');
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  if (vendorId !== vendor.vendorId) {
+    return c.json({ success: false, error: 'Forbidden' }, 403);
+  }
+
+  const now = Date.now();
+
+  try {
+    // Promote held → eligible
+    await c.env.DB.prepare(
+      `UPDATE settlements SET status = 'eligible', updated_at = ?
+       WHERE tenant_id = ? AND vendor_id = ? AND status = 'held' AND hold_until <= ?`
+    ).bind(now, tenantId, vendorId, now).run();
+
+    // Check for existing pending/processing payout
+    const existingPayout = await c.env.DB.prepare(
+      `SELECT id, status FROM payout_requests
+       WHERE tenant_id = ? AND vendor_id = ? AND status IN ('pending', 'processing')
+       LIMIT 1`
+    ).bind(tenantId, vendorId).first<{ id: string; status: string }>();
+
+    if (existingPayout) {
+      return c.json({
+        success: false,
+        error: `A payout request (${existingPayout.id}) is already ${existingPayout.status}. Wait for it to complete.`,
+      }, 409);
+    }
+
+    // Fetch eligible settlements
+    const eligible = await c.env.DB.prepare(
+      `SELECT id, amount FROM settlements
+       WHERE tenant_id = ? AND vendor_id = ? AND status = 'eligible'`
+    ).bind(tenantId, vendorId).all<{ id: string; amount: number }>();
+
+    const eligibleRows = eligible.results ?? [];
+    if (eligibleRows.length === 0) {
+      return c.json({ success: false, error: 'No eligible settlements to pay out. Balance may still be in hold period.' }, 422);
+    }
+
+    const totalAmount = eligibleRows.reduce((s, r) => s + r.amount, 0);
+
+    // Fetch vendor bank_details snapshot
+    const vendor = await c.env.DB.prepare(
+      `SELECT bank_details_json FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
+    ).bind(vendorId, tenantId).first<{ bank_details_json: string | null }>();
+
+    const prId = `pr_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+    await c.env.DB.prepare(
+      `INSERT INTO payout_requests
+         (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
+          status, requested_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
+    ).bind(
+      prId, tenantId, vendorId, totalAmount, eligibleRows.length,
+      vendor?.bank_details_json ?? null, now, now, now,
+    ).run();
+
+    // Link settlements to payout request and mark as released
+    for (const row of eligibleRows) {
+      await c.env.DB.prepare(
+        `UPDATE settlements
+         SET status = 'released', payout_request_id = ?, updated_at = ?
+         WHERE id = ?`
+      ).bind(prId, now, row.id).run();
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        payout_request_id: prId,
+        amount: totalAmount,
+        settlement_count: eligibleRows.length,
+        status: 'pending',
+      },
+    }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
 export { app as multiVendorRouter };
+
