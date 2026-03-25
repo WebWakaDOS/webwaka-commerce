@@ -67,6 +67,7 @@ See `.env.example` for reference:
 | COM-2 SV Phase 3 | Variants, FTS5 search, virtual scroll, category pills | ✅ Complete | #12 |
 | COM-2 SV Phase 4 | Customer OTP auth, wishlists, order history, abandoned-cart cron | ✅ Complete | #13 |
 | COM-2 SV Phase 5 | Analytics API, KV catalog cache, CF Images URLs, e2e full-flow, FINAL_SV_REPORT | ✅ Complete | #14 |
+| COM-3 Review | Deep review of multi-vendor module — 10 gaps, 7 dimension audits, MV-1..MV-5 roadmap | ✅ Complete | #15 |
 
 **Test count:** 387 passing (Vitest) — zero regressions across all 14 test files
 
