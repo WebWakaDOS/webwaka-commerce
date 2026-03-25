@@ -6,6 +6,7 @@
  * v3: Added heldCarts for park/hold sale (POS Phase 4)
  * v4: Added storefrontCarts for single-vendor cart persistence (SV Phase 1)
  * v5: Added wishlists for customer offline wishlist (SV Phase 4)
+ * v6: Added mvWishlists (multi-vendor wishlist) + mvCatalogCache (offline catalog browsing)
  */
 import Dexie, { type Table } from 'dexie';
 
@@ -107,6 +108,38 @@ export interface HeldCart {
   sessionId?: string;
 }
 
+// ─── Multi-Vendor wishlist (MV Phase 5) ──────────────────────────────────────
+export interface MvWishlistItem {
+  id: string;           // `mvwl_${tenantId}_${productId}`
+  tenantId: string;
+  productId: string;
+  productName: string;
+  vendorId: string;
+  vendorSlug: string;
+  price: number;        // kobo — snapshot at add time
+  imageEmoji?: string;
+  addedAt: number;
+  syncStatus: 'PENDING' | 'SYNCED' | 'REMOVED';
+}
+
+// ─── Multi-Vendor catalog cache (MV Phase 5 — offline browsing) ──────────────
+export interface MvCatalogItem {
+  id: string;           // product id
+  tenantId: string;
+  vendorId: string;
+  vendorSlug: string;
+  vendorName: string;
+  name: string;
+  sku: string;
+  price: number;        // kobo
+  category: string;
+  description?: string;
+  imageEmoji?: string;
+  rating_avg: number | null;
+  rating_count: number;
+  cachedAt: number;     // epoch ms — evict after 24 h
+}
+
 // ─── Offline wishlist (Single-Vendor, SV Phase 4) ────────────────────────────
 export interface OfflineWishlistItem {
   id: string;           // `wl_${tenantId}_${productId}`
@@ -148,6 +181,8 @@ export class CommerceOfflineDB extends Dexie {
   heldCarts!: Table<HeldCart, string>;
   storefrontCarts!: Table<StorefrontCartSession, string>;
   wishlists!: Table<OfflineWishlistItem, string>;
+  mvWishlists!: Table<MvWishlistItem, string>;
+  mvCatalogCache!: Table<MvCatalogItem, string>;
 
   constructor(tenantId: string) {
     super(`WebWakaCommerce_${tenantId}`);
@@ -204,6 +239,21 @@ export class CommerceOfflineDB extends Dexie {
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
       wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+    });
+
+    // v6 — adds mvWishlists (multi-vendor wishlist) + mvCatalogCache (offline catalog browsing)
+    this.version(6).stores({
+      mutations: '++id, tenantId, entityType, entityId, status, timestamp',
+      cartItems: '++id, tenantId, sessionToken, productId',
+      offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
+      products: 'id, tenantId, sku, category, cachedAt',
+      posReceipts: 'id, orderId, tenantId, createdAt',
+      posSessions: 'id, tenantId, status, openedAt',
+      heldCarts: 'id, tenantId, heldAt',
+      storefrontCarts: 'id, tenantId, updatedAt',
+      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      mvWishlists: 'id, tenantId, productId, vendorId, syncStatus, addedAt',
+      mvCatalogCache: 'id, tenantId, vendorId, category, cachedAt',
     });
   }
 }
@@ -411,4 +461,79 @@ export async function isWishlisted(tenantId: string, customerId: string, product
   const id = `wl_${tenantId}_${customerId}_${productId}`;
   const item = await db.wishlists.get(id);
   return !!(item && item.syncStatus !== 'REMOVED');
+}
+
+// ─── MV Wishlist helpers (MV Phase 5) ────────────────────────────────────────
+
+/** Toggle a product in the multi-vendor offline wishlist. Returns new state. */
+export async function toggleMvWishlistItem(
+  tenantId: string,
+  product: { id: string; name: string; vendorId: string; vendorSlug: string; price: number; imageEmoji?: string },
+): Promise<'added' | 'removed'> {
+  const db = getCommerceDB(tenantId);
+  const id = `mvwl_${tenantId}_${product.id}`;
+  const existing = await db.mvWishlists.get(id);
+  if (existing && existing.syncStatus !== 'REMOVED') {
+    await db.mvWishlists.update(id, { syncStatus: 'REMOVED' });
+    return 'removed';
+  }
+  await db.mvWishlists.put({
+    id, tenantId,
+    productId: product.id,
+    productName: product.name,
+    vendorId: product.vendorId,
+    vendorSlug: product.vendorSlug,
+    price: product.price,
+    imageEmoji: product.imageEmoji,
+    addedAt: Date.now(),
+    syncStatus: 'PENDING',
+  });
+  return 'added';
+}
+
+/** Get all active MV wishlist items for a tenant session. */
+export async function getMvWishlistItems(tenantId: string): Promise<MvWishlistItem[]> {
+  const db = getCommerceDB(tenantId);
+  return db.mvWishlists
+    .where('tenantId').equals(tenantId)
+    .filter(i => i.syncStatus !== 'REMOVED')
+    .toArray();
+}
+
+/** Check if a product is in the MV wishlist. */
+export async function isMvWishlisted(tenantId: string, productId: string): Promise<boolean> {
+  const db = getCommerceDB(tenantId);
+  const id = `mvwl_${tenantId}_${productId}`;
+  const item = await db.mvWishlists.get(id);
+  return !!(item && item.syncStatus !== 'REMOVED');
+}
+
+// ─── MV Catalog cache helpers (MV Phase 5) ───────────────────────────────────
+const MV_CATALOG_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+
+/** Cache a page of catalog items from the API. */
+export async function cacheMvCatalogPage(tenantId: string, items: MvCatalogItem[]): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  const now = Date.now();
+  await db.mvCatalogCache.bulkPut(items.map(item => ({ ...item, tenantId, cachedAt: now })));
+}
+
+/** Get cached catalog items (excluding stale entries). */
+export async function getCachedMvCatalog(tenantId: string, category?: string): Promise<MvCatalogItem[]> {
+  const db = getCommerceDB(tenantId);
+  const cutoff = Date.now() - MV_CATALOG_TTL_MS;
+  let query = db.mvCatalogCache.where('tenantId').equals(tenantId);
+  return (await query.toArray()).filter(
+    i => i.cachedAt > cutoff && (!category || i.category === category),
+  );
+}
+
+/** Evict stale cached catalog items older than TTL. */
+export async function evictStaleMvCatalog(tenantId: string): Promise<number> {
+  const db = getCommerceDB(tenantId);
+  const cutoff = Date.now() - MV_CATALOG_TTL_MS;
+  return db.mvCatalogCache
+    .where('tenantId').equals(tenantId)
+    .filter(i => i.cachedAt <= cutoff)
+    .delete();
 }

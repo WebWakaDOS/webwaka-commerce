@@ -6,7 +6,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { getTranslations, getSupportedLanguages, getLanguageName, formatKoboToNaira, type Language } from './core/i18n';
-import { getCommerceDB, queueMutation, getPendingMutations, toggleWishlistItem, getWishlistItems } from './core/offline/db';
+import { getCommerceDB, queueMutation, getPendingMutations, toggleWishlistItem, getWishlistItems, toggleMvWishlistItem, getMvWishlistItems } from './core/offline/db';
 import { useStorefrontCart } from './modules/single-vendor/useStorefrontCart';
 
 // ============================================================
@@ -1393,6 +1393,27 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
     return () => obs.disconnect();
   }, [hasMore, catalogLoading, nextCursor, fetchCatalog]);
 
+  // ── MV Wishlist (offline-first Dexie v6) ─────────────────────────────────
+  const [mvWishlisted, setMvWishlisted] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    getMvWishlistItems(tenantId).then(items => {
+      setMvWishlisted(new Set(items.map(i => i.productId)));
+    }).catch(() => {});
+  }, [tenantId]);
+
+  const toggleMvHeart = useCallback(async (p: CatalogProduct) => {
+    const action = await toggleMvWishlistItem(tenantId, {
+      id: p.id, name: p.name, vendorId: p.vendor_id ?? '', vendorSlug: p.vendor_slug,
+      price: p.price, imageEmoji: '🛍️',
+    });
+    setMvWishlisted(prev => {
+      const next = new Set(prev);
+      if (action === 'added') next.add(p.id); else next.delete(p.id);
+      return next;
+    });
+  }, [tenantId]);
+
   // ── Vendor list state (live from /vendors) ───────────────────────────────
   const [vendors, setVendors] = useState<Array<{ id: string; name: string; slug: string; status: string; commission_rate: number }>>([]);
   const [vendorsLoading, setVendorsLoading] = useState(false);
@@ -1544,6 +1565,17 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
                         <span style={{ color: '#9ca3af', marginLeft: '3px' }}>({p.rating_count})</span>
                       </div>
                     )}
+                    <button
+                      onClick={() => toggleMvHeart(p)}
+                      title={mvWishlisted.has(p.id) ? 'Remove from wishlist' : 'Save to wishlist'}
+                      style={{
+                        background: 'none', border: 'none', cursor: 'pointer',
+                        fontSize: '16px', padding: '2px 0', alignSelf: 'flex-start',
+                        lineHeight: 1,
+                      }}
+                    >
+                      {mvWishlisted.has(p.id) ? '❤️' : '🤍'}
+                    </button>
                   </div>
                 </div>
               );
@@ -1626,7 +1658,7 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   const [vendorName, setVendorName] = useState<string | null>(() =>
     sessionStorage.getItem(`ww_vname_${tenantId}`)
   );
-  const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'kyc' | 'payouts'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'kyc' | 'payouts' | 'analytics'>('overview');
 
   const [otpStep, setOtpStep] = useState<'phone' | 'code'>('phone');
   const [otpPhone, setOtpPhone] = useState('');
@@ -1657,6 +1689,14 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   const [payoutRequesting, setPayoutRequesting] = useState(false);
   const [payoutMessage, setPayoutMessage] = useState('');
   const [payoutError, setPayoutError] = useState('');
+
+  const [analyticsData, setAnalyticsData] = useState<{
+    total_orders: number; total_gmv: number; avg_order_value: number;
+    rating_avg: number | null; rating_count: number;
+    top_products: Array<{ id: string; name: string; order_count: number; revenue: number }>;
+    daily_gmv: Array<{ date_key: string; orders: number; gmv: number }>;
+  } | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
 
   const apiHeaders = useCallback((extraHeaders?: Record<string, string>) => ({
     'Content-Type': 'application/json',
@@ -1755,6 +1795,16 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
       })
       .catch(() => {})
       .finally(() => setPayoutsLoading(false));
+  }, [authToken, vendorId, activeTab, apiHeaders]);
+
+  useEffect(() => {
+    if (!authToken || !vendorId || activeTab !== 'analytics') return;
+    setAnalyticsLoading(true);
+    fetch(`/api/multi-vendor/vendors/${vendorId}/analytics`, { headers: apiHeaders() })
+      .then(r => r.ok ? r.json() as Promise<{ success: boolean; data: typeof analyticsData }> : Promise.reject(r.status))
+      .then(j => setAnalyticsData(j.data))
+      .catch(() => {})
+      .finally(() => setAnalyticsLoading(false));
   }, [authToken, vendorId, activeTab, apiHeaders]);
 
   const handleRequestPayout = async () => {
@@ -1879,6 +1929,7 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
         <button style={S.tab(activeTab === 'orders')} onClick={() => setActiveTab('orders')}>📦 Orders</button>
         <button style={S.tab(activeTab === 'kyc')} onClick={() => setActiveTab('kyc')}>🔖 KYC</button>
         <button style={S.tab(activeTab === 'payouts')} onClick={() => setActiveTab('payouts')}>💸 Payouts</button>
+        <button style={S.tab(activeTab === 'analytics')} onClick={() => setActiveTab('analytics')}>📈 Analytics</button>
       </div>
 
       <div style={{ padding: '16px' }}>
@@ -2068,6 +2119,70 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
               </form>
             </div>
           </div>
+        )}
+
+        {activeTab === 'analytics' && (
+          analyticsLoading ? (
+            <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>Loading analytics…</div>
+          ) : !analyticsData ? (
+            <div style={{ textAlign: 'center', padding: '32px', color: '#9ca3af', fontSize: '13px' }}>
+              Analytics data unavailable.
+            </div>
+          ) : (
+            <div>
+              {/* KPI Cards */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '16px' }}>
+                <div style={{ ...S.card, borderLeft: '4px solid #16a34a', marginBottom: 0 }}>
+                  <div style={{ fontSize: '11px', color: '#6b7280' }}>30-Day GMV</div>
+                  <div style={{ fontSize: '18px', fontWeight: 700, color: '#16a34a' }}>₦{(analyticsData.total_gmv / 100).toLocaleString()}</div>
+                </div>
+                <div style={{ ...S.card, borderLeft: '4px solid #3b82f6', marginBottom: 0 }}>
+                  <div style={{ fontSize: '11px', color: '#6b7280' }}>Orders</div>
+                  <div style={{ fontSize: '18px', fontWeight: 700, color: '#3b82f6' }}>{analyticsData.total_orders}</div>
+                </div>
+                <div style={{ ...S.card, borderLeft: '4px solid #8b5cf6', marginBottom: 0 }}>
+                  <div style={{ fontSize: '11px', color: '#6b7280' }}>Avg Order Value</div>
+                  <div style={{ fontSize: '18px', fontWeight: 700, color: '#8b5cf6' }}>₦{(analyticsData.avg_order_value / 100).toLocaleString()}</div>
+                </div>
+                <div style={{ ...S.card, borderLeft: '4px solid #f59e0b', marginBottom: 0 }}>
+                  <div style={{ fontSize: '11px', color: '#6b7280' }}>Rating</div>
+                  <div style={{ fontSize: '18px', fontWeight: 700, color: '#f59e0b' }}>
+                    {analyticsData.rating_avg != null ? `${analyticsData.rating_avg.toFixed(1)} ★` : '—'}
+                    {analyticsData.rating_count > 0 && <span style={{ fontSize: '11px', color: '#9ca3af', marginLeft: '4px' }}>({analyticsData.rating_count})</span>}
+                  </div>
+                </div>
+              </div>
+
+              {/* Top Products */}
+              {analyticsData.top_products.length > 0 && (
+                <div style={S.card}>
+                  <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>Top Products (30 days)</div>
+                  {analyticsData.top_products.map((p, i) => (
+                    <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: i < analyticsData.top_products.length - 1 ? '1px solid #f3f4f6' : 'none' }}>
+                      <div>
+                        <div style={{ fontSize: '13px', fontWeight: 500 }}>{p.name}</div>
+                        <div style={{ fontSize: '11px', color: '#9ca3af' }}>{p.order_count} orders</div>
+                      </div>
+                      <div style={{ fontSize: '13px', fontWeight: 700, color: '#16a34a' }}>₦{(p.revenue / 100).toLocaleString()}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Daily GMV sparkline (text) */}
+              {analyticsData.daily_gmv.length > 0 && (
+                <div style={S.card}>
+                  <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>Daily GMV (last 7 days)</div>
+                  {analyticsData.daily_gmv.map(d => (
+                    <div key={d.date_key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', padding: '4px 0', borderBottom: '1px solid #f9fafb' }}>
+                      <span style={{ color: '#6b7280' }}>{d.date_key}</span>
+                      <span style={{ fontWeight: 600 }}>₦{(d.gmv / 100).toLocaleString()} <span style={{ color: '#9ca3af', fontWeight: 400 }}>({d.orders} orders)</span></span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )
         )}
       </div>
     </div>

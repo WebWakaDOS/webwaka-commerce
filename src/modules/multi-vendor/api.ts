@@ -1841,5 +1841,417 @@ app.post('/vendors/:id/payout-request', async (c) => {
   }
 });
 
-export { app as multiVendorRouter };
 
+// ════════════════════════════════════════════════════════════════════════════
+// MV-5: PRODUCT CRUD (vendor-scoped), BULK CSV, REVIEWS, ANALYTICS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── PUT /vendors/:id/products/:pid — update own product ──────────────────────
+app.put('/vendors/:id/products/:pid', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('pid');
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Unauthorized' }, 401);
+  if (vendor.vendorId !== vendorId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+
+  const existing = await c.env.DB.prepare(
+    `SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+  ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+  if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const allowedCols = ['name', 'description', 'price', 'category', 'stock_quantity', 'is_active'];
+  const setClauses: string[] = [];
+  const values: unknown[] = [];
+  for (const col of allowedCols) {
+    if (col in body) { setClauses.push(`${col} = ?`); values.push(body[col]); }
+  }
+  if (setClauses.length === 0) return c.json({ success: false, error: 'No updatable fields provided' }, 400);
+
+  const now = Date.now();
+  setClauses.push('updated_at = ?');
+  values.push(now, productId);
+
+  await c.env.DB.prepare(
+    `UPDATE products SET ${setClauses.join(', ')} WHERE id = ?`,
+  ).bind(...values).run();
+
+  return c.json({ success: true, data: { id: productId, updated_at: now } });
+});
+
+// ── DELETE /vendors/:id/products/:pid — soft-delete own product ───────────────
+app.delete('/vendors/:id/products/:pid', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('pid');
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Unauthorized' }, 401);
+  if (vendor.vendorId !== vendorId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  const existing = await c.env.DB.prepare(
+    `SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+  ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+  if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const now = Date.now();
+  await c.env.DB.prepare(
+    `UPDATE products SET deleted_at = ?, is_active = 0, updated_at = ? WHERE id = ?`,
+  ).bind(now, now, productId).run();
+
+  return c.json({ success: true, data: { id: productId, deleted_at: now } });
+});
+
+// ── POST /vendors/:id/products/bulk-csv — CSV bulk import ─────────────────────
+// Format: header row (name,sku,price_naira,category,description,stock_quantity) + data rows.
+// price_naira is whole Naira → multiplied ×100 to store as kobo.
+app.post('/vendors/:id/products/bulk-csv', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+  const vendorId = c.req.param('id');
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Unauthorized' }, 401);
+  if (vendor.vendorId !== vendorId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  const csvBody = await c.req.text().catch(() => '');
+  if (!csvBody.trim()) return c.json({ success: false, error: 'Empty CSV body' }, 400);
+
+  const lines = csvBody.split('\n').map((l: string) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return c.json({ success: false, error: 'CSV must have a header row plus at least one data row' }, 400);
+
+  const batchId = `csv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  const created: string[] = [];
+  const errors: Array<{ row: number; error: string }> = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = (lines[i] as string).split(',').map((c: string) => c.trim());
+    const [name, sku, priceStr, category, description, stockStr] = cols;
+    if (!name || !sku || !priceStr) {
+      errors.push({ row: i + 1, error: 'name, sku, price_naira are required' });
+      continue;
+    }
+    const priceKobo = Math.round(parseFloat(priceStr) * 100);
+    if (isNaN(priceKobo) || priceKobo <= 0) {
+      errors.push({ row: i + 1, error: `Invalid price_naira: "${priceStr}"` });
+      continue;
+    }
+    const stockQty = parseInt(stockStr ?? '0', 10) || 0;
+    const pid = `prd_csv_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO products
+           (id, tenant_id, vendor_id, name, sku, price, category, description,
+            stock_quantity, is_active, import_batch, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+      ).bind(
+        pid, tenantId, vendorId, name, sku, priceKobo,
+        category ?? null, description ?? null, stockQty,
+        batchId, now, now,
+      ).run();
+      created.push(pid);
+    } catch (e) {
+      errors.push({ row: i + 1, error: String(e) });
+    }
+  }
+
+  return c.json({
+    success: true,
+    data: { batch_id: batchId, created_count: created.length, error_count: errors.length, errors },
+  }, 201);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// MV-5: REVIEWS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── POST /reviews — submit post-delivery product review ───────────────────────
+// Body: { product_id, order_id, rating (1-5), title?, body?, customer_email, ndpr_consent }
+app.post('/reviews', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+
+  const body = await c.req.json<{
+    product_id?: string; order_id?: string; rating?: number;
+    title?: string; body?: string; customer_email?: string; ndpr_consent?: boolean;
+  }>().catch(() => null);
+  if (!body) return c.json({ success: false, error: 'Invalid JSON body' }, 400);
+
+  const { product_id, order_id, rating, customer_email, ndpr_consent } = body;
+  if (!product_id || !order_id || rating == null || !customer_email) {
+    return c.json({ success: false, error: 'product_id, order_id, rating, customer_email are required' }, 400);
+  }
+  if (!ndpr_consent) return c.json({ success: false, error: 'NDPR consent required' }, 422);
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return c.json({ success: false, error: 'rating must be an integer between 1 and 5' }, 422);
+  }
+
+  const order = await c.env.DB.prepare(
+    `SELECT id, vendor_id, order_status FROM marketplace_orders WHERE id = ? AND tenant_id = ?`,
+  ).bind(order_id, tenantId).first<{ id: string; vendor_id: string; order_status: string }>();
+  if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+  if (!['confirmed', 'shipped', 'delivered'].includes(order.order_status)) {
+    return c.json({ success: false, error: 'Order must be confirmed, shipped, or delivered to submit a review' }, 409);
+  }
+
+  const product = await c.env.DB.prepare(
+    `SELECT id, vendor_id FROM products WHERE id = ? AND tenant_id = ?`,
+  ).bind(product_id, tenantId).first<{ id: string; vendor_id: string }>();
+  if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const now = Date.now();
+  const reviewId = `rv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO product_reviews
+         (id, tenant_id, product_id, vendor_id, order_id, customer_email,
+          rating, title, body, is_verified, is_visible, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`,
+    ).bind(
+      reviewId, tenantId, product_id, product.vendor_id, order_id,
+      customer_email, rating, body.title ?? null, body.body ?? null, now, now,
+    ).run();
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes('UNIQUE')) return c.json({ success: false, error: 'You have already reviewed this product for this order' }, 409);
+    return c.json({ success: false, error: msg }, 500);
+  }
+
+  // Update product aggregate rating
+  await c.env.DB.prepare(
+    `UPDATE products
+     SET rating_avg = (SELECT AVG(CAST(rating AS REAL)) FROM product_reviews WHERE product_id = ? AND tenant_id = ? AND is_visible = 1),
+         rating_count = (SELECT COUNT(*) FROM product_reviews WHERE product_id = ? AND tenant_id = ? AND is_visible = 1),
+         updated_at = ?
+     WHERE id = ?`,
+  ).bind(product_id, tenantId, product_id, tenantId, now, product_id).run();
+
+  // Upsert vendor_rating_cache
+  await c.env.DB.prepare(
+    `INSERT INTO vendor_rating_cache (vendor_id, tenant_id, rating_avg, rating_count, updated_at)
+     SELECT vendor_id, tenant_id,
+            AVG(CAST(rating AS REAL)),
+            COUNT(*),
+            ?
+     FROM product_reviews
+     WHERE vendor_id = ? AND tenant_id = ? AND is_visible = 1
+     ON CONFLICT(vendor_id, tenant_id) DO UPDATE SET
+       rating_avg   = excluded.rating_avg,
+       rating_count = excluded.rating_count,
+       updated_at   = excluded.updated_at`,
+  ).bind(now, product.vendor_id, tenantId).run();
+
+  return c.json({ success: true, data: { id: reviewId } }, 201);
+});
+
+// ── GET /products/:id/reviews — paginated review list for a product ───────────
+app.get('/products/:id/reviews', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+  const productId = c.req.param('id');
+  const page = Math.max(1, parseInt(c.req.query('page') ?? '1', 10) || 1);
+  const perPage = Math.min(50, Math.max(1, parseInt(c.req.query('per_page') ?? '10', 10) || 10));
+  const offset = (page - 1) * perPage;
+
+  const rows = await c.env.DB.prepare(
+    `SELECT id, rating, title, body, is_verified, helpful_count, created_at
+     FROM product_reviews
+     WHERE product_id = ? AND tenant_id = ? AND is_visible = 1
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`,
+  ).bind(productId, tenantId, perPage, offset).all<{
+    id: string; rating: number; title: string | null; body: string | null;
+    is_verified: number; helpful_count: number; created_at: number;
+  }>();
+
+  const agg = await c.env.DB.prepare(
+    `SELECT COUNT(*) as total, AVG(CAST(rating AS REAL)) as avg_rating
+     FROM product_reviews WHERE product_id = ? AND tenant_id = ? AND is_visible = 1`,
+  ).bind(productId, tenantId).first<{ total: number; avg_rating: number | null }>();
+
+  return c.json({
+    success: true,
+    data: rows.results ?? [],
+    meta: { total: agg?.total ?? 0, avg_rating: agg?.avg_rating ?? null, page, per_page: perPage },
+  });
+});
+
+// ── GET /vendors/:id/reviews — paginated reviews for a vendor + aggregate ──────
+app.get('/vendors/:id/reviews', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+  const vendorId = c.req.param('id');
+  const page = Math.max(1, parseInt(c.req.query('page') ?? '1', 10) || 1);
+  const perPage = Math.min(50, Math.max(1, parseInt(c.req.query('per_page') ?? '10', 10) || 10));
+  const offset = (page - 1) * perPage;
+
+  const rows = await c.env.DB.prepare(
+    `SELECT pr.id, pr.product_id, p.name as product_name,
+            pr.rating, pr.title, pr.body, pr.is_verified, pr.helpful_count, pr.created_at
+     FROM product_reviews pr
+     JOIN products p ON p.id = pr.product_id
+     WHERE pr.vendor_id = ? AND pr.tenant_id = ? AND pr.is_visible = 1
+     ORDER BY pr.created_at DESC
+     LIMIT ? OFFSET ?`,
+  ).bind(vendorId, tenantId, perPage, offset).all<{
+    id: string; product_id: string; product_name: string; rating: number;
+    title: string | null; body: string | null; is_verified: number; helpful_count: number; created_at: number;
+  }>();
+
+  const cache = await c.env.DB.prepare(
+    `SELECT rating_avg, rating_count FROM vendor_rating_cache WHERE vendor_id = ? AND tenant_id = ?`,
+  ).bind(vendorId, tenantId).first<{ rating_avg: number; rating_count: number }>();
+
+  return c.json({
+    success: true,
+    data: rows.results ?? [],
+    meta: {
+      rating_avg: cache?.rating_avg ?? null,
+      rating_count: cache?.rating_count ?? 0,
+      page, per_page: perPage,
+    },
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// MV-5: ANALYTICS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── GET /analytics/marketplace — 30-day GMV, top vendors, daily chart ─────────
+// Requires vendor JWT — any authenticated vendor can view marketplace-level data.
+app.get('/analytics/marketplace', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+  try {
+    const thirtyDaysAgo = Date.now() - 30 * 86400000;
+    const sevenDaysAgo = Date.now() - 7 * 86400000;
+
+    const gmvRow = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total_orders, COALESCE(SUM(total_amount), 0) as total_gmv
+       FROM marketplace_orders
+       WHERE tenant_id = ? AND payment_status = 'paid' AND created_at >= ?`,
+    ).bind(tenantId, thirtyDaysAgo).first<{ total_orders: number; total_gmv: number }>();
+
+    const topVendors = await c.env.DB.prepare(
+      `SELECT mo.vendor_id, v.name as vendor_name, v.slug,
+              COUNT(*) as order_count, COALESCE(SUM(mo.total_amount), 0) as gmv
+       FROM marketplace_orders mo
+       JOIN vendors v ON v.id = mo.vendor_id
+       WHERE mo.tenant_id = ? AND mo.payment_status = 'paid' AND mo.created_at >= ?
+       GROUP BY mo.vendor_id
+       ORDER BY gmv DESC
+       LIMIT 5`,
+    ).bind(tenantId, thirtyDaysAgo).all<{
+      vendor_id: string; vendor_name: string; slug: string; order_count: number; gmv: number;
+    }>();
+
+    const dailyGmv = await c.env.DB.prepare(
+      `SELECT strftime('%Y-%m-%d', datetime(created_at / 1000, 'unixepoch')) as date_key,
+              COUNT(*) as orders, COALESCE(SUM(total_amount), 0) as gmv
+       FROM marketplace_orders
+       WHERE tenant_id = ? AND payment_status = 'paid' AND created_at >= ?
+       GROUP BY date_key
+       ORDER BY date_key ASC`,
+    ).bind(tenantId, sevenDaysAgo).all<{ date_key: string; orders: number; gmv: number }>();
+
+    const vendorCount = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM vendors WHERE marketplace_tenant_id = ? AND status = 'active'`,
+    ).bind(tenantId).first<{ total: number }>();
+
+    return c.json({
+      success: true,
+      data: {
+        period_days: 30,
+        total_orders: gmvRow?.total_orders ?? 0,
+        total_gmv: gmvRow?.total_gmv ?? 0,
+        active_vendors: vendorCount?.total ?? 0,
+        top_vendors: topVendors.results ?? [],
+        daily_gmv: dailyGmv.results ?? [],
+      },
+    });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ── GET /vendors/:id/analytics — vendor own 30-day analytics ──────────────────
+app.get('/vendors/:id/analytics', async (c) => {
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) return c.json({ success: false, error: 'x-tenant-id required' }, 400);
+  const vendorId = c.req.param('id');
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Unauthorized' }, 401);
+  if (vendor.vendorId !== vendorId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  try {
+    const thirtyDaysAgo = Date.now() - 30 * 86400000;
+    const sevenDaysAgo = Date.now() - 7 * 86400000;
+
+    const gmvRow = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total_orders,
+              COALESCE(SUM(total_amount), 0) as total_gmv,
+              COALESCE(AVG(total_amount), 0) as avg_order_value
+       FROM marketplace_orders
+       WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid' AND created_at >= ?`,
+    ).bind(vendorId, tenantId, thirtyDaysAgo).first<{
+      total_orders: number; total_gmv: number; avg_order_value: number;
+    }>();
+
+    const topProducts = await c.env.DB.prepare(
+      `SELECT p.id, p.name,
+              COUNT(mo.id) as order_count,
+              COALESCE(SUM(mo.total_amount), 0) as revenue
+       FROM marketplace_orders mo
+       JOIN products p ON p.vendor_id = mo.vendor_id AND p.tenant_id = mo.tenant_id
+       WHERE mo.vendor_id = ? AND mo.tenant_id = ? AND mo.payment_status = 'paid' AND mo.created_at >= ?
+       GROUP BY p.id
+       ORDER BY revenue DESC
+       LIMIT 5`,
+    ).bind(vendorId, tenantId, thirtyDaysAgo).all<{
+      id: string; name: string; order_count: number; revenue: number;
+    }>();
+
+    const ratingCache = await c.env.DB.prepare(
+      `SELECT rating_avg, rating_count FROM vendor_rating_cache WHERE vendor_id = ? AND tenant_id = ?`,
+    ).bind(vendorId, tenantId).first<{ rating_avg: number; rating_count: number }>();
+
+    const dailyGmv = await c.env.DB.prepare(
+      `SELECT strftime('%Y-%m-%d', datetime(created_at / 1000, 'unixepoch')) as date_key,
+              COUNT(*) as orders, COALESCE(SUM(total_amount), 0) as gmv
+       FROM marketplace_orders
+       WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid' AND created_at >= ?
+       GROUP BY date_key
+       ORDER BY date_key ASC`,
+    ).bind(vendorId, tenantId, sevenDaysAgo).all<{ date_key: string; orders: number; gmv: number }>();
+
+    return c.json({
+      success: true,
+      data: {
+        period_days: 30,
+        total_orders: gmvRow?.total_orders ?? 0,
+        total_gmv: gmvRow?.total_gmv ?? 0,
+        avg_order_value: Math.round(gmvRow?.avg_order_value ?? 0),
+        rating_avg: ratingCache?.rating_avg ?? null,
+        rating_count: ratingCache?.rating_count ?? 0,
+        top_products: topProducts.results ?? [],
+        daily_gmv: dailyGmv.results ?? [],
+      },
+    });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+export { app as multiVendorRouter };

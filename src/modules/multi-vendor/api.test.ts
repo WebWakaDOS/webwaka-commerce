@@ -2588,3 +2588,897 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
 });
 
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// MV-5 — Product CRUD, Bulk CSV, Reviews, Analytics (67 tests)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Product CRUD: PUT /vendors/:id/products/:pid (14 tests) ──────────────────
+describe('MV-5 Product CRUD: PUT /vendors/:id/products/:pid', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+    mockDb.run.mockResolvedValue({ success: true });
+  });
+
+  it('returns 200 and updated_at when product updated successfully', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'Updated Name', price: 50000 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(200);
+    expect(d.success).toBe(true);
+    expect(d.data.id).toBe('prd_1');
+    expect(d.data.updated_at).toBeDefined();
+  });
+
+  it('returns 400 when no updatable fields are provided', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ unknown_field: 'foo' }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 403 when vendor tries to update another vendor product', async () => {
+    const token = await makeVendorToken('vnd_other', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'Hack' }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(403);
+  });
+
+  it('returns 401 when no auth token on PUT', async () => {
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Test' }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 404 when product does not exist or is deleted', async () => {
+    mockDb.first.mockResolvedValueOnce(null);
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_ghost', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'Ghost' }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 400 when x-tenant-id header is missing on PUT', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'Test' }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('allows updating price to new kobo value', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ price: 150000 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(200);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const updateSql = updateCalls.find((s: string) => s.includes('UPDATE products SET'));
+    expect(updateSql).toBeDefined();
+  });
+
+  it('allows updating multiple fields at once', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'New', category: 'fashion', stock_quantity: 25 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(200);
+  });
+
+  it('soft-delete: DELETE returns 200 with deleted_at', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'DELETE',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(200);
+    expect(d.data.deleted_at).toBeDefined();
+  });
+
+  it('DELETE returns 403 for wrong vendor', async () => {
+    const token = await makeVendorToken('vnd_other', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'DELETE',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(403);
+  });
+
+  it('DELETE returns 401 without auth', async () => {
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'DELETE',
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(401);
+  });
+
+  it('DELETE returns 404 for non-existent product', async () => {
+    mockDb.first.mockResolvedValueOnce(null);
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_ghost', {
+      method: 'DELETE',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(404);
+  });
+
+  it('DELETE sets is_active=0 in the SQL update', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'DELETE',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const sqls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const deleteSql = sqls.find((s: string) => s.includes('deleted_at') && s.toUpperCase().includes('UPDATE'));
+    expect(deleteSql).toBeDefined();
+    expect(deleteSql).toContain('is_active');
+  });
+
+  it('DELETE returns 400 when x-tenant-id is missing', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+});
+
+// ── Bulk CSV Upload: POST /vendors/:id/products/bulk-csv (10 tests) ───────────
+describe('MV-5 Bulk CSV Upload: POST /vendors/:id/products/bulk-csv', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+    mockDb.run.mockResolvedValue({ success: true });
+  });
+
+  it('returns 201 with created_count for valid CSV', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const csv = 'name,sku,price_naira,category,description,stock_quantity\nShirt,SKU001,2500,fashion,A shirt,10\nPants,SKU002,3500,fashion,Trousers,5';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'text/csv', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(201);
+    expect(d.data.created_count).toBe(2);
+    expect(d.data.error_count).toBe(0);
+  });
+
+  it('returns 400 for empty CSV body', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: '',
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 for header-only CSV with no data rows', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: 'name,sku,price_naira,category',
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('records error row when price is invalid', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const csv = 'name,sku,price_naira\nShirt,SKU001,notanumber';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.error_count).toBe(1);
+    expect(d.data.errors[0].error).toContain('Invalid price');
+  });
+
+  it('records error row when required fields are missing', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const csv = 'name,sku,price_naira\n,SKU001,2500';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.error_count).toBeGreaterThan(0);
+  });
+
+  it('converts price_naira to kobo (×100) in INSERT', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const csv = 'name,sku,price_naira\nCap,CAP01,500';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const bindArgs = mockDb.bind.mock.calls.flat();
+    expect(bindArgs).toContain(50000); // 500 Naira × 100 = 50000 kobo
+  });
+
+  it('batch_id is present in response data', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const csv = 'name,sku,price_naira\nHat,HAT01,1000';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.batch_id).toMatch(/^csv_/);
+  });
+
+  it('partial success: reports mixed created and error counts', async () => {
+    mockDb.run.mockResolvedValueOnce({ success: true }).mockRejectedValueOnce(new Error('UNIQUE constraint'));
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const csv = 'name,sku,price_naira\nGood,SKU_G,2000\nBad,SKU_G,2000';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.created_count).toBe(1);
+    expect(d.data.error_count).toBe(1);
+  });
+
+  it('returns 401 when no auth token provided', async () => {
+    const csv = 'name,sku,price_naira\nShirt,SKU001,2500';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test' },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 403 when vendor tries to upload to another vendor', async () => {
+    const token = await makeVendorToken('vnd_other', 'tnt_test');
+    const csv = 'name,sku,price_naira\nShirt,SKU001,2500';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(403);
+  });
+});
+
+// ── Reviews: POST + GET (18 tests) ────────────────────────────────────────────
+describe('MV-5 Reviews: POST /reviews', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+    mockDb.run.mockResolvedValue({ success: true });
+  });
+
+  it('returns 201 with review id for valid POST /reviews', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'delivered' })
+      .mockResolvedValueOnce({ id: 'prd_1', vendor_id: 'vnd_1' })
+      .mockResolvedValue(null);
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        product_id: 'prd_1', order_id: 'ord_1', rating: 5,
+        customer_email: 'ada@test.ng', ndpr_consent: true,
+        title: 'Great!', body: 'Loved it',
+      }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(201);
+    expect(d.data.id).toMatch(/^rv_/);
+  });
+
+  it('returns 422 for rating below 1', async () => {
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 0, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(422);
+  });
+
+  it('returns 422 for rating above 5', async () => {
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 6, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(422);
+  });
+
+  it('returns 422 for non-integer rating (float)', async () => {
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 3.5, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(422);
+  });
+
+  it('returns 422 when ndpr_consent is false', async () => {
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 5, customer_email: 'a@b.ng', ndpr_consent: false }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(422);
+  });
+
+  it('returns 400 when required fields are missing', async () => {
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_id: 'ord_1', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 404 when order does not exist', async () => {
+    mockDb.first.mockResolvedValueOnce(null);
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_ghost', rating: 4, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 409 when order status is pending', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'pending' });
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 4, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(409);
+  });
+
+  it('returns 404 when product does not exist', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'delivered' })
+      .mockResolvedValueOnce(null);
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_ghost', order_id: 'ord_1', rating: 4, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 400 when x-tenant-id is missing', async () => {
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 4, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 409 on duplicate review (UNIQUE constraint)', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'confirmed' })
+      .mockResolvedValueOnce({ id: 'prd_1', vendor_id: 'vnd_1' });
+    mockDb.run.mockRejectedValueOnce(new Error('UNIQUE constraint failed'));
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 4, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(409);
+  });
+
+  it('accepts order_status "confirmed" as valid for review', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'confirmed' })
+      .mockResolvedValueOnce({ id: 'prd_1', vendor_id: 'vnd_1' })
+      .mockResolvedValue(null);
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 3, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(201);
+  });
+
+  it('GET /products/:id/reviews returns 200 with data array', async () => {
+    mockDb.all.mockResolvedValueOnce({ results: [{ id: 'rv_1', rating: 5, title: 'Great' }] });
+    mockDb.first.mockResolvedValueOnce({ total: 1, avg_rating: 5.0 });
+    const req = new Request('http://localhost/products/prd_1/reviews', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(200);
+    expect(Array.isArray(d.data)).toBe(true);
+    expect(d.meta.avg_rating).toBe(5.0);
+  });
+
+  it('GET /products/:id/reviews returns pagination meta', async () => {
+    mockDb.all.mockResolvedValueOnce({ results: [] });
+    mockDb.first.mockResolvedValueOnce({ total: 25, avg_rating: 4.2 });
+    const req = new Request('http://localhost/products/prd_1/reviews?page=2&per_page=5', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.meta.page).toBe(2);
+    expect(d.meta.per_page).toBe(5);
+    expect(d.meta.total).toBe(25);
+  });
+
+  it('GET /vendors/:id/reviews returns 200 with aggregate meta', async () => {
+    mockDb.all.mockResolvedValueOnce({ results: [{ id: 'rv_2', rating: 4 }] });
+    mockDb.first.mockResolvedValueOnce({ rating_avg: 4.2, rating_count: 18 });
+    const req = new Request('http://localhost/vendors/vnd_1/reviews', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(200);
+    expect(d.meta.rating_avg).toBe(4.2);
+    expect(d.meta.rating_count).toBe(18);
+  });
+
+  it('GET /vendors/:id/reviews returns rating_avg null when no cache exists', async () => {
+    mockDb.all.mockResolvedValueOnce({ results: [] });
+    mockDb.first.mockResolvedValueOnce(null);
+    const req = new Request('http://localhost/vendors/vnd_new/reviews', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.meta.rating_avg).toBeNull();
+    expect(d.meta.rating_count).toBe(0);
+  });
+
+  it('POST /reviews updates product aggregate rating SQL', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'shipped' })
+      .mockResolvedValueOnce({ id: 'prd_1', vendor_id: 'vnd_1' })
+      .mockResolvedValue(null);
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 5, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const sqls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const aggSql = sqls.find((s: string) => s.includes('rating_avg') && s.includes('UPDATE products'));
+    expect(aggSql).toBeDefined();
+  });
+
+  it('POST /reviews upserts vendor_rating_cache', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'delivered' })
+      .mockResolvedValueOnce({ id: 'prd_1', vendor_id: 'vnd_1' })
+      .mockResolvedValue(null);
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 4, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const sqls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const cacheSql = sqls.find((s: string) => s.includes('vendor_rating_cache'));
+    expect(cacheSql).toBeDefined();
+  });
+});
+
+// ── Analytics (12 tests) ──────────────────────────────────────────────────────
+describe('MV-5 Analytics: GET /analytics/marketplace', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+    mockDb.run.mockResolvedValue({ success: true });
+  });
+
+  it('returns 200 with GMV data for authenticated vendor', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ total_orders: 42, total_gmv: 5000000 })
+      .mockResolvedValueOnce({ total: 8 });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/analytics/marketplace', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(200);
+    expect(d.data.total_orders).toBe(42);
+    expect(d.data.total_gmv).toBe(5000000);
+  });
+
+  it('returns 401 when no auth token for marketplace analytics', async () => {
+    const req = new Request('http://localhost/analytics/marketplace', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 400 when x-tenant-id is missing for marketplace analytics', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/analytics/marketplace', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('response includes top_vendors array', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ total_orders: 10, total_gmv: 1000000 })
+      .mockResolvedValueOnce({ total: 3 });
+    mockDb.all
+      .mockResolvedValueOnce({ results: [{ vendor_id: 'vnd_1', vendor_name: 'Adire Lagos', gmv: 800000 }] })
+      .mockResolvedValueOnce({ results: [] });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/analytics/marketplace', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(Array.isArray(d.data.top_vendors)).toBe(true);
+  });
+
+  it('response includes daily_gmv array', async () => {
+    mockDb.first.mockResolvedValue({ total_orders: 5, total_gmv: 500000 });
+    mockDb.all
+      .mockResolvedValueOnce({ results: [] })
+      .mockResolvedValueOnce({ results: [{ date_key: '2026-03-18', orders: 2, gmv: 200000 }] });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/analytics/marketplace', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(Array.isArray(d.data.daily_gmv)).toBe(true);
+  });
+
+  it('period_days is 30 in marketplace analytics response', async () => {
+    mockDb.first.mockResolvedValue({ total_orders: 0, total_gmv: 0 });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/analytics/marketplace', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.period_days).toBe(30);
+  });
+});
+
+describe('MV-5 Analytics: GET /vendors/:id/analytics', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+    mockDb.run.mockResolvedValue({ success: true });
+  });
+
+  it('returns 200 with vendor analytics for own vendor', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ total_orders: 15, total_gmv: 2500000, avg_order_value: 166666 })
+      .mockResolvedValueOnce({ rating_avg: 4.5, rating_count: 12 });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/analytics', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(res.status).toBe(200);
+    expect(d.data.total_orders).toBe(15);
+    expect(d.data.rating_avg).toBe(4.5);
+  });
+
+  it('returns 403 when vendor requests another vendor analytics', async () => {
+    const token = await makeVendorToken('vnd_other', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/analytics', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(403);
+  });
+
+  it('returns 401 when no auth for vendor analytics', async () => {
+    const req = new Request('http://localhost/vendors/vnd_1/analytics', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(401);
+  });
+
+  it('response includes top_products array', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ total_orders: 5, total_gmv: 100000, avg_order_value: 20000 })
+      .mockResolvedValueOnce({ rating_avg: null, rating_count: 0 });
+    mockDb.all
+      .mockResolvedValueOnce({ results: [{ id: 'prd_1', name: 'Ankara Dress', order_count: 3, revenue: 75000 }] })
+      .mockResolvedValueOnce({ results: [] });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/analytics', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(Array.isArray(d.data.top_products)).toBe(true);
+  });
+
+  it('rating_avg is null when vendor has no reviews', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ total_orders: 0, total_gmv: 0, avg_order_value: 0 })
+      .mockResolvedValueOnce(null);
+    const token = await makeVendorToken('vnd_new', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_new/analytics', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.rating_avg).toBeNull();
+    expect(d.data.rating_count).toBe(0);
+  });
+
+  it('avg_order_value is rounded integer in kobo', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ total_orders: 3, total_gmv: 300001, avg_order_value: 100000.33 })
+      .mockResolvedValueOnce(null);
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/analytics', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(Number.isInteger(d.data.avg_order_value)).toBe(true);
+  });
+});
+
+// ── Edge cases and invariants (13 tests) ──────────────────────────────────────
+describe('MV-5 Edge Cases and Nigeria-First Invariants', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+    mockDb.run.mockResolvedValue({ success: true });
+  });
+
+  it('PUT product: is_active field can be set to 0 to deactivate', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ is_active: 0 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(200);
+  });
+
+  it('CSV: price_naira of 0 is rejected as invalid', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const csv = 'name,sku,price_naira\nFreebee,FREE01,0';
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.error_count).toBe(1);
+  });
+
+  it('Reviews: order_status "shipped" is accepted', async () => {
+    mockDb.first
+      .mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'shipped' })
+      .mockResolvedValueOnce({ id: 'prd_1', vendor_id: 'vnd_1' })
+      .mockResolvedValue(null);
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 4, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(201);
+  });
+
+  it('Reviews: order_status "cancelled" is rejected', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'ord_1', vendor_id: 'vnd_1', order_status: 'cancelled' });
+    const req = new Request('http://localhost/reviews', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: 'prd_1', order_id: 'ord_1', rating: 1, customer_email: 'a@b.ng', ndpr_consent: true }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(409);
+  });
+
+  it('GET /products/:id/reviews clamps per_page to 50 max', async () => {
+    mockDb.all.mockResolvedValueOnce({ results: [] });
+    mockDb.first.mockResolvedValueOnce({ total: 0, avg_rating: null });
+    const req = new Request('http://localhost/products/prd_1/reviews?per_page=999', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.meta.per_page).toBe(50);
+  });
+
+  it('GET /vendors/:id/reviews clamps per_page to 50 max', async () => {
+    mockDb.all.mockResolvedValueOnce({ results: [] });
+    mockDb.first.mockResolvedValueOnce(null);
+    const req = new Request('http://localhost/vendors/vnd_1/reviews?per_page=200', {
+      headers: { 'x-tenant-id': 'tnt_test' },
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.meta.per_page).toBe(50);
+  });
+
+  it('GET /products/:id/reviews returns 400 when x-tenant-id missing', async () => {
+    const req = new Request('http://localhost/products/prd_1/reviews');
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('GET /vendors/:id/reviews returns 400 when x-tenant-id missing', async () => {
+    const req = new Request('http://localhost/vendors/vnd_1/reviews');
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(400);
+  });
+
+  it('CSV: large batch_id has csv_ prefix and timestamp component', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const rows = Array.from({ length: 3 }, (_, i) => `Item${i},SKU${i},${(i + 1) * 1000}`).join('\n');
+    const csv = `name,sku,price_naira\n${rows}`;
+    const req = new Request('http://localhost/vendors/vnd_1/products/bulk-csv', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+      body: csv,
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    const d = await res.json() as any;
+    expect(d.data.batch_id).toMatch(/^csv_\d+_/);
+  });
+
+  it('analytics: marketplace route uses 30-day window in SQL', async () => {
+    mockDb.first.mockResolvedValue({ total_orders: 0, total_gmv: 0 });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/analytics/marketplace', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const bindArgs = mockDb.bind.mock.calls.flat();
+    const thirtyDaysAgo = Date.now() - 30 * 86400000;
+    const closeEnough = bindArgs.some((a: unknown) => typeof a === 'number' && Math.abs((a as number) - thirtyDaysAgo) < 5000);
+    expect(closeEnough).toBe(true);
+  });
+
+  it('analytics: vendor route uses 30-day window in SQL', async () => {
+    mockDb.first.mockResolvedValue({ total_orders: 0, total_gmv: 0, avg_order_value: 0 });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/analytics', {
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const bindArgs = mockDb.bind.mock.calls.flat();
+    const thirtyDaysAgo = Date.now() - 30 * 86400000;
+    const closeEnough = bindArgs.some((a: unknown) => typeof a === 'number' && Math.abs((a as number) - thirtyDaysAgo) < 5000);
+    expect(closeEnough).toBe(true);
+  });
+
+  it('PUT product: query checks both vendor_id AND tenant_id scope', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'PUT',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'Isolated' }),
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const sqls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const selectSql = sqls.find((s: string) => s.includes('vendor_id') && s.includes('tenant_id') && s.includes('products'));
+    expect(selectSql).toBeDefined();
+  });
+
+  it('DELETE product: query checks both vendor_id AND tenant_id scope (tenant isolation)', async () => {
+    mockDb.first.mockResolvedValueOnce({ id: 'prd_1' });
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/vendors/vnd_1/products/prd_1', {
+      method: 'DELETE',
+      headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
+    });
+    await multiVendorRouter.fetch(req, mockEnv as any);
+    const sqls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const selectSql = sqls.find((s: string) => s.includes('vendor_id') && s.includes('tenant_id') && s.includes('deleted_at IS NULL'));
+    expect(selectSql).toBeDefined();
+  });
+});
