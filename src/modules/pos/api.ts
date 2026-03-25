@@ -1,5 +1,6 @@
 /**
- * COM-1: Point of Sale (POS) API — Phase 1
+ * COM-1: Point of Sale (POS) API — Phase 2
+ * Phase 2 additions: low-stock alerts, receipt generation (with WhatsApp + print)
  * Hono router for in-store POS operations
  * Phase 1 additions: Session/shift management, split payments, rate limiting, void, PCI hardening
  * Invariants: Nigeria-First (Paystack), Offline-First (sync), Multi-tenancy, PCI-DSS error hygiene
@@ -250,6 +251,22 @@ app.get('/products/barcode/:code', async (c) => {
     return c.json({ success: true, data: product });
   } catch {
     return c.json({ success: false, error: 'Product not found' }, 404);
+  }
+});
+
+// GET /api/pos/products/low-stock — Reorder alerts
+app.get('/products/low-stock', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const threshold = Math.max(0, parseInt(c.req.query('threshold') ?? '10', 10));
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, sku, name, category, price, quantity, low_stock_threshold, barcode FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL AND quantity <= ? ORDER BY quantity ASC',
+    )
+      .bind(tenantId, threshold)
+      .all();
+    return c.json({ success: true, data: results, threshold, count: results.length });
+  } catch {
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
 
@@ -583,6 +600,85 @@ app.post('/orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
     return c.json({ success: false, error: 'Transaction failed' }, 500);
   }
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RECEIPT — Formatted receipt JSON with WhatsApp share URL
+// ──────────────────────────────────────────────────────────────────────────────
+
+// POST /api/pos/orders/:id/receipt — Generate receipt payload for print/share
+app.post(
+  '/orders/:id/receipt',
+  requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
+  async (c) => {
+    const tenantId = getTenantId(c);
+    const orderId = c.req.param('id');
+    try {
+      const order = await c.env.DB.prepare(
+        "SELECT id, total_amount, subtotal, discount, payment_method, payments_json, items_json, customer_email, customer_phone, order_status, created_at FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL",
+      )
+        .bind(orderId, tenantId)
+        .first<{
+          id: string;
+          total_amount: number;
+          subtotal: number;
+          discount: number;
+          payment_method: string;
+          payments_json: string | null;
+          items_json: string | null;
+          customer_email: string | null;
+          customer_phone: string | null;
+          order_status: string;
+          created_at: number;
+        }>();
+
+      if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+      const items: unknown[] = order.items_json ? JSON.parse(order.items_json) : [];
+      const payments: unknown[] = order.payments_json ? JSON.parse(order.payments_json) : [];
+      const receiptId = `RCP_${orderId}`;
+      const issuedAt = Date.now();
+      const orderDate = new Date(order.created_at).toLocaleDateString('en-NG', {
+        day: '2-digit', month: 'short', year: 'numeric',
+      });
+      const totalNaira = (order.total_amount / 100).toFixed(2);
+
+      const whatsappText = [
+        `WebWaka POS Receipt`,
+        `Receipt: #${receiptId}`,
+        `Date: ${orderDate}`,
+        `Total: ₦${totalNaira}`,
+        `Payment: ${order.payment_method}`,
+        `Status: ${order.order_status}`,
+        ``,
+        `Thank you for your purchase!`,
+      ].join('\n');
+
+      const receipt = {
+        receipt_id: receiptId,
+        order_id: orderId,
+        tenant_id: tenantId,
+        issued_at: issuedAt,
+        order_date: new Date(order.created_at).toISOString(),
+        items,
+        subtotal_kobo: order.subtotal,
+        discount_kobo: order.discount,
+        total_kobo: order.total_amount,
+        total_naira: totalNaira,
+        payment_method: order.payment_method,
+        payments,
+        order_status: order.order_status,
+        customer_email: order.customer_email ?? null,
+        customer_phone: order.customer_phone ?? null,
+        whatsapp_url: `https://wa.me/?text=${encodeURIComponent(whatsappText)}`,
+        print_url: `/api/pos/orders/${orderId}/receipt/print`,
+      };
+
+      return c.json({ success: true, data: receipt }, 201);
+    } catch {
+      return c.json({ success: false, error: 'Service unavailable' }, 503);
+    }
+  },
+);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // ORDERS
