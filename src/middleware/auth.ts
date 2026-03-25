@@ -1,17 +1,61 @@
 /**
  * WebWaka Commerce Suite — JWT Authentication Middleware
  * Reuses the Super Admin V2 auth pattern for consistency (Build Once Use Infinitely).
+ *
+ * MV-1 addition: vendorAuthMiddleware — verifies vendor JWT (role='vendor')
+ * and injects vendor_id + tenant_id into the Hono context.
  */
 import { jwtAuthMiddleware as coreJwtAuthMiddleware, requireRole as coreRequireRole } from '@webwaka/core';
+import type { Context, Next } from 'hono';
+import { verifyJwt } from '../modules/multi-vendor/api';
 
 export const jwtAuthMiddleware = coreJwtAuthMiddleware({
   publicRoutes: [
     { method: 'GET', path: '/health' },
     { method: 'GET', path: '/api/pos/products' },
     { method: 'GET', path: '/api/single-vendor/products' },
-    { method: 'GET', path: '/api/multi-vendor/products' },
     { method: 'GET', path: '/api/multi-vendor/vendors' },
+    { method: 'GET', path: '/api/multi-vendor/vendors/:id/products' },
+    { method: 'POST', path: '/api/multi-vendor/auth/vendor-request-otp' },
+    { method: 'POST', path: '/api/multi-vendor/auth/vendor-verify-otp' },
+    { method: 'POST', path: '/api/multi-vendor/checkout' },
   ]
 });
 
 export const requireRole = coreRequireRole;
+
+/**
+ * Vendor JWT middleware for Hono routes.
+ * Validates Bearer token with role='vendor' and injects:
+ *   c.set('vendorId', ...)    — the authenticated vendor's ID
+ *   c.set('vendorTenantId', ...) — the marketplace tenant ID from the JWT
+ *
+ * Usage (inline on a vendor-guarded route):
+ *   app.get('/vendor/orders', vendorAuthMiddleware, async (c) => {
+ *     const vendorId = c.get('vendorId');
+ *   });
+ */
+export async function vendorAuthMiddleware(c: Context, next: Next): Promise<Response | void> {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+
+  if (!token) {
+    return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  }
+
+  const jwtSecret: string = (c.env as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-secret-change-me';
+  const claims = await verifyJwt(token, jwtSecret);
+
+  if (!claims || claims.role !== 'vendor') {
+    return c.json({ success: false, error: 'Invalid or expired vendor token' }, 401);
+  }
+
+  if (claims.tenant !== tenantId) {
+    return c.json({ success: false, error: 'Vendor token tenant mismatch' }, 403);
+  }
+
+  c.set('vendorId', String(claims.vendor_id));
+  c.set('vendorTenantId', String(claims.tenant));
+  await next();
+}
