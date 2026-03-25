@@ -1301,20 +1301,111 @@ function AccountPage({
   );
 }
 
-// Multi-Vendor Marketplace Module (COM-3 — MV-2 updated)
+// ── Catalog product type (MV-3) ───────────────────────────────────────────────
+interface CatalogProduct {
+  id: string;
+  sku: string;
+  name: string;
+  description: string | null;
+  category: string | null;
+  price: number;
+  quantity: number;
+  image_url: string | null;
+  vendor_id: string;
+  vendor_name: string;
+  vendor_slug: string;
+  rating_avg: number | null;
+  rating_count: number | null;
+}
+
+// ── Vendor badge colours (deterministic from vendor_slug hash) ────────────────
+const VENDOR_BADGE_COLORS = [
+  { bg: '#dcfce7', text: '#15803d' },
+  { bg: '#dbeafe', text: '#1d4ed8' },
+  { bg: '#fef9c3', text: '#854d0e' },
+  { bg: '#fce7f3', text: '#be185d' },
+  { bg: '#ede9fe', text: '#6d28d9' },
+];
+function vendorBadgeColor(vendorSlug: string) {
+  let h = 0;
+  for (let i = 0; i < vendorSlug.length; i++) h = (h * 31 + vendorSlug.charCodeAt(i)) >>> 0;
+  return VENDOR_BADGE_COLORS[h % VENDOR_BADGE_COLORS.length]!;
+}
+
+// Multi-Vendor Marketplace Module (COM-3 — MV-3 updated)
 function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
   const [activeTab, setActiveTab] = useState<'browse' | 'vendors' | 'vendor-dashboard'>('browse');
-  const [vendors] = useState([
-    { id: 'vnd_1', name: 'Ade Fashion House', slug: 'ade-fashion', status: 'active', commission_rate: 1000 },
-    { id: 'vnd_2', name: 'Chidi Electronics', slug: 'chidi-elec', status: 'active', commission_rate: 800 },
-    { id: 'vnd_3', name: 'Fatima Spices', slug: 'fatima-spices', status: 'active', commission_rate: 1200 },
-  ]);
-  const [products] = useState([
-    { id: 'mp_1', vendor_id: 'vnd_1', name: 'Aso-Oke Set', price: 2500000, vendor_name: 'Ade Fashion House' },
-    { id: 'mp_2', vendor_id: 'vnd_2', name: 'Bluetooth Speaker', price: 1200000, vendor_name: 'Chidi Electronics' },
-    { id: 'mp_3', vendor_id: 'vnd_3', name: 'Mixed Spice Pack', price: 350000, vendor_name: 'Fatima Spices' },
-    { id: 'mp_4', vendor_id: 'vnd_1', name: 'Kaftan (XL)', price: 1800000, vendor_name: 'Ade Fashion House' },
-  ]);
+
+  // ── Catalog state (MV-3 live fetch + infinite scroll) ────────────────────
+  const [products, setProducts] = useState<CatalogProduct[]>([]);
+  const [search, setSearch] = useState('');
+  const [searchInput, setSearchInput] = useState('');
+  const [category, setCategory] = useState('');
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState('');
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+
+  const fetchCatalog = useCallback(async (cursor = '', reset = false) => {
+    setCatalogLoading(true);
+    setCatalogError('');
+    try {
+      const params = new URLSearchParams({ per_page: '12' });
+      if (cursor)   params.set('after', cursor);
+      if (search)   params.set('search', search);
+      if (category) params.set('category', category);
+      const res = await fetch(`/api/multi-vendor/catalog?${params}`, {
+        headers: { 'x-tenant-id': tenantId },
+      });
+      if (!res.ok) throw new Error(`Catalog fetch failed (${res.status})`);
+      const json = await res.json() as {
+        success: boolean;
+        data: CatalogProduct[];
+        meta: { has_more: boolean; next_cursor: string | null };
+      };
+      setProducts(prev => reset ? json.data : [...prev, ...json.data]);
+      setHasMore(json.meta.has_more);
+      setNextCursor(json.meta.next_cursor);
+    } catch (e) {
+      setCatalogError(String(e));
+      if (reset) setProducts([]);
+    } finally {
+      setCatalogLoading(false);
+    }
+  }, [tenantId, search, category]);
+
+  // Initial load and when filters change
+  useEffect(() => {
+    if (activeTab === 'browse') fetchCatalog('', true);
+  }, [activeTab, fetchCatalog]);
+
+  // Infinite scroll via IntersectionObserver
+  useEffect(() => {
+    const el = loadMoreRef.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(([entry]) => {
+      if (entry?.isIntersecting && hasMore && !catalogLoading && nextCursor) {
+        fetchCatalog(nextCursor);
+      }
+    }, { threshold: 0.1 });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [hasMore, catalogLoading, nextCursor, fetchCatalog]);
+
+  // ── Vendor list state (live from /vendors) ───────────────────────────────
+  const [vendors, setVendors] = useState<Array<{ id: string; name: string; slug: string; status: string; commission_rate: number }>>([]);
+  const [vendorsLoading, setVendorsLoading] = useState(false);
+
+  useEffect(() => {
+    if (activeTab !== 'vendors') return;
+    setVendorsLoading(true);
+    fetch('/api/multi-vendor/vendors', { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.ok ? r.json() as Promise<{ success: boolean; data: typeof vendors }> : Promise.reject(r.status))
+      .then(j => setVendors(j.data ?? []))
+      .catch(() => setVendors([]))
+      .finally(() => setVendorsLoading(false));
+  }, [activeTab, tenantId]);
 
   const tabs: Array<{ id: typeof activeTab; label: string }> = [
     { id: 'browse', label: t.marketplace_products },
@@ -1344,41 +1435,171 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
         ))}
       </div>
 
+      {/* ── BROWSE TAB — live catalog, search, infinite scroll ────────────── */}
       {activeTab === 'browse' && (
-        <div style={{ padding: '12px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '12px' }}>
-          {products.map(p => (
-            <div key={p.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff' }}>
-              <div style={{ backgroundColor: '#fef9c3', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px' }}>
-                🛒
-              </div>
-              <div style={{ padding: '10px' }}>
-                <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '2px' }}>{p.vendor_name}</div>
-                <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px' }}>{p.name}</div>
-                <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a' }}>{formatKoboToNaira(p.price)}</div>
-              </div>
-            </div>
+        <div>
+          {/* Search bar */}
+          <div style={{ padding: '10px 12px 0', display: 'flex', gap: '8px' }}>
+            <input
+              value={searchInput}
+              onChange={e => setSearchInput(e.currentTarget.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { setSearch(searchInput); setProducts([]); } }}
+              placeholder="Search products…"
+              style={{
+                flex: 1, padding: '8px 12px', borderRadius: '8px',
+                border: '1px solid #d1d5db', fontSize: '13px', outline: 'none',
+              }}
+            />
+            <button
+              onClick={() => { setSearch(searchInput); setProducts([]); }}
+              style={{
+                padding: '8px 14px', backgroundColor: '#16a34a', color: '#fff',
+                border: 'none', borderRadius: '8px', fontSize: '13px', cursor: 'pointer',
+              }}
+            >
+              Search
+            </button>
+            {search && (
+              <button
+                onClick={() => { setSearchInput(''); setSearch(''); setProducts([]); }}
+                style={{
+                  padding: '8px 10px', backgroundColor: '#f3f4f6', color: '#374151',
+                  border: '1px solid #e5e7eb', borderRadius: '8px', fontSize: '12px', cursor: 'pointer',
+                }}
+              >
+                ✕
+              </button>
+            )}
+          </div>
+
+          {/* Category filter pills */}
+          {['', 'fashion', 'electronics', 'food', 'beauty', 'home'].map(cat => (
+            <button
+              key={cat}
+              onClick={() => { setCategory(cat); setProducts([]); }}
+              style={{
+                margin: cat === '' ? '8px 0 8px 12px' : '8px 4px 8px 0',
+                padding: '4px 10px', borderRadius: '20px',
+                border: `1px solid ${category === cat ? '#16a34a' : '#e5e7eb'}`,
+                backgroundColor: category === cat ? '#dcfce7' : '#fff',
+                color: category === cat ? '#15803d' : '#6b7280',
+                fontSize: '11px', cursor: 'pointer',
+              }}
+            >
+              {cat === '' ? 'All' : cat.charAt(0).toUpperCase() + cat.slice(1)}
+            </button>
           ))}
+
+          {/* Product grid */}
+          {catalogError && (
+            <div style={{ padding: '12px', color: '#dc2626', fontSize: '13px' }}>{catalogError}</div>
+          )}
+          {!catalogError && products.length === 0 && !catalogLoading && (
+            <div style={{ padding: '24px 12px', color: '#9ca3af', textAlign: 'center', fontSize: '13px' }}>
+              {search ? `No products found for "${search}"` : 'No products available yet.'}
+            </div>
+          )}
+
+          <div style={{ padding: '12px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(155px, 1fr))', gap: '12px' }}>
+            {products.map(p => {
+              const badge = vendorBadgeColor(p.vendor_slug);
+              return (
+                <div
+                  key={p.id}
+                  style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', display: 'flex', flexDirection: 'column' }}
+                >
+                  {/* Product image or placeholder */}
+                  {p.image_url ? (
+                    <img
+                      src={p.image_url}
+                      alt={p.name}
+                      style={{ height: '80px', objectFit: 'cover', width: '100%' }}
+                    />
+                  ) : (
+                    <div style={{ backgroundColor: '#fef9c3', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px' }}>
+                      🛍️
+                    </div>
+                  )}
+
+                  <div style={{ padding: '8px 10px', flex: 1, display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                    {/* Vendor badge */}
+                    <span style={{
+                      display: 'inline-block', fontSize: '10px', fontWeight: 600,
+                      backgroundColor: badge.bg, color: badge.text,
+                      borderRadius: '4px', padding: '1px 5px',
+                      maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>
+                      @{p.vendor_slug}
+                    </span>
+                    {p.category && (
+                      <span style={{ fontSize: '10px', color: '#9ca3af' }}>{p.category}</span>
+                    )}
+                    <div style={{ fontSize: '13px', fontWeight: 600, lineHeight: 1.3 }}>{p.name}</div>
+                    <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginTop: 'auto' }}>
+                      {formatKoboToNaira(p.price)}
+                    </div>
+                    {p.rating_avg != null && (
+                      <div style={{ fontSize: '10px', color: '#f59e0b' }}>
+                        {'★'.repeat(Math.round(p.rating_avg))}{'☆'.repeat(5 - Math.round(p.rating_avg))}
+                        <span style={{ color: '#9ca3af', marginLeft: '3px' }}>({p.rating_count})</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Infinite scroll sentinel */}
+          <div ref={loadMoreRef} style={{ height: '1px' }} />
+
+          {catalogLoading && (
+            <div style={{ padding: '12px', textAlign: 'center', color: '#9ca3af', fontSize: '13px' }}>
+              Loading…
+            </div>
+          )}
+          {!hasMore && products.length > 0 && (
+            <div style={{ padding: '8px', textAlign: 'center', color: '#d1d5db', fontSize: '11px' }}>
+              — End of catalog —
+            </div>
+          )}
         </div>
       )}
 
+      {/* ── VENDORS TAB ─────────────────────────────────────────────────────── */}
       {activeTab === 'vendors' && (
         <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-          {vendors.map(v => (
-            <div key={v.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', padding: '14px', backgroundColor: '#fff', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <div style={{ fontWeight: 600 }}>{v.name}</div>
-                <div style={{ fontSize: '12px', color: '#6b7280' }}>@{v.slug}</div>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <div style={{ fontSize: '11px', color: '#16a34a', fontWeight: 600 }}>
-                  {v.status.toUpperCase()}
+          {vendorsLoading && (
+            <div style={{ textAlign: 'center', color: '#9ca3af', fontSize: '13px', padding: '24px' }}>Loading vendors…</div>
+          )}
+          {!vendorsLoading && vendors.length === 0 && (
+            <div style={{ textAlign: 'center', color: '#9ca3af', fontSize: '13px', padding: '24px' }}>No active vendors yet.</div>
+          )}
+          {vendors.map(v => {
+            const badge = vendorBadgeColor(v.slug);
+            return (
+              <div key={v.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', padding: '14px', backgroundColor: '#fff', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <div style={{ fontWeight: 600 }}>{v.name}</div>
+                  <span style={{
+                    display: 'inline-block', marginTop: '3px', fontSize: '11px', fontWeight: 600,
+                    backgroundColor: badge.bg, color: badge.text,
+                    borderRadius: '4px', padding: '1px 5px',
+                  }}>
+                    @{v.slug}
+                  </span>
                 </div>
-                <div style={{ fontSize: '11px', color: '#6b7280' }}>
-                  {v.commission_rate / 100}% {t.marketplace_commission}
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: '11px', color: '#16a34a', fontWeight: 600 }}>
+                    {v.status.toUpperCase()}
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#6b7280' }}>
+                    {v.commission_rate / 100}% {t.marketplace_commission}
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

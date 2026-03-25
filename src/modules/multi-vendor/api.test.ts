@@ -1,9 +1,10 @@
 /**
- * COM-3: Multi-Vendor Marketplace API — Phase MV-1 Tests
- * L2 QA Layer: Auth, vendor isolation, tenant isolation, security hardening
- * Invariants verified: vendor JWT scoping, tenant isolation, admin-key guard, NDPR, Nigeria-First
+ * COM-3: Multi-Vendor Marketplace API — Phase MV-1 + MV-2 + MV-3 Tests
+ * L2 QA Layer: Auth, vendor isolation, tenant isolation, security hardening,
+ *              cross-vendor catalog (FTS5/LIKE, KV cache), marketplace cart, umbrella orders.
+ * Invariants: vendor JWT scoping, tenant isolation, admin-key guard, NDPR, Nigeria-First
  *
- * Test count: original 17 → MV-1 adds 25 → total 42 in this file
+ * Test count: MV-1 (40) + MV-2 (28) + MV-3 (50+) = 118+ total
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { multiVendorRouter } from './api';
@@ -17,7 +18,19 @@ const mockDb = {
   run: vi.fn().mockResolvedValue({ success: true }),
 };
 
-const mockEnv = { DB: mockDb, TENANT_CONFIG: {}, EVENTS: {}, JWT_SECRET: 'test-secret-32-chars-minimum!!!' };
+const mockCatalogCache = {
+  get: vi.fn().mockResolvedValue(null),
+  put: vi.fn().mockResolvedValue(undefined),
+};
+
+const mockEnv = {
+  DB: mockDb,
+  TENANT_CONFIG: {},
+  EVENTS: {},
+  SESSIONS_KV: {},
+  JWT_SECRET: 'test-secret-32-chars-minimum!!!',
+  CATALOG_CACHE: mockCatalogCache,
+};
 
 // ── JWT helpers ───────────────────────────────────────────────────────────────
 /** Sign a minimal HS256 JWT for testing — mirrors the production signJwt */
@@ -103,6 +116,8 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     mockDb.all.mockResolvedValue({ results: [] });
     mockDb.first.mockResolvedValue(null);
     mockDb.run.mockResolvedValue({ success: true });
+    mockCatalogCache.get.mockResolvedValue(null);
+    mockCatalogCache.put.mockResolvedValue(undefined);
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -921,5 +936,713 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(bindArgs).toContain('%"vendor_id":"vnd_xyz"%');
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-3: CROSS-VENDOR CATALOG — GET /catalog
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('GET /catalog — cross-vendor catalog (MV-3)', () => {
+    const catalogRows = [
+      { id: 'prod_1', sku: 'SKU001', name: 'Aso-Oke Set', description: 'Traditional fabric', category: 'fashion',
+        price: 2500000, quantity: 10, image_url: null, vendor_id: 'vnd_1',
+        vendor_name: 'Ade Fashion House', vendor_slug: 'ade-fashion', rating_avg: 4.5, rating_count: 12, created_at: 1000 },
+      { id: 'prod_2', sku: 'SKU002', name: 'Bluetooth Speaker', description: 'Waterproof', category: 'electronics',
+        price: 1200000, quantity: 5, image_url: null, vendor_id: 'vnd_2',
+        vendor_name: 'Chidi Electronics', vendor_slug: 'chidi-elec', rating_avg: null, rating_count: null, created_at: 2000 },
+    ];
+
+    it('returns 200 with cross-vendor products from active vendors', async () => {
+      mockDb.all.mockResolvedValue({ results: catalogRows });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data).toHaveLength(2);
+    });
+
+    it('includes vendor_name and vendor_slug on each product', async () => {
+      mockDb.all.mockResolvedValue({ results: catalogRows });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data[0]).toHaveProperty('vendor_name');
+      expect(data.data[0]).toHaveProperty('vendor_slug');
+      expect(data.data[0].vendor_name).toBe('Ade Fashion House');
+    });
+
+    it('never includes cost_price in catalog response (NDPR / price integrity)', async () => {
+      const rowWithCost = { ...catalogRows[0], cost_price: 999999 };
+      mockDb.all.mockResolvedValue({ results: [rowWithCost] });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data[0]).not.toHaveProperty('cost_price');
+    });
+
+    it('returns empty data array when no active vendor products', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.data).toHaveLength(0);
+      expect(data.meta.has_more).toBe(false);
+    });
+
+    it('respects per_page parameter and caps at 24', async () => {
+      const rows = Array.from({ length: 24 }, (_, i) => ({ ...catalogRows[0], id: `prod_${i}`, sku: `SKU${i}` }));
+      mockDb.all.mockResolvedValue({ results: rows });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?per_page=100'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain(25); // per_page capped at 24, fetches 24+1
+    });
+
+    it('returns has_more=true and next_cursor when more results exist', async () => {
+      const rows = Array.from({ length: 13 }, (_, i) => ({ ...catalogRows[0], id: `prod_${i}`, created_at: i }));
+      mockDb.all.mockResolvedValue({ results: rows });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?per_page=12'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.meta.has_more).toBe(true);
+      expect(data.meta.next_cursor).toBe('prod_11');
+      expect(data.data).toHaveLength(12);
+    });
+
+    it('returns has_more=false when results fit in page', async () => {
+      mockDb.all.mockResolvedValue({ results: catalogRows });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?per_page=12'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.meta.has_more).toBe(false);
+      expect(data.meta.next_cursor).toBeNull();
+    });
+
+    it('passes search param into SQL bind arguments (LIKE fallback)', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?search=Aso-Oke'),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat().map(String);
+      const hasLike = bindArgs.some(a => a.includes('Aso-Oke'));
+      expect(hasLike).toBe(true);
+    });
+
+    it('filters by category when provided', async () => {
+      mockDb.all.mockResolvedValue({ results: [catalogRows[0]] });
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?category=fashion'),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain('fashion');
+    });
+
+    it('filters by vendor_id when provided', async () => {
+      mockDb.all.mockResolvedValue({ results: [catalogRows[0]] });
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?vendor_id=vnd_1'),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain('vnd_1');
+    });
+
+    it('passes cursor (after param) into SQL bind arguments', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?after=prod_9'),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain('prod_9');
+    });
+
+    it('always scopes query to the request tenant_id', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog', undefined, 'tnt_abc'),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain('tnt_abc');
+    });
+
+    it('returns cached payload from KV without hitting DB', async () => {
+      const payload = JSON.stringify({ success: true, data: catalogRows, meta: { has_more: false, next_cursor: null, count: 2, per_page: 12 } });
+      mockCatalogCache.get.mockResolvedValue(payload);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      expect(mockDb.prepare).not.toHaveBeenCalled();
+      const cacheHeader = res.headers.get('X-Cache');
+      expect(cacheHeader).toBe('HIT');
+    });
+
+    it('stores catalog response in KV after a DB query (cache miss)', async () => {
+      mockDb.all.mockResolvedValue({ results: catalogRows });
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      expect(mockCatalogCache.put).toHaveBeenCalledTimes(1);
+      const [key, val, opts] = mockCatalogCache.put.mock.calls[0] as [string, string, { expirationTtl: number }];
+      expect(key).toMatch(/^mv_catalog_tnt_test_/);
+      expect(opts.expirationTtl).toBe(60);
+      const parsed = JSON.parse(val);
+      expect(parsed.success).toBe(true);
+    });
+
+    it('bypasses KV cache when nocache=1', async () => {
+      const payload = JSON.stringify({ success: true, data: [], meta: {} });
+      mockCatalogCache.get.mockResolvedValue(payload);
+      mockDb.all.mockResolvedValue({ results: catalogRows });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?nocache=1'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data).toHaveLength(2); // got from DB, not cache
+      expect(mockDb.prepare).toHaveBeenCalled();
+    });
+
+    it('X-Cache header is MISS on a DB fetch', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      expect(res.headers.get('X-Cache')).toBe('MISS');
+    });
+
+    it('meta.count matches the number of items returned', async () => {
+      mockDb.all.mockResolvedValue({ results: catalogRows });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.meta.count).toBe(data.data.length);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-3: MARKETPLACE CART — POST /cart
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('POST /cart — marketplace cart creation (MV-3)', () => {
+    const twoVendorItems = [
+      { product_id: 'prod_1', vendor_id: 'vnd_1', vendor_name: 'Ade Fashion', name: 'Aso-Oke', price: 2500000, quantity: 1 },
+      { product_id: 'prod_2', vendor_id: 'vnd_2', vendor_name: 'Chidi Elec', name: 'Speaker', price: 1200000, quantity: 2 },
+    ];
+
+    it('returns 400 when NDPR consent is false', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: false }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/NDPR/i);
+    });
+
+    it('returns 400 when items array is empty', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: [], ndpr_consent: true }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it('returns 400 when an item is missing product_id', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', {
+          items: [{ vendor_id: 'vnd_1', name: 'x', price: 100, quantity: 1 }],
+          ndpr_consent: true,
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/product_id/i);
+    });
+
+    it('returns 400 when an item is missing vendor_id', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', {
+          items: [{ product_id: 'p1', name: 'x', price: 100, quantity: 1 }],
+          ndpr_consent: true,
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/vendor_id/i);
+    });
+
+    it('returns 400 when an item price is non-positive', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', {
+          items: [{ product_id: 'p1', vendor_id: 'vnd_1', name: 'x', price: -500, quantity: 1 }],
+          ndpr_consent: true,
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/price/i);
+    });
+
+    it('returns 400 when an item quantity is zero', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', {
+          items: [{ product_id: 'p1', vendor_id: 'vnd_1', name: 'x', price: 100, quantity: 0 }],
+          ndpr_consent: true,
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/quantity/i);
+    });
+
+    it('returns 201 and creates cart with a token on success', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(201);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.token).toBeDefined();
+    });
+
+    it('cart token starts with cart_mkp_ prefix', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.token).toMatch(/^cart_mkp_/);
+    });
+
+    it('vendor_breakdown groups items by vendor_id correctly', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      const bd = data.data.vendor_breakdown;
+      expect(bd).toHaveProperty('vnd_1');
+      expect(bd).toHaveProperty('vnd_2');
+      expect(bd.vnd_1.subtotal).toBe(2500000);
+      expect(bd.vnd_2.subtotal).toBe(2400000); // 1200000 * 2
+    });
+
+    it('total_amount is the sum across all vendors', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.total_amount).toBe(2500000 + 2400000);
+    });
+
+    it('vendor_count matches the number of unique vendors', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.vendor_count).toBe(2);
+    });
+
+    it('expires_at is approximately 24 hours from now', async () => {
+      const before = Date.now();
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      const after = Date.now();
+      const data = await res.json() as any;
+      const expected24h = 24 * 60 * 60 * 1000;
+      expect(data.data.expires_at).toBeGreaterThanOrEqual(before + expected24h - 100);
+      expect(data.data.expires_at).toBeLessThanOrEqual(after + expected24h + 100);
+    });
+
+    it('single-vendor cart has vendor_count=1', async () => {
+      const singleVendorItems = [
+        { product_id: 'prod_1', vendor_id: 'vnd_1', vendor_name: 'Ade Fashion', name: 'Kaftan', price: 1800000, quantity: 2 },
+        { product_id: 'prod_2', vendor_id: 'vnd_1', vendor_name: 'Ade Fashion', name: 'Gown', price: 2000000, quantity: 1 },
+      ];
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: singleVendorItems, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.vendor_count).toBe(1);
+      expect(data.data.vendor_breakdown.vnd_1.subtotal).toBe(1800000 * 2 + 2000000);
+    });
+
+    it('vendor_breakdown item_count sums quantities correctly', async () => {
+      const items = [
+        { product_id: 'prod_1', vendor_id: 'vnd_1', vendor_name: 'Ade', name: 'A', price: 100, quantity: 3 },
+        { product_id: 'prod_2', vendor_id: 'vnd_1', vendor_name: 'Ade', name: 'B', price: 200, quantity: 2 },
+      ];
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items, ndpr_consent: true }),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.vendor_breakdown.vnd_1.item_count).toBe(5);
+    });
+
+    it('returns 200 when updating existing cart with valid token', async () => {
+      mockDb.first.mockResolvedValue({ id: 'cs_1' });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true, token: 'cart_mkp_existing' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.data.token).toBe('cart_mkp_existing');
+    });
+
+    it('returns 404 when updating a cart with unknown token', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true, token: 'cart_mkp_ghost' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('passes customer_phone into DB insert when provided', async () => {
+      await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true, customer_phone: '+2348099991234' }),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain('+2348099991234');
+    });
+
+    it('item name is required — returns 400 when missing', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/cart', {
+          items: [{ product_id: 'p1', vendor_id: 'vnd_1', price: 100, quantity: 1 }],
+          ndpr_consent: true,
+        }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/name/i);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-3: MARKETPLACE CART — GET /cart/:token
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('GET /cart/:token — retrieve marketplace cart (MV-3)', () => {
+    const cartItems = [
+      { product_id: 'prod_1', vendor_id: 'vnd_1', vendor_name: 'Ade', name: 'Aso-Oke', price: 2500000, quantity: 1 },
+      { product_id: 'prod_2', vendor_id: 'vnd_2', vendor_name: 'Chidi', name: 'Speaker', price: 600000, quantity: 2 },
+    ];
+    const cartBreakdown = {
+      vnd_1: { vendor_id: 'vnd_1', vendor_name: 'Ade', item_count: 1, subtotal: 2500000 },
+      vnd_2: { vendor_id: 'vnd_2', vendor_name: 'Chidi', item_count: 2, subtotal: 1200000 },
+    };
+    const futureExpiry = Date.now() + 23 * 60 * 60 * 1000;
+    const mockCartRow = {
+      id: 'cs_1',
+      session_token: 'cart_mkp_abc123',
+      items_json: JSON.stringify(cartItems),
+      vendor_breakdown_json: JSON.stringify(cartBreakdown),
+      customer_phone: '+2348099991234',
+      expires_at: futureExpiry,
+      created_at: Date.now() - 1000,
+      updated_at: Date.now(),
+    };
+
+    it('returns 404 when token is not found', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_notfound'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('returns 200 with cart data for a valid token', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+    });
+
+    it('response includes parsed items array', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(Array.isArray(data.data.items)).toBe(true);
+      expect(data.data.items).toHaveLength(2);
+    });
+
+    it('response includes vendor_breakdown with per-vendor subtotals', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.vendor_breakdown).toHaveProperty('vnd_1');
+      expect(data.data.vendor_breakdown.vnd_1.subtotal).toBe(2500000);
+    });
+
+    it('total_amount is computed from items price * quantity', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.total_amount).toBe(2500000 + 600000 * 2);
+    });
+
+    it('item_count sums all item quantities', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.item_count).toBe(3); // 1 + 2
+    });
+
+    it('vendor_count matches number of vendors in breakdown', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.vendor_count).toBe(2);
+    });
+
+    it('returns 404 when cart is expired', async () => {
+      mockDb.first.mockResolvedValue({ ...mockCartRow, expires_at: Date.now() - 1000 });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/expired/i);
+    });
+
+    it('response token matches the requested token', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.token).toBe('cart_mkp_abc123');
+    });
+
+    it('passes tenant_id to DB query (tenant isolation)', async () => {
+      mockDb.first.mockResolvedValue(null);
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123', undefined, 'tnt_isolated'),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat();
+      expect(bindArgs).toContain('tnt_isolated');
+    });
+
+    it('response includes created_at and updated_at timestamps', async () => {
+      mockDb.first.mockResolvedValue(mockCartRow);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data).toHaveProperty('created_at');
+      expect(data.data).toHaveProperty('updated_at');
+    });
+
+    it('handles empty or corrupt vendor_breakdown_json gracefully', async () => {
+      mockDb.first.mockResolvedValue({ ...mockCartRow, vendor_breakdown_json: 'INVALID_JSON' });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/cart/cart_mkp_abc123'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.data.vendor_breakdown).toEqual({});
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-3: CHECKOUT — UMBRELLA ORDER CREATION
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('POST /checkout — umbrella marketplace order (MV-3)', () => {
+    const checkoutBody = {
+      items: [
+        { product_id: 'prod_1', vendor_id: 'vnd_1', quantity: 1, price: 2500000, name: 'Aso-Oke' },
+        { product_id: 'prod_2', vendor_id: 'vnd_2', quantity: 2, price: 600000, name: 'Speaker' },
+      ],
+      customer_email: 'ada@example.com',
+      customer_phone: '+2348011112222',
+      payment_method: 'paystack',
+      ndpr_consent: true,
+    };
+
+    it('returns 201 with marketplace_order_id on success', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 1000 });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', checkoutBody),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(201);
+      const data = await res.json() as any;
+      expect(data.data).toHaveProperty('marketplace_order_id');
+    });
+
+    it('marketplace_order_id starts with mkp_ord_ prefix', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 1000 });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', checkoutBody),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.marketplace_order_id).toMatch(/^mkp_ord_/);
+    });
+
+    it('response includes vendor_breakdown with per-vendor commission + payout', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 1000 }); // 10%
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', checkoutBody),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      const bd = data.data.vendor_breakdown;
+      expect(bd).toHaveProperty('vnd_1');
+      expect(bd.vnd_1.commission).toBe(Math.round(2500000 * 1000 / 10000)); // 250000
+      expect(bd.vnd_1.payout).toBe(2500000 - bd.vnd_1.commission);
+    });
+
+    it('vendor_count matches the number of distinct vendors in items', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 800 });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', checkoutBody),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.vendor_count).toBe(2);
+    });
+
+    it('total_amount equals sum of all item prices * quantities', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 1000 });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', checkoutBody),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.total_amount).toBe(2500000 + 600000 * 2);
+    });
+
+    it('uses default commission_rate of 10% when vendor not found in DB', async () => {
+      mockDb.first.mockResolvedValue(null); // vendor row not found
+      const singleVendorBody = {
+        ...checkoutBody,
+        items: [{ product_id: 'prod_1', vendor_id: 'vnd_ghost', quantity: 1, price: 1000000, name: 'Item' }],
+      };
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', singleVendorBody),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.vendor_breakdown.vnd_ghost.commission).toBe(Math.round(1000000 * 1000 / 10000));
+    });
+
+    it('returns 400 when NDPR consent is missing', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', { ...checkoutBody, ndpr_consent: false }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it('returns 400 when customer_email is missing', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', { ...checkoutBody, customer_email: '' }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it('accepts optional payment_reference from client (MV-4 will verify server-side)', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 1000 });
+      const bodyWithRef = { ...checkoutBody, payment_reference: 'pay_ref_custom123' };
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', bodyWithRef),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.payment_reference).toBe('pay_ref_custom123');
+    });
+
+    it('generates payment_reference automatically when not provided', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 1000 });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', checkoutBody),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.payment_reference).toMatch(/^pay_mkp_/);
+    });
+
+    it('inserts umbrella record into marketplace_orders (DB INSERT called)', async () => {
+      mockDb.first.mockResolvedValue({ commission_rate: 1000 });
+      await multiVendorRouter.fetch(
+        makeRequest('POST', '/checkout', checkoutBody),
+        mockEnv as any,
+      );
+      const insertCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]).filter(
+        (sql: string) => sql.includes('marketplace_orders'),
+      );
+      expect(insertCalls.length).toBeGreaterThanOrEqual(1);
+    });
+  });
 });
+
 

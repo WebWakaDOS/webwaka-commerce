@@ -1,10 +1,12 @@
 /**
- * COM-3: Multi-Vendor Marketplace API — Phase MV-1 + MV-2
- * Auth, security hardening, KYC schema, vendor isolation, vendor onboarding
+ * COM-3: Multi-Vendor Marketplace API — Phase MV-1 + MV-2 + MV-3
+ * Auth, security hardening, KYC schema, vendor isolation, vendor onboarding,
+ * cross-vendor catalog, marketplace cart, umbrella orders.
  * Invariants: Nigeria-First (Paystack split in MV-3), Multi-tenancy, NDPR, Build Once Use Infinitely
  *
  * Auth model:
- *   Public  : GET /vendors (active only), GET /vendors/:id/products, GET /, POST /checkout
+ *   Public  : GET /vendors (active only), GET /vendors/:id/products, GET /catalog,
+ *             GET /cart/:token, POST /cart, POST /checkout
  *   Admin   : POST /vendors, PATCH /vendors/:id  (x-admin-key header)
  *   Vendor  : POST /vendors/:id/products, GET /orders, GET /ledger,
  *             POST /vendors/:id/kyc  (Bearer JWT, role='vendor')
@@ -13,6 +15,12 @@
  *   POST /vendor-auth/request-otp  — alias for /auth/vendor-request-otp (canonical path)
  *   POST /vendor-auth/verify-otp   — alias for /auth/vendor-verify-otp
  *   POST /vendors/:id/kyc          — vendor submits rc_number, bvn_hash, nin_hash, bank_details
+ *
+ * MV-3 additions:
+ *   GET  /catalog                  — cross-vendor cursor-paginated catalog, KV cache, FTS5 search
+ *   POST /cart                     — create/update marketplace cart with per-vendor breakdown
+ *   GET  /cart/:token              — return cart session with vendor_breakdown_json
+ *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
 import type { Env } from '../../worker';
@@ -579,15 +587,18 @@ app.get('/ledger', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /checkout — Marketplace checkout with commission splitting
- * MV-1: NDPR consent gate enforced; payment_reference accepted from client.
- * MV-2: Replace client reference with server-side Paystack verify + umbrella/child orders.
+ * POST /checkout — Marketplace checkout with umbrella order + commission splitting
+ * MV-3: Creates marketplace_orders umbrella record + per-vendor child orders in orders table.
+ *       Builds vendor_breakdown_json with per-vendor subtotal, commission, payout.
+ *       All child orders reference the umbrella via marketplace_order_id.
+ * MV-4: Will replace client payment_reference with server-side Paystack verify.
  */
 app.post('/checkout', async (c) => {
   const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
   const body = await c.req.json<{
     items: Array<{ product_id: string; vendor_id: string; quantity: number; price: number; name: string }>;
     customer_email: string;
+    customer_phone?: string;
     payment_method: string;
     payment_reference?: string;
     ndpr_consent: boolean;
@@ -603,14 +614,11 @@ app.post('/checkout', async (c) => {
     return c.json({ success: false, error: 'customer_email is required' }, 400);
   }
 
-  const id = `ord_mkp_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
   const now = Date.now();
   const subtotal = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
+  const paymentRef = body.payment_reference ?? `pay_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
-  // MV-2 TODO: verify body.payment_reference with Paystack API before proceeding
-  const paymentRef = body.payment_reference ?? `pay_mkp_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-
-  // Group items by vendor for commission ledger
+  // ── Group items by vendor ─────────────────────────────────────────────────
   const vendorGroups = body.items.reduce((acc, item) => {
     if (!acc[item.vendor_id]) acc[item.vendor_id] = { items: [], subtotal: 0 };
     acc[item.vendor_id]!.items.push(item);
@@ -618,19 +626,17 @@ app.post('/checkout', async (c) => {
     return acc;
   }, {} as Record<string, { items: typeof body.items; subtotal: number }>);
 
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO orders
-         (id, tenant_id, customer_email, items_json, subtotal, discount, total_amount,
-          payment_method, payment_status, order_status, channel, payment_reference, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'pending', 'confirmed', 'marketplace', ?, ?, ?)`
-    ).bind(
-      id, tenantId, body.customer_email.trim(),
-      JSON.stringify(body.items), subtotal, subtotal,
-      body.payment_method, paymentRef, now, now,
-    ).run();
+  const vendorCount = Object.keys(vendorGroups).length;
 
-    // Commission ledger entries per vendor
+  // ── Umbrella order ID (mkp_ord_ prefix) ─────────────────────────────────
+  const mkpOrderId = `mkp_ord_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+  try {
+    // ── Build per-vendor breakdown (fetch commission_rates) ──────────────────
+    const breakdownMap: Record<string, {
+      vendor_id: string; subtotal: number; commission: number; payout: number; commission_rate: number;
+    }> = {};
+
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const vendorRow = await c.env.DB.prepare(
         'SELECT commission_rate FROM vendors WHERE id = ? AND marketplace_tenant_id = ?'
@@ -638,8 +644,51 @@ app.post('/checkout', async (c) => {
 
       const commissionRate = vendorRow?.commission_rate ?? 1000;
       const commission = Math.round(group.subtotal * commissionRate / 10000);
-      const vendorPayout = group.subtotal - commission;
+      const payout = group.subtotal - commission;
+      breakdownMap[vendorId] = { vendor_id: vendorId, subtotal: group.subtotal, commission, payout, commission_rate: commissionRate };
+    }
 
+    // ── Insert marketplace_orders umbrella ───────────────────────────────────
+    await c.env.DB.prepare(
+      `INSERT INTO marketplace_orders
+         (id, tenant_id, customer_email, customer_phone, items_json, vendor_count,
+          subtotal, total_amount, payment_method, payment_reference, payment_status,
+          order_status, channel, ndpr_consent, vendor_breakdown_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'confirmed', 'marketplace', 1, ?, ?, ?)`
+    ).bind(
+      mkpOrderId, tenantId,
+      body.customer_email.trim(),
+      body.customer_phone?.trim() ?? null,
+      JSON.stringify(body.items),
+      vendorCount,
+      subtotal, subtotal,
+      body.payment_method, paymentRef,
+      JSON.stringify(breakdownMap),
+      now, now,
+    ).run();
+
+    // ── Insert per-vendor child orders ───────────────────────────────────────
+    for (const [vendorId, group] of Object.entries(vendorGroups)) {
+      const childId = `ord_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+      const childSubtotal = group.subtotal;
+
+      await c.env.DB.prepare(
+        `INSERT INTO orders
+           (id, tenant_id, customer_email, items_json, subtotal, discount, total_amount,
+            payment_method, payment_status, order_status, channel, payment_reference,
+            marketplace_order_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'pending', 'confirmed', 'marketplace', ?, ?, ?, ?)`
+      ).bind(
+        childId, tenantId, body.customer_email.trim(),
+        JSON.stringify(group.items),
+        childSubtotal, childSubtotal,
+        body.payment_method, paymentRef,
+        mkpOrderId,
+        now, now,
+      ).run();
+
+      // Commission + revenue ledger entries
+      const bd = breakdownMap[vendorId]!;
       const led1 = `led_${now}_${Math.random().toString(36).slice(2, 9)}`;
       const led2 = `led_${now + 1}_${Math.random().toString(36).slice(2, 9)}`;
 
@@ -647,22 +696,25 @@ app.post('/checkout', async (c) => {
         `INSERT INTO ledger_entries
            (id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at)
          VALUES (?, ?, ?, ?, 'commission', ?, 'CREDIT', ?, ?, ?)`
-      ).bind(led1, tenantId, vendorId, id, commission, `Commission from order ${id}`, paymentRef, now).run();
+      ).bind(led1, tenantId, vendorId, childId, bd.commission,
+        `Commission from umbrella order ${mkpOrderId}`, paymentRef, now).run();
 
       await c.env.DB.prepare(
         `INSERT INTO ledger_entries
            (id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at)
          VALUES (?, ?, ?, ?, 'revenue', ?, 'CREDIT', ?, ?, ?)`
-      ).bind(led2, tenantId, vendorId, id, vendorPayout, `Vendor payout for order ${id}`, paymentRef, now).run();
+      ).bind(led2, tenantId, vendorId, childId, bd.payout,
+        `Vendor payout for umbrella order ${mkpOrderId}`, paymentRef, now).run();
     }
 
     return c.json({
       success: true,
       data: {
-        id,
+        marketplace_order_id: mkpOrderId,
         total_amount: subtotal,
         payment_reference: paymentRef,
-        vendor_count: Object.keys(vendorGroups).length,
+        vendor_count: vendorCount,
+        vendor_breakdown: breakdownMap,
       },
     }, 201);
   } catch (e) {
@@ -916,6 +968,385 @@ app.post('/vendors/:id/kyc', async (c) => {
         kyc_status: 'submitted',
         kyc_submitted_at: now,
         message: 'KYC submitted successfully. Admin review typically takes 1-2 business days.',
+      },
+    });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-3: CROSS-VENDOR CATALOG — GET /catalog
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /catalog
+ * Returns active products from all active vendors in this marketplace.
+ * Supports cursor pagination (after=<product_id>), per_page (max 24, default 12),
+ * search (FTS5 MATCH or LIKE fallback), category, and vendor_id filters.
+ *
+ * KV cache: CATALOG_CACHE binding, key = mv_catalog_{tenant}_{cacheKey}
+ * TTL: 60 seconds. Bypass with ?nocache=1 (admin/dev only, not documented publicly).
+ *
+ * NDPR: cost_price is never included in response.
+ * Tenant isolation: tenant_id from header enforced in all DB predicates.
+ */
+app.get('/catalog', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const search    = c.req.query('search')?.trim()     ?? '';
+  const category  = c.req.query('category')?.trim()   ?? '';
+  const vendorId  = c.req.query('vendor_id')?.trim()  ?? '';
+  const after     = c.req.query('after')?.trim()      ?? '';
+  const perPage   = Math.min(Number(c.req.query('per_page') ?? '12'), 24);
+  const noCache   = c.req.query('nocache') === '1';
+
+  const cacheKey = `mv_catalog_${tenantId}_${after}_${search}_${category}_${vendorId}_${perPage}`;
+
+  // ── KV cache hit ──────────────────────────────────────────────────────────
+  if (!noCache && c.env.CATALOG_CACHE) {
+    const cached = await c.env.CATALOG_CACHE.get(cacheKey);
+    if (cached) {
+      return new Response(cached, {
+        headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' },
+      });
+    }
+  }
+
+  try {
+    // ── Build SQL predicates ─────────────────────────────────────────────────
+    const conditions: string[] = [
+      'p.tenant_id = ?',
+      'p.is_active = 1',
+      'p.deleted_at IS NULL',
+      'v.status = ?',
+      'v.deleted_at IS NULL',
+    ];
+    const binds: unknown[] = [tenantId, 'active'];
+
+    if (after) {
+      conditions.push('p.id > ?');
+      binds.push(after);
+    }
+    if (category) {
+      conditions.push('p.category = ?');
+      binds.push(category);
+    }
+    if (vendorId) {
+      conditions.push('p.vendor_id = ?');
+      binds.push(vendorId);
+    }
+
+    // FTS5 search if available; LIKE fallback otherwise
+    let searchJoin = '';
+    if (search) {
+      try {
+        // Attempt FTS5 — inner join products_fts (may not exist in older DBs)
+        searchJoin = `INNER JOIN products_fts fts ON fts.product_id = p.id AND fts.tenant_id = p.tenant_id`;
+        conditions.push('products_fts MATCH ?');
+        binds.push(search);
+      } catch {
+        // Fallback to LIKE if FTS5 table absent
+        searchJoin = '';
+        conditions.push(`(p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)`);
+        const like = `%${search}%`;
+        binds.push(like, like, like);
+      }
+    }
+
+    // When FTS5 failed but search is set, searchJoin must be empty and binds already updated above
+    // If FTS5 try was not entered:
+    const where = conditions.join(' AND ');
+    const sql = `
+      SELECT
+        p.id, p.sku, p.name, p.description, p.category,
+        p.price, p.quantity, p.image_url, p.vendor_id,
+        v.name  AS vendor_name,
+        v.slug  AS vendor_slug,
+        v.rating_avg, v.rating_count,
+        p.created_at
+      FROM products p
+      INNER JOIN vendors v ON v.id = p.vendor_id
+      ${searchJoin}
+      WHERE ${where}
+      ORDER BY p.id ASC
+      LIMIT ?
+    `.trim();
+
+    binds.push(perPage + 1); // fetch one extra to detect has_more
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { results } = await c.env.DB.prepare(sql).bind(...(binds as any[])).all<{
+      id: string; sku: string; name: string; description: string | null;
+      category: string | null; price: number; quantity: number; image_url: string | null;
+      vendor_id: string; vendor_name: string; vendor_slug: string;
+      rating_avg: number | null; rating_count: number | null; created_at: number;
+    }>();
+
+    const hasMore = results.length > perPage;
+    const pageRaw = hasMore ? results.slice(0, perPage) : results;
+    const nextCursor = hasMore ? pageRaw[pageRaw.length - 1]!.id : null;
+
+    // NDPR / price integrity: never expose cost_price
+    const page = pageRaw.map(({ ...r }) => {
+      delete (r as Record<string, unknown>).cost_price;
+      return r;
+    });
+
+    const payload = JSON.stringify({
+      success: true,
+      data: page,
+      meta: {
+        count: page.length,
+        has_more: hasMore,
+        next_cursor: nextCursor,
+        per_page: perPage,
+      },
+    });
+
+    // ── Store in KV cache ─────────────────────────────────────────────────
+    if (c.env.CATALOG_CACHE) {
+      await c.env.CATALOG_CACHE.put(cacheKey, payload, { expirationTtl: 60 });
+    }
+
+    return new Response(payload, {
+      headers: { 'Content-Type': 'application/json', 'X-Cache': 'MISS' },
+    });
+  } catch (e) {
+    // If FTS5 MATCH failed (table not yet populated) retry with LIKE
+    if (search && String(e).includes('no such table: products_fts')) {
+      const like = `%${search}%`;
+      const fallbackBinds: unknown[] = [tenantId, 'active'];
+      const fallbackConds = [
+        'p.tenant_id = ?', 'p.is_active = 1', 'p.deleted_at IS NULL',
+        'v.status = ?', 'v.deleted_at IS NULL',
+        `(p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)`,
+      ];
+      fallbackBinds.push(like, like, like);
+      if (after)    { fallbackConds.push('p.id > ?');       fallbackBinds.push(after); }
+      if (category) { fallbackConds.push('p.category = ?'); fallbackBinds.push(category); }
+      if (vendorId) { fallbackConds.push('p.vendor_id = ?');fallbackBinds.push(vendorId); }
+      fallbackBinds.push(perPage + 1);
+
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { results } = await c.env.DB.prepare(
+          `SELECT p.id, p.sku, p.name, p.description, p.category,
+                  p.price, p.quantity, p.image_url, p.vendor_id,
+                  v.name AS vendor_name, v.slug AS vendor_slug,
+                  v.rating_avg, v.rating_count, p.created_at
+           FROM products p
+           INNER JOIN vendors v ON v.id = p.vendor_id
+           WHERE ${fallbackConds.join(' AND ')}
+           ORDER BY p.id ASC LIMIT ?`
+        ).bind(...(fallbackBinds as any[])).all<{
+          id: string; sku: string; name: string; description: string | null; category: string | null;
+          price: number; quantity: number; image_url: string | null; vendor_id: string;
+          vendor_name: string; vendor_slug: string; rating_avg: number | null;
+          rating_count: number | null; created_at: number;
+        }>();
+
+        const hasMore = results.length > perPage;
+        const page = hasMore ? results.slice(0, perPage) : results;
+        return c.json({ success: true, data: page, meta: { count: page.length, has_more: hasMore, next_cursor: hasMore ? page[page.length - 1]!.id : null, per_page: perPage } });
+      } catch (e2) {
+        return c.json({ success: false, error: String(e2) }, 500);
+      }
+    }
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-3: MARKETPLACE CART — POST /cart + GET /cart/:token
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Compute per-vendor subtotal breakdown from a cart items array.
+ * Returns: { [vendor_id]: { vendor_id, vendor_name, item_count, subtotal } }
+ */
+function computeVendorBreakdown(
+  items: Array<{ vendor_id: string; vendor_name?: string; quantity: number; price: number }>,
+): Record<string, { vendor_id: string; vendor_name: string; item_count: number; subtotal: number }> {
+  return items.reduce((acc, item) => {
+    const key = item.vendor_id;
+    if (!acc[key]) {
+      acc[key] = { vendor_id: key, vendor_name: item.vendor_name ?? key, item_count: 0, subtotal: 0 };
+    }
+    acc[key]!.item_count += item.quantity;
+    acc[key]!.subtotal   += item.price * item.quantity;
+    return acc;
+  }, {} as Record<string, { vendor_id: string; vendor_name: string; item_count: number; subtotal: number }>);
+}
+
+/**
+ * POST /cart — Create or update a marketplace cart session.
+ * Body: { items, customer_phone?, ndpr_consent, token? }
+ * - items: [{ product_id, vendor_id, vendor_name, name, price, quantity, image_url? }]
+ * - token: if provided, updates the existing cart; otherwise creates a new one.
+ * - ndpr_consent: must be true (NDPR requirement).
+ * Returns: { token, items, vendor_breakdown, total_amount, expires_at, vendor_count }
+ */
+app.post('/cart', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+
+  type CartItem = {
+    product_id: string;
+    vendor_id: string;
+    vendor_name?: string;
+    name: string;
+    price: number;
+    quantity: number;
+    image_url?: string;
+  };
+  const body = await c.req.json<{
+    items: CartItem[];
+    customer_phone?: string;
+    ndpr_consent: boolean;
+    token?: string;
+  }>();
+
+  if (!body.ndpr_consent) {
+    return c.json({ success: false, error: 'NDPR consent required to store cart data' }, 400);
+  }
+  if (!body.items?.length) {
+    return c.json({ success: false, error: 'items array is required and must not be empty' }, 400);
+  }
+  for (const item of body.items) {
+    if (!item.product_id?.trim()) return c.json({ success: false, error: 'Each item must have a product_id' }, 400);
+    if (!item.vendor_id?.trim())  return c.json({ success: false, error: 'Each item must have a vendor_id' }, 400);
+    if (!item.name?.trim())       return c.json({ success: false, error: 'Each item must have a name' }, 400);
+    if (!Number.isInteger(item.price) || item.price <= 0)    return c.json({ success: false, error: 'Each item price must be a positive integer (kobo)' }, 400);
+    if (!Number.isInteger(item.quantity) || item.quantity <= 0) return c.json({ success: false, error: 'Each item quantity must be a positive integer' }, 400);
+  }
+
+  const breakdown = computeVendorBreakdown(body.items);
+  const totalAmount = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
+  const vendorCount = Object.keys(breakdown).length;
+  const now = Date.now();
+  const expiresAt = now + 24 * 60 * 60 * 1000; // 24-hour cart TTL
+
+  try {
+    if (body.token) {
+      // Update existing cart
+      const existing = await c.env.DB.prepare(
+        `SELECT id FROM cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?`
+      ).bind(body.token, tenantId, now).first<{ id: string }>();
+
+      if (!existing) {
+        return c.json({ success: false, error: 'Cart session not found or expired' }, 404);
+      }
+
+      await c.env.DB.prepare(
+        `UPDATE cart_sessions
+         SET items_json = ?, vendor_breakdown_json = ?, expires_at = ?,
+             customer_phone = COALESCE(?, customer_phone), updated_at = ?
+         WHERE session_token = ? AND tenant_id = ?`
+      ).bind(
+        JSON.stringify(body.items),
+        JSON.stringify(breakdown),
+        expiresAt,
+        body.customer_phone ?? null,
+        now,
+        body.token, tenantId,
+      ).run();
+
+      return c.json({
+        success: true,
+        data: {
+          token: body.token,
+          items: body.items,
+          vendor_breakdown: breakdown,
+          total_amount: totalAmount,
+          vendor_count: vendorCount,
+          expires_at: expiresAt,
+        },
+      });
+    }
+
+    // Create new cart
+    const token = `cart_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+    const cartId = `cs_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+    await c.env.DB.prepare(
+      `INSERT INTO cart_sessions
+         (id, tenant_id, session_token, items_json, vendor_breakdown_json,
+          channel, customer_phone, expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'marketplace', ?, ?, ?, ?)`
+    ).bind(
+      cartId, tenantId, token,
+      JSON.stringify(body.items),
+      JSON.stringify(breakdown),
+      body.customer_phone ?? null,
+      expiresAt, now, now,
+    ).run();
+
+    return c.json({
+      success: true,
+      data: {
+        token,
+        items: body.items,
+        vendor_breakdown: breakdown,
+        total_amount: totalAmount,
+        vendor_count: vendorCount,
+        expires_at: expiresAt,
+      },
+    }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+/**
+ * GET /cart/:token — Retrieve a marketplace cart session.
+ * Returns cart items + per-vendor breakdown + total_amount.
+ * 404 when token not found, belongs to a different tenant, or expired.
+ */
+app.get('/cart/:token', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const token = c.req.param('token');
+  const now = Date.now();
+
+  try {
+    const cart = await c.env.DB.prepare(
+      `SELECT id, session_token, items_json, vendor_breakdown_json,
+              customer_phone, expires_at, created_at, updated_at
+       FROM cart_sessions
+       WHERE session_token = ? AND tenant_id = ? AND channel = 'marketplace'`
+    ).bind(token, tenantId).first<{
+      id: string;
+      session_token: string;
+      items_json: string;
+      vendor_breakdown_json: string | null;
+      customer_phone: string | null;
+      expires_at: number;
+      created_at: number;
+      updated_at: number;
+    }>();
+
+    if (!cart) return c.json({ success: false, error: 'Cart not found' }, 404);
+    if (cart.expires_at < now) return c.json({ success: false, error: 'Cart has expired' }, 404);
+
+    let items: unknown[] = [];
+    try { items = JSON.parse(cart.items_json); } catch { items = []; }
+
+    let breakdown: Record<string, unknown> = {};
+    try { breakdown = cart.vendor_breakdown_json ? JSON.parse(cart.vendor_breakdown_json) : {}; } catch { breakdown = {}; }
+
+    const totalAmount = (items as Array<{ price: number; quantity: number }>)
+      .reduce((s, i) => s + (i.price ?? 0) * (i.quantity ?? 0), 0);
+
+    return c.json({
+      success: true,
+      data: {
+        token: cart.session_token,
+        items,
+        vendor_breakdown: breakdown,
+        vendor_count: Object.keys(breakdown).length,
+        total_amount: totalAmount,
+        item_count: (items as Array<{ quantity: number }>).reduce((s, i) => s + (i.quantity ?? 0), 0),
+        expires_at: cart.expires_at,
+        created_at: cart.created_at,
+        updated_at: cart.updated_at,
       },
     });
   } catch (e) {
