@@ -20,9 +20,11 @@ export interface Env {
   TENANT_CONFIG: KVNamespace;
   EVENTS: KVNamespace;
   SESSIONS_KV: KVNamespace;
-  PAYSTACK_SECRET: string;    // Cloudflare Worker secret
-  TERMII_API_KEY: string;     // Termii SMS API key for OTP delivery
-  JWT_SECRET: string;         // HMAC-SHA256 secret for customer JWTs
+  CATALOG_CACHE: KVNamespace;       // 60-second catalog page cache
+  PAYSTACK_SECRET: string;          // Cloudflare Worker secret
+  TERMII_API_KEY: string;           // Termii SMS API key for OTP delivery
+  JWT_SECRET: string;               // HMAC-SHA256 secret for customer JWTs
+  CF_IMAGES_ACCOUNT_HASH?: string;  // Cloudflare Images account hash (optional)
 }
 
 const app = new Hono<{ Bindings: Env }>();

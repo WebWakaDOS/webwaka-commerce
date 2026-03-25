@@ -83,12 +83,22 @@ app.get('/catalog/search', async (c) => {
   }
 });
 
-// ── GET /catalog — Paginated public product catalog (PAGE-1) ─────────────────
+// ── GET /catalog — Paginated public product catalog (PAGE-1 + KV cache 60s) ──
 app.get('/catalog', async (c) => {
   const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
-  const category = c.req.query('category');
-  const after = c.req.query('after');          // last product id from prev page
+  const category = c.req.query('category') ?? '';
+  const after = c.req.query('after') ?? '';
   const perPage = Math.min(Number(c.req.query('per_page') ?? DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
+
+  // ── KV cache lookup (60-second TTL) ────────────────────────────────────────
+  const cacheKey = `catalog:${tenantId}:${category}:${after}:${perPage}`;
+  if (c.env.CATALOG_CACHE) {
+    const cached = await c.env.CATALOG_CACHE.get(cacheKey);
+    if (cached) {
+      const parsed = JSON.parse(cached) as { products: unknown[]; next_cursor: string | null; has_more: boolean };
+      return c.json({ success: true, data: parsed, cached: true });
+    }
+  }
 
   try {
     const params: (string | number)[] = [tenantId!];
@@ -109,10 +119,30 @@ app.get('/catalog', async (c) => {
     }>();
 
     const hasMore = results.length > perPage;
-    const products = hasMore ? results.slice(0, perPage) : results;
-    const nextCursor = hasMore ? products[products.length - 1]?.id ?? null : null;
+    const rawProducts = hasMore ? results.slice(0, perPage) : results;
+    const nextCursor = hasMore ? rawProducts[rawProducts.length - 1]?.id ?? null : null;
 
-    return c.json({ success: true, data: { products, next_cursor: nextCursor, has_more: hasMore } });
+    // ── Cloudflare Images URL transform (optional — CF_IMAGES_ACCOUNT_HASH) ──
+    const cfHash = c.env.CF_IMAGES_ACCOUNT_HASH;
+    const products = cfHash
+      ? rawProducts.map(p => ({
+          ...p,
+          image_url: p.image_url
+            ? `https://imagedelivery.net/${cfHash}/${p.image_url}/public`
+            : null,
+        }))
+      : rawProducts;
+
+    const payload = { products, next_cursor: nextCursor, has_more: hasMore };
+
+    // Write to KV cache (non-blocking, 60s TTL)
+    if (c.env.CATALOG_CACHE) {
+      c.executionCtx?.waitUntil(
+        c.env.CATALOG_CACHE.put(cacheKey, JSON.stringify(payload), { expirationTtl: 60 })
+      );
+    }
+
+    return c.json({ success: true, data: payload });
   } catch {
     return c.json({ success: true, data: { products: [], next_cursor: null, has_more: false } });
   }
@@ -646,7 +676,81 @@ app.get('/account/profile', async (c) => {
   }
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── GET /analytics — Today/week revenue, conversion %, top products (ANLT-1) ─
+app.get('/analytics', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+
+  // Require admin token (x-admin-key header or staff JWT)
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey) return c.json({ success: false, error: 'Admin authentication required' }, 401);
+
+  const now = Date.now();
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const todayMs = todayStart.getTime();
+  const weekMs = now - 7 * 24 * 60 * 60 * 1000;
+
+  try {
+    // Today and week revenue from paid orders (storefront channel)
+    const revenueRow = await c.env.DB.prepare(
+      `SELECT
+         SUM(CASE WHEN created_at >= ? THEN total_amount ELSE 0 END) AS today_revenue_kobo,
+         SUM(CASE WHEN created_at >= ? THEN total_amount ELSE 0 END) AS week_revenue_kobo,
+         COUNT(CASE WHEN created_at >= ? THEN 1 END)                  AS today_orders,
+         COUNT(CASE WHEN created_at >= ? THEN 1 END)                  AS week_orders
+       FROM orders
+       WHERE tenant_id = ? AND payment_status = 'paid' AND channel = 'storefront'`
+    ).bind(todayMs, weekMs, todayMs, weekMs, tenantId).first<{
+      today_revenue_kobo: number; week_revenue_kobo: number;
+      today_orders: number; week_orders: number;
+    }>();
+
+    // Cart sessions created this week (for conversion denominator)
+    const cartRow = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS cart_count FROM cart_sessions WHERE tenant_id = ? AND created_at >= ?`
+    ).bind(tenantId, weekMs).first<{ cart_count: number }>();
+
+    // Top 5 products by revenue this week
+    const { results: topProducts } = await c.env.DB.prepare(
+      `SELECT oi.product_id, oi.product_name AS name,
+              SUM(oi.quantity)               AS units_sold,
+              SUM(oi.total_price)            AS revenue_kobo
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE o.tenant_id = ? AND o.payment_status = 'paid'
+         AND o.channel = 'storefront' AND o.created_at >= ?
+       GROUP BY oi.product_id, oi.product_name
+       ORDER BY revenue_kobo DESC
+       LIMIT 5`
+    ).bind(tenantId, weekMs).all<{
+      product_id: string; name: string; units_sold: number; revenue_kobo: number;
+    }>();
+
+    const weekOrders = revenueRow?.week_orders ?? 0;
+    const cartCount = cartRow?.cart_count ?? 0;
+    const conversionPct = cartCount > 0 ? Math.round((weekOrders / cartCount) * 1000) / 10 : 0;
+
+    return c.json({
+      success: true,
+      data: {
+        today: {
+          revenue_kobo: revenueRow?.today_revenue_kobo ?? 0,
+          orders: revenueRow?.today_orders ?? 0,
+        },
+        week: {
+          revenue_kobo: revenueRow?.week_revenue_kobo ?? 0,
+          orders: weekOrders,
+          cart_sessions: cartCount,
+          conversion_pct: conversionPct,
+        },
+        top_products: topProducts,
+        generated_at: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    return c.json({ success: false, error: String(err) }, 500);
+  }
+});
+
 export function computeDiscount(discountType: string, discountValue: number, subtotalKobo: number): number {
   if (discountType === 'flat') return Math.min(discountValue, subtotalKobo);
   if (discountType === 'pct') return Math.round((subtotalKobo * discountValue) / 100);

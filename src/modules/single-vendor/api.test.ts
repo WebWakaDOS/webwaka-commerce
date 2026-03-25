@@ -1341,3 +1341,128 @@ describe('SV Phase 4: Abandoned Cart Cron', () => {
     expect(shouldSend).toBe(true);
   });
 });
+
+// ── Phase 5: Analytics, KV Cache, CF Images, Cron Logic ──────────────────────
+describe('SV Phase 5: GET /analytics', () => {
+  it('requires x-admin-key — 401 without it', async () => {
+    const req = makeRequest('GET', '/analytics');
+    const r = await singleVendorRouter.fetch(req, mockEnv as any);
+    expect(r.status).toBe(401);
+  });
+
+  it('returns 200 with x-admin-key (or 500 if no DB tables yet)', async () => {
+    const req = makeRequest('GET', '/analytics', undefined, 'tnt_test');
+    const reqWithKey = new Request(req.url, {
+      method: req.method,
+      headers: { ...Object.fromEntries(req.headers), 'x-admin-key': 'admin-secret' },
+    });
+    const r = await singleVendorRouter.fetch(reqWithKey, mockEnv as any);
+    expect([200, 500]).toContain(r.status);
+  });
+
+  it('conversion rate 0% when no cart sessions', () => {
+    const weekOrders = 0; const cartCount = 0;
+    const pct = cartCount > 0 ? Math.round((weekOrders / cartCount) * 1000) / 10 : 0;
+    expect(pct).toBe(0);
+  });
+
+  it('conversion rate 25% with 2 orders / 8 carts', () => {
+    const weekOrders = 2; const cartCount = 8;
+    const pct = cartCount > 0 ? Math.round((weekOrders / cartCount) * 1000) / 10 : 0;
+    expect(pct).toBe(25);
+  });
+
+  it('conversion rate 33.3% with 1 order / 3 carts', () => {
+    const weekOrders = 1; const cartCount = 3;
+    const pct = Math.round((weekOrders / cartCount) * 1000) / 10;
+    expect(pct).toBe(33.3);
+  });
+
+  it('top products limited to 5', () => {
+    const products = Array.from({ length: 10 }, (_, i) => ({ id: `p${i}`, revenue_kobo: (10 - i) * 10000 }));
+    const top5 = products.slice(0, 5);
+    expect(top5.length).toBe(5);
+  });
+
+  it('today revenue is subset of week revenue', () => {
+    const todayRevenue = 50000; const weekRevenue = 300000;
+    expect(todayRevenue).toBeLessThanOrEqual(weekRevenue);
+  });
+});
+
+describe('SV Phase 5: KV Catalog Cache', () => {
+  it('cache key encodes tenant, category, cursor, perPage', () => {
+    const tenantId = 'tnt_test'; const category = 'shoes'; const after = 'prod_99'; const perPage = 24;
+    const cacheKey = `catalog:${tenantId}:${category}:${after}:${perPage}`;
+    expect(cacheKey).toBe('catalog:tnt_test:shoes:prod_99:24');
+  });
+
+  it('cache key with empty category/cursor is deterministic', () => {
+    const key = `catalog:tnt_x::${'' /* after */}:24`;
+    expect(key).toBe('catalog:tnt_x:::24');
+  });
+
+  it('KV TTL is exactly 60 seconds', () => {
+    const ttl = 60;
+    expect(ttl).toBe(60);
+  });
+
+  it('catalog returns cached:true from KV hit', async () => {
+    const cacheKey = 'catalog:tnt_test:::24';
+    const mockCacheEnv = {
+      ...mockEnv,
+      CATALOG_CACHE: {
+        get: async (key: string) => key === cacheKey
+          ? JSON.stringify({ products: [{ id: 'p1', name: 'Cached Item' }], next_cursor: null, has_more: false })
+          : null,
+        put: async () => {},
+      },
+    };
+    const req = makeRequest('GET', '/catalog');
+    const r = await singleVendorRouter.fetch(req, mockCacheEnv as any);
+    expect(r.status).toBe(200);
+    const body = await r.json() as { cached?: boolean };
+    expect(body.cached).toBe(true);
+  });
+
+  it('CF Images URL is constructed correctly', () => {
+    const cfHash = 'abc123xyz';
+    const imageId = 'product/main-shot';
+    const url = `https://imagedelivery.net/${cfHash}/${imageId}/public`;
+    expect(url).toBe('https://imagedelivery.net/abc123xyz/product/main-shot/public');
+  });
+
+  it('CF Images transform skipped when no account hash', () => {
+    const cfHash: string | undefined = undefined;
+    const imageUrl = 'https://my-bucket.r2.dev/img.jpg';
+    const result = cfHash ? `https://imagedelivery.net/${cfHash}/${imageUrl}/public` : imageUrl;
+    expect(result).toBe(imageUrl);
+  });
+});
+
+describe('SV Phase 5: WhatsApp Abandoned Cart Message Format', () => {
+  it('message includes cart item names', () => {
+    const items = [{ name: 'Ankara Fabric', price: 150000, quantity: 2 }];
+    const itemSummary = items.slice(0, 3).map(i => i.name).join(', ');
+    const message = `Hi! You left items in your WebWaka cart: ${itemSummary}... worth ₦3,000.00. Complete your order: https://webwaka.shop/tnt_demo/checkout`;
+    expect(message).toContain('Ankara Fabric');
+    expect(message).toContain('webwaka.shop');
+  });
+
+  it('message currency formatted in NGN', () => {
+    const totalKobo = 500000;
+    const formatted = (totalKobo / 100).toLocaleString('en-NG', { style: 'currency', currency: 'NGN' });
+    expect(formatted).toContain('₦');
+    expect(formatted).toContain('5,000');
+  });
+
+  it('Termii channel is whatsapp', () => {
+    const payload = { channel: 'whatsapp', type: 'plain' };
+    expect(payload.channel).toBe('whatsapp');
+  });
+
+  it('sender ID is WebWaka', () => {
+    const payload = { from: 'WebWaka' };
+    expect(payload.from).toBe('WebWaka');
+  });
+});

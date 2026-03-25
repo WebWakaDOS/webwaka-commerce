@@ -66,8 +66,9 @@ See `.env.example` for reference:
 | COM-2 SV Phase 2 | Promo codes, VAT, delivery address, NDPR | ✅ Complete | #11 |
 | COM-2 SV Phase 3 | Variants, FTS5 search, virtual scroll, category pills | ✅ Complete | #12 |
 | COM-2 SV Phase 4 | Customer OTP auth, wishlists, order history, abandoned-cart cron | ✅ Complete | #13 |
+| COM-2 SV Phase 5 | Analytics API, KV catalog cache, CF Images URLs, e2e full-flow, FINAL_SV_REPORT | ✅ Complete | #14 |
 
-**Test count:** 370 passing (Vitest)
+**Test count:** 387 passing (Vitest) — zero regressions across all 14 test files
 
 ## Notes
 - The `@webwaka/core` package is a local file dependency (`../webwaka-core`) used only in worker/backend files, not the frontend React app
