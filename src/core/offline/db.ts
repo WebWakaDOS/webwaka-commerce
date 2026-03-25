@@ -5,6 +5,7 @@
  * v2: Added pos_receipts, pos_sessions tables for POS Phase 2
  * v3: Added heldCarts for park/hold sale (POS Phase 4)
  * v4: Added storefrontCarts for single-vendor cart persistence (SV Phase 1)
+ * v5: Added wishlists for customer offline wishlist (SV Phase 4)
  */
 import Dexie, { type Table } from 'dexie';
 
@@ -106,6 +107,19 @@ export interface HeldCart {
   sessionId?: string;
 }
 
+// ─── Offline wishlist (Single-Vendor, SV Phase 4) ────────────────────────────
+export interface OfflineWishlistItem {
+  id: string;           // `wl_${tenantId}_${productId}`
+  tenantId: string;
+  customerId: string;   // customer_id from JWT
+  productId: string;
+  productName: string;
+  productPrice: number; // kobo — cached at add time
+  imageEmoji?: string;
+  addedAt: number;
+  syncStatus: 'PENDING' | 'SYNCED' | 'REMOVED';
+}
+
 // ─── Storefront cart session (Single-Vendor, SV Phase 1) ──────────────────────
 export interface StorefrontCartItem {
   productId: string;
@@ -133,6 +147,7 @@ export class CommerceOfflineDB extends Dexie {
   posSessions!: Table<PosLocalSession, string>;
   heldCarts!: Table<HeldCart, string>;
   storefrontCarts!: Table<StorefrontCartSession, string>;
+  wishlists!: Table<OfflineWishlistItem, string>;
 
   constructor(tenantId: string) {
     super(`WebWakaCommerce_${tenantId}`);
@@ -176,6 +191,19 @@ export class CommerceOfflineDB extends Dexie {
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
+    });
+
+    // v5 — adds wishlists for customer offline wishlist (SV Phase 4)
+    this.version(5).stores({
+      mutations: '++id, tenantId, entityType, entityId, status, timestamp',
+      cartItems: '++id, tenantId, sessionToken, productId',
+      offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
+      products: 'id, tenantId, sku, category, cachedAt',
+      posReceipts: 'id, orderId, tenantId, createdAt',
+      posSessions: 'id, tenantId, status, openedAt',
+      heldCarts: 'id, tenantId, heldAt',
+      storefrontCarts: 'id, tenantId, updatedAt',
+      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
     });
   }
 }
@@ -339,4 +367,48 @@ export async function loadStorefrontCart(
 export async function clearStorefrontCart(tenantId: string): Promise<void> {
   const db = getCommerceDB(tenantId);
   await db.storefrontCarts.delete(`sv_cart_${tenantId}`);
+}
+
+// ─── Wishlist helpers (SV Phase 4) ────────────────────────────────────────────
+
+/** Toggle a product in the customer's offline wishlist. Returns new state. */
+export async function toggleWishlistItem(
+  tenantId: string,
+  customerId: string,
+  product: { id: string; name: string; price: number; imageEmoji?: string },
+): Promise<'added' | 'removed'> {
+  const db = getCommerceDB(tenantId);
+  const id = `wl_${tenantId}_${customerId}_${product.id}`;
+  const existing = await db.wishlists.get(id);
+  if (existing && existing.syncStatus !== 'REMOVED') {
+    await db.wishlists.update(id, { syncStatus: 'REMOVED' });
+    return 'removed';
+  }
+  await db.wishlists.put({
+    id, tenantId, customerId,
+    productId: product.id,
+    productName: product.name,
+    productPrice: product.price,
+    imageEmoji: product.imageEmoji,
+    addedAt: Date.now(),
+    syncStatus: 'PENDING',
+  });
+  return 'added';
+}
+
+/** Get all active wishlist items for a customer. */
+export async function getWishlistItems(tenantId: string, customerId: string): Promise<OfflineWishlistItem[]> {
+  const db = getCommerceDB(tenantId);
+  return db.wishlists
+    .where({ tenantId, customerId })
+    .filter(i => i.syncStatus !== 'REMOVED')
+    .toArray();
+}
+
+/** Check if a product is in the customer's wishlist. */
+export async function isWishlisted(tenantId: string, customerId: string, productId: string): Promise<boolean> {
+  const db = getCommerceDB(tenantId);
+  const id = `wl_${tenantId}_${customerId}_${productId}`;
+  const item = await db.wishlists.get(id);
+  return !!(item && item.syncStatus !== 'REMOVED');
 }

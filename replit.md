@@ -58,6 +58,18 @@ See `.env.example` for reference:
 - **Backend:** Cloudflare Workers (`wrangler deploy`)
 - In dev, `/api` proxies to `https://webwaka-commerce-api-staging.webwaka.workers.dev`
 
+## Progress Tracker
+| Phase | Description | Status | PR |
+|-------|-------------|--------|----|
+| COM-1 POS | Point of Sale (POS module) | ✅ Complete | #8 |
+| COM-2 SV Phase 1 | Single-Vendor foundation, checkout, Paystack | ✅ Complete | #10 |
+| COM-2 SV Phase 2 | Promo codes, VAT, delivery address, NDPR | ✅ Complete | #11 |
+| COM-2 SV Phase 3 | Variants, FTS5 search, virtual scroll, category pills | ✅ Complete | #12 |
+| COM-2 SV Phase 4 | Customer OTP auth, wishlists, order history, abandoned-cart cron | ✅ Complete | #13 |
+
+**Test count:** 370 passing (Vitest)
+
 ## Notes
 - The `@webwaka/core` package is a local file dependency (`../webwaka-core`) used only in worker/backend files, not the frontend React app
 - Vite configured with `host: '0.0.0.0'` and `allowedHosts: true` for Replit proxy compatibility
+- SV Phase 4 adds: `migrations/005_sv_auth.sql` (customer_otps, wishlists, abandoned_carts), JWT helper (`signJwt`/`verifyJwt`), Termii SMS OTP, Dexie v5 wishlists, hourly abandoned-cart cron, `AccountPage` component

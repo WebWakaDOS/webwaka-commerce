@@ -6,7 +6,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { getTranslations, getSupportedLanguages, getLanguageName, formatKoboToNaira, type Language } from './core/i18n';
-import { getCommerceDB, queueMutation, getPendingMutations } from './core/offline/db';
+import { getCommerceDB, queueMutation, getPendingMutations, toggleWishlistItem, getWishlistItems } from './core/offline/db';
 import { useStorefrontCart } from './modules/single-vendor/useStorefrontCart';
 
 // ============================================================
@@ -393,7 +393,87 @@ declare global {
 // Single-Vendor Storefront Module (COM-2) — SV Phase 2: Paystack, VAT, promo, address
 function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
   const { cart, addToCart, clearCart, total, itemCount, token } = useStorefrontCart(tenantId);
-  const [step, setStep] = useState<'catalog' | 'checkout' | 'success'>('catalog');
+  const [step, setStep] = useState<'catalog' | 'checkout' | 'success' | 'account'>('catalog');
+
+  // ── Customer auth (OTP → JWT) ──────────────────────────────────────────────
+  const [customerId, setCustomerId] = useState<string | null>(() => sessionStorage.getItem(`ww_cid_${tenantId}`));
+  const [customerPhone, setCustomerPhone] = useState<string | null>(() => sessionStorage.getItem(`ww_cph_${tenantId}`));
+  const [customerLoyalty, setCustomerLoyalty] = useState(0);
+  const [authToken, setAuthToken] = useState<string | null>(() => sessionStorage.getItem(`ww_tok_${tenantId}`));
+
+  // ── OTP modal ─────────────────────────────────────────────────────────────
+  const [showOtpModal, setShowOtpModal] = useState(false);
+  const [otpStep, setOtpStep] = useState<'phone' | 'code'>('phone');
+  const [otpPhone, setOtpPhone] = useState('');
+  const [otpCode, setOtpCode] = useState('');
+  const [otpLoading, setOtpLoading] = useState(false);
+  const [otpError, setOtpError] = useState('');
+
+  // ── Wishlist (offline-first via Dexie) ────────────────────────────────────
+  const [wishlisted, setWishlisted] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!customerId) return;
+    getWishlistItems(tenantId, customerId).then(items => {
+      setWishlisted(new Set(items.map(i => i.productId)));
+    }).catch(() => {});
+  }, [tenantId, customerId]);
+
+  const handleToggleWishlist = useCallback(async (p: Product) => {
+    if (!customerId) { setShowOtpModal(true); return; }
+    const action = await toggleWishlistItem(tenantId, customerId, { id: p.id, name: p.name, price: p.price, imageEmoji: '🛍️' });
+    setWishlisted(prev => {
+      const next = new Set(prev);
+      if (action === 'added') next.add(p.id); else next.delete(p.id);
+      return next;
+    });
+    if (authToken) {
+      fetch('/api/single-vendor/wishlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+        body: JSON.stringify({ product_id: p.id }),
+      }).catch(() => {});
+    }
+  }, [tenantId, customerId, authToken]);
+
+  // ── OTP handlers ──────────────────────────────────────────────────────────
+  const handleRequestOtp = async () => {
+    setOtpLoading(true); setOtpError('');
+    try {
+      const res = await fetch('/api/single-vendor/auth/request-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({ phone: otpPhone }),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) setOtpStep('code');
+      else setOtpError(d.error ?? 'Could not send OTP');
+    } catch { setOtpError('Network error. Try again.'); }
+    finally { setOtpLoading(false); }
+  };
+
+  const handleVerifyOtp = async () => {
+    setOtpLoading(true); setOtpError('');
+    try {
+      const res = await fetch('/api/single-vendor/auth/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({ phone: otpPhone, otp: otpCode }),
+      });
+      const d = await res.json() as { success: boolean; data?: { token: string; customer_id: string; phone: string; loyalty_points: number }; error?: string };
+      if (d.success && d.data) {
+        setAuthToken(d.data.token);
+        setCustomerId(d.data.customer_id);
+        setCustomerPhone(d.data.phone);
+        setCustomerLoyalty(d.data.loyalty_points);
+        sessionStorage.setItem(`ww_tok_${tenantId}`, d.data.token);
+        sessionStorage.setItem(`ww_cid_${tenantId}`, d.data.customer_id);
+        sessionStorage.setItem(`ww_cph_${tenantId}`, d.data.phone);
+        setShowOtpModal(false); setOtpStep('phone'); setOtpCode(''); setOtpPhone('');
+      } else setOtpError(d.error ?? 'Invalid OTP');
+    } catch { setOtpError('Network error. Try again.'); }
+    finally { setOtpLoading(false); }
+  };
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [ndprConsent, setNdprConsent] = useState(false);
@@ -658,6 +738,30 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     );
   }
 
+  // ── Account page ─────────────────────────────────────────────────────────
+  if (step === 'account') {
+    return (
+      <AccountPage
+        tenantId={tenantId}
+        customerId={customerId}
+        customerPhone={customerPhone}
+        customerLoyalty={customerLoyalty}
+        authToken={authToken}
+        wishlisted={wishlisted}
+        onBack={() => setStep('catalog')}
+        onLogout={() => {
+          setCustomerId(null); setCustomerPhone(null); setAuthToken(null);
+          sessionStorage.removeItem(`ww_tok_${tenantId}`);
+          sessionStorage.removeItem(`ww_cid_${tenantId}`);
+          sessionStorage.removeItem(`ww_cph_${tenantId}`);
+          setWishlisted(new Set());
+          setStep('catalog');
+        }}
+        formatKoboToNaira={formatKoboToNaira}
+      />
+    );
+  }
+
   if (step === 'checkout') {
     const inp: React.CSSProperties = { width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', boxSizing: 'border-box', fontSize: '14px' };
     const lbl: React.CSSProperties = { display: 'block', fontSize: '12px', fontWeight: 600, marginBottom: '4px', color: '#374151' };
@@ -787,7 +891,7 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
 
-      {/* Search bar */}
+      {/* Top bar: search + account button */}
       <div style={{ padding: '10px 12px 0', display: 'flex', gap: '8px' }}>
         <input
           type="search"
@@ -807,6 +911,11 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
             style={{ padding: '9px 12px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
           >✕</button>
         )}
+        <button
+          onClick={() => customerId ? setStep('account') : setShowOtpModal(true)}
+          title={customerId ? 'My Account' : 'Sign In'}
+          style={{ padding: '9px 12px', backgroundColor: customerId ? '#f0fdf4' : '#fff', border: `1px solid ${customerId ? '#16a34a' : '#d1d5db'}`, borderRadius: '8px', cursor: 'pointer', fontSize: '16px' }}
+        >{customerId ? '👤' : '🔐'}</button>
       </div>
 
       {/* Category pills — derived from loaded products */}
@@ -867,10 +976,15 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
                     <div
                       key={p.id}
                       onClick={() => openModal(p)}
-                      style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', cursor: 'pointer', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}
+                      style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', cursor: 'pointer', boxShadow: '0 1px 3px rgba(0,0,0,0.06)', position: 'relative' }}
                     >
-                      <div style={{ backgroundColor: '#f0fdf4', height: '90px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '36px' }}>
+                      <div style={{ backgroundColor: '#f0fdf4', height: '90px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '36px', position: 'relative' }}>
                         {p.image_url ? <img src={p.image_url} alt={p.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : '🛍️'}
+                        <button
+                          onClick={e => { e.stopPropagation(); handleToggleWishlist(p); }}
+                          title={wishlisted.has(p.id) ? 'Remove from wishlist' : 'Add to wishlist'}
+                          style={{ position: 'absolute', top: '6px', right: '6px', background: 'rgba(255,255,255,0.85)', border: 'none', borderRadius: '50%', width: '28px', height: '28px', cursor: 'pointer', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
+                        >{wishlisted.has(p.id) ? '❤️' : '🤍'}</button>
                       </div>
                       <div style={{ padding: '8px' }}>
                         <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '2px', lineHeight: '1.3', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{p.name}</div>
@@ -904,6 +1018,61 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
           <button onClick={() => setStep('checkout')} style={{ padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 700 }}>
             {t.storefront_checkout}
           </button>
+        </div>
+      )}
+
+      {/* OTP login modal */}
+      {showOtpModal && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }} onClick={() => setShowOtpModal(false)}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '16px', padding: '24px', width: '100%', maxWidth: '360px' }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: '20px', fontWeight: 800, marginBottom: '6px', color: '#111827' }}>
+              {otpStep === 'phone' ? '🔐 Sign In' : '📱 Enter Code'}
+            </div>
+            <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '20px' }}>
+              {otpStep === 'phone'
+                ? 'Enter your Nigerian phone number to receive a one-time code.'
+                : `We sent a 6-digit code to ${otpPhone}. Enter it below.`}
+            </div>
+            {otpError && <div style={{ padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>{otpError}</div>}
+            {otpStep === 'phone' ? (
+              <>
+                <input
+                  type="tel"
+                  placeholder="e.g. 08012345678 or +2348012345678"
+                  value={otpPhone}
+                  onChange={e => setOtpPhone(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleRequestOtp(); }}
+                  style={{ width: '100%', padding: '10px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '15px', marginBottom: '12px', boxSizing: 'border-box' as React.CSSProperties['boxSizing'] }}
+                  autoFocus
+                />
+                <button onClick={handleRequestOtp} disabled={otpLoading || !otpPhone.trim()}
+                  style={{ width: '100%', padding: '12px', backgroundColor: otpLoading || !otpPhone.trim() ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: otpLoading || !otpPhone.trim() ? 'not-allowed' : 'pointer', fontWeight: 700, fontSize: '15px' }}>
+                  {otpLoading ? 'Sending…' : 'Send Code via SMS'}
+                </button>
+              </>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  placeholder="6-digit code"
+                  value={otpCode}
+                  onChange={e => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  onKeyDown={e => { if (e.key === 'Enter') handleVerifyOtp(); }}
+                  style={{ width: '100%', padding: '10px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '22px', textAlign: 'center', letterSpacing: '0.3em', marginBottom: '12px', boxSizing: 'border-box' as React.CSSProperties['boxSizing'] }}
+                  maxLength={6}
+                  autoFocus
+                />
+                <button onClick={handleVerifyOtp} disabled={otpLoading || otpCode.length !== 6}
+                  style={{ width: '100%', padding: '12px', backgroundColor: otpLoading || otpCode.length !== 6 ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: otpLoading || otpCode.length !== 6 ? 'not-allowed' : 'pointer', fontWeight: 700, fontSize: '15px', marginBottom: '8px' }}>
+                  {otpLoading ? 'Verifying…' : 'Verify & Sign In'}
+                </button>
+                <button onClick={() => { setOtpStep('phone'); setOtpCode(''); setOtpError(''); }}
+                  style={{ width: '100%', padding: '10px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '14px', fontWeight: 600 }}>
+                  ← Change Number
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
 
@@ -983,6 +1152,148 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
             <button onClick={closeModal} style={{ width: '100%', marginTop: '10px', padding: '12px', fontSize: '14px', fontWeight: 600, borderRadius: '10px', border: '1px solid #e5e7eb', backgroundColor: '#fff', color: '#374151', cursor: 'pointer' }}>
               Close
             </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Account Page component (SV Phase 4) ──────────────────────────────────────
+function AccountPage({
+  tenantId, customerId, customerPhone, customerLoyalty, authToken, wishlisted,
+  onBack, onLogout, formatKoboToNaira: fmt,
+}: {
+  tenantId: string; customerId: string | null; customerPhone: string | null;
+  customerLoyalty: number; authToken: string | null; wishlisted: Set<string>;
+  onBack: () => void; onLogout: () => void; formatKoboToNaira: (n: number) => string;
+}) {
+  const [orders, setOrders] = useState<Array<{
+    id: string; total_amount: number; payment_status: string; order_status: string;
+    created_at: number; items: Array<{ name: string; quantity: number; price: number }>;
+  }>>([]);
+  const [ordersLoading, setOrdersLoading] = useState(true);
+  const [wishlistProducts, setWishlistProducts] = useState<Array<{ name: string; price: number; product_id: string }>>([]);
+  const [activeTab, setActiveTab] = useState<'orders' | 'wishlist' | 'profile'>('orders');
+
+  useEffect(() => {
+    if (!authToken) return;
+    setOrdersLoading(true);
+    fetch('/api/single-vendor/account/orders?per_page=20', {
+      headers: { 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+    })
+      .then(r => r.json() as Promise<{ success: boolean; data: { orders: typeof orders } }>)
+      .then(d => { if (d.success) setOrders(d.data.orders ?? []); })
+      .catch(() => {})
+      .finally(() => setOrdersLoading(false));
+  }, [tenantId, authToken]);
+
+  useEffect(() => {
+    if (!authToken) return;
+    fetch('/api/single-vendor/wishlist', {
+      headers: { 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+    })
+      .then(r => r.json() as Promise<{ success: boolean; data: { items: typeof wishlistProducts } }>)
+      .then(d => { if (d.success) setWishlistProducts(d.data.items ?? []); })
+      .catch(() => {});
+  }, [tenantId, authToken]);
+
+  const tabStyle = (tab: typeof activeTab): React.CSSProperties => ({
+    flex: 1, padding: '10px 0', border: 'none', backgroundColor: 'transparent',
+    borderBottom: `3px solid ${activeTab === tab ? '#16a34a' : 'transparent'}`,
+    color: activeTab === tab ? '#16a34a' : '#6b7280', fontWeight: activeTab === tab ? 700 : 500,
+    cursor: 'pointer', fontSize: '13px',
+  });
+
+  return (
+    <div style={{ padding: '16px', paddingBottom: '80px' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+        <button onClick={onBack} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '20px', padding: '4px' }}>←</button>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, fontSize: '16px' }}>My Account</div>
+          <div style={{ fontSize: '12px', color: '#6b7280' }}>{customerPhone ?? 'Guest'}</div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div style={{ fontSize: '11px', color: '#6b7280' }}>Loyalty points</div>
+          <div style={{ fontWeight: 800, color: '#16a34a', fontSize: '18px' }}>{customerLoyalty}</div>
+        </div>
+        <button onClick={onLogout} style={{ padding: '6px 10px', border: '1px solid #fecaca', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '12px', cursor: 'pointer', fontWeight: 600 }}>
+          Sign Out
+        </button>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', marginBottom: '16px' }}>
+        <button style={tabStyle('orders')} onClick={() => setActiveTab('orders')}>📦 Orders</button>
+        <button style={tabStyle('wishlist')} onClick={() => setActiveTab('wishlist')}>❤️ Wishlist</button>
+        <button style={tabStyle('profile')} onClick={() => setActiveTab('profile')}>👤 Profile</button>
+      </div>
+
+      {/* Orders tab */}
+      {activeTab === 'orders' && (
+        ordersLoading
+          ? <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>Loading orders…</div>
+          : orders.length === 0
+            ? <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>No orders yet.</div>
+            : orders.map(o => (
+                <div key={o.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', padding: '12px', marginBottom: '10px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <div style={{ fontSize: '13px', fontWeight: 700, color: '#111827' }}>{o.id.slice(0, 18)}…</div>
+                    <div style={{ fontSize: '14px', fontWeight: 800, color: '#16a34a' }}>{fmt(o.total_amount)}</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '6px' }}>
+                    <span style={{ padding: '2px 8px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, backgroundColor: o.payment_status === 'paid' ? '#dcfce7' : '#fef9c3', color: o.payment_status === 'paid' ? '#16a34a' : '#ca8a04' }}>
+                      {o.payment_status}
+                    </span>
+                    <span style={{ padding: '2px 8px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, backgroundColor: '#f3f4f6', color: '#374151' }}>
+                      {o.order_status}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#6b7280' }}>
+                    {o.items?.slice(0, 2).map(i => `${i.name} ×${i.quantity}`).join(' · ')}{o.items?.length > 2 ? ` +${o.items.length - 2} more` : ''}
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '4px' }}>
+                    {new Date(o.created_at).toLocaleDateString('en-NG', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  </div>
+                </div>
+              ))
+      )}
+
+      {/* Wishlist tab */}
+      {activeTab === 'wishlist' && (
+        wishlistProducts.length === 0
+          ? <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>
+              Your wishlist is empty. Tap ❤️ on any product to save it.
+            </div>
+          : <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              {wishlistProducts.map((item: { product_id: string; name: string; price: number }) => (
+                <div key={item.product_id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', padding: '10px', backgroundColor: '#fff' }}>
+                  <div style={{ fontSize: '28px', textAlign: 'center', marginBottom: '6px' }}>🛍️</div>
+                  <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '4px' }}>{item.name}</div>
+                  <div style={{ fontSize: '14px', fontWeight: 700, color: '#16a34a' }}>{fmt(item.price)}</div>
+                </div>
+              ))}
+            </div>
+      )}
+
+      {/* Profile tab */}
+      {activeTab === 'profile' && (
+        <div style={{ border: '1px solid #e5e7eb', borderRadius: '12px', padding: '16px' }}>
+          <div style={{ marginBottom: '12px' }}>
+            <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '2px' }}>Phone</div>
+            <div style={{ fontSize: '15px', fontWeight: 600 }}>{customerPhone ?? '—'}</div>
+          </div>
+          <div style={{ marginBottom: '12px' }}>
+            <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '2px' }}>Customer ID</div>
+            <div style={{ fontSize: '13px', fontFamily: 'monospace', color: '#374151' }}>{customerId ?? '—'}</div>
+          </div>
+          <div style={{ marginBottom: '16px' }}>
+            <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '2px' }}>Loyalty Points</div>
+            <div style={{ fontSize: '22px', fontWeight: 800, color: '#16a34a' }}>{customerLoyalty} pts</div>
+          </div>
+          <div style={{ fontSize: '11px', color: '#9ca3af', lineHeight: '1.5' }}>
+            Your data is protected under Nigeria Data Protection Regulation (NDPR). We use your phone number only for order updates and loyalty rewards.
           </div>
         </div>
       )}

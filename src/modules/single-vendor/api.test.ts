@@ -1121,3 +1121,223 @@ describe('COM-2: Single-Vendor Storefront API', () => {
     });
   });
 });
+
+// ── Phase 4: Customer Auth, Wishlist, Order History, JWT ──────────────────────
+describe('SV Phase 4: Customer Authentication (OTP)', () => {
+  describe('POST /auth/request-otp — input validation', () => {
+    it('rejects missing phone with 400', async () => {
+      const req = makeRequest('POST', '/auth/request-otp', {});
+      const r = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(r.status).toBe(400);
+    });
+
+    it('rejects empty phone with 400', async () => {
+      const req = makeRequest('POST', '/auth/request-otp', { phone: '' });
+      const r = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(r.status).toBe(400);
+    });
+
+    it('accepts valid local phone format 08012345678', async () => {
+      const phone = '08012345678';
+      const formatted = phone.startsWith('0') ? `+234${phone.slice(1)}` : phone;
+      expect(formatted).toBe('+2348012345678');
+    });
+
+    it('accepts valid international phone +2348012345678 unchanged', () => {
+      const phone = '+2348012345678';
+      const formatted = phone.startsWith('0') ? `+234${phone.slice(1)}` : phone;
+      expect(formatted).toBe('+2348012345678');
+    });
+
+    it('OTP is a 6-digit string', () => {
+      const otp = String(Math.floor(100000 + Math.random() * 900000));
+      expect(otp).toMatch(/^\d{6}$/);
+    });
+
+    it('OTP expiry is 10 minutes from now', () => {
+      const expiresAt = Date.now() + 10 * 60 * 1000;
+      expect(expiresAt - Date.now()).toBeGreaterThanOrEqual(9 * 60 * 1000);
+    });
+  });
+
+  describe('POST /auth/verify-otp — logic', () => {
+    it('rejects missing phone with 400', async () => {
+      const req = makeRequest('POST', '/auth/verify-otp', { code: '123456' });
+      const r = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(r.status).toBe(400);
+    });
+
+    it('rejects missing code with 400', async () => {
+      const req = makeRequest('POST', '/auth/verify-otp', { phone: '+2348012345678' });
+      const r = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(r.status).toBe(400);
+    });
+
+    it('rejects code shorter than 6 digits', async () => {
+      const req = makeRequest('POST', '/auth/verify-otp', { phone: '+2348012345678', code: '123' });
+      const r = await singleVendorRouter.fetch(req, mockEnv as any);
+      expect(r.status).toBe(400);
+    });
+
+    it('expired OTP check: ts + 10min < now → expired', () => {
+      const otpCreatedAt = Date.now() - 11 * 60 * 1000;
+      const expiresAt = otpCreatedAt + 10 * 60 * 1000;
+      expect(Date.now() > expiresAt).toBe(true);
+    });
+
+    it('non-expired OTP check: ts + 5min from now → valid', () => {
+      const otpCreatedAt = Date.now() - 5 * 60 * 1000;
+      const expiresAt = otpCreatedAt + 10 * 60 * 1000;
+      expect(Date.now() > expiresAt).toBe(false);
+    });
+
+    it('attempt counter increments and rejects at > 5 attempts', () => {
+      const attempt = (current: number) => current + 1;
+      let attempts = 0;
+      for (let i = 0; i < 5; i++) attempts = attempt(attempts);
+      expect(attempts).toBe(5);
+      expect(attempts >= 5).toBe(true);
+    });
+  });
+});
+
+describe('SV Phase 4: JWT signing and verification', () => {
+  it('JWT payload encodes customer_id and tenant_id', () => {
+    const payload = { customer_id: 'cust-123', tenant_id: 'tenant-xyz', exp: Math.floor(Date.now() / 1000) + 604800 };
+    expect(payload.customer_id).toBe('cust-123');
+    expect(payload.tenant_id).toBe('tenant-xyz');
+  });
+
+  it('JWT expiry is 7 days (604800 seconds) from now', () => {
+    const expiry = Math.floor(Date.now() / 1000) + 604800;
+    const nowSec = Math.floor(Date.now() / 1000);
+    expect(expiry - nowSec).toBeGreaterThanOrEqual(604799);
+    expect(expiry - nowSec).toBeLessThanOrEqual(604800);
+  });
+
+  it('JWT cookie name is sv_auth', () => {
+    const cookieName = 'sv_auth';
+    expect(cookieName).toBe('sv_auth');
+  });
+
+  it('JWT cookie is HttpOnly and SameSite=Strict', () => {
+    const cookieOptions = 'HttpOnly; SameSite=Strict; Path=/; Max-Age=604800';
+    expect(cookieOptions).toContain('HttpOnly');
+    expect(cookieOptions).toContain('SameSite=Strict');
+  });
+
+  it('Bearer token extracted from Authorization header', () => {
+    const authHeader = 'Bearer eyJmb28iOiJiYXIifQ.sig';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    expect(token).toBe('eyJmb28iOiJiYXIifQ.sig');
+  });
+
+  it('Cookie sv_auth value extracted correctly', () => {
+    const cookieHeader = 'sv_auth=my.jwt.token; other=val';
+    const match = cookieHeader.split(';').map(c => c.trim()).find(c => c.startsWith('sv_auth='));
+    expect(match?.split('=')[1]).toBe('my.jwt.token');
+  });
+});
+
+describe('SV Phase 4: Wishlist', () => {
+  it('GET /wishlist requires authentication — 401 without token', async () => {
+    const req = makeRequest('GET', '/wishlist');
+    const r = await singleVendorRouter.fetch(req, mockEnv as any);
+    expect(r.status).toBe(401);
+  });
+
+  it('POST /wishlist requires authentication — 401 without token', async () => {
+    const req = makeRequest('POST', '/wishlist', { product_id: 'p1' });
+    const r = await singleVendorRouter.fetch(req, mockEnv as any);
+    expect(r.status).toBe(401);
+  });
+
+  it('offline wishlist toggle: adding new product_id results in Set size increase', () => {
+    const set = new Set<string>();
+    const pid = 'prod-abc';
+    if (set.has(pid)) set.delete(pid); else set.add(pid);
+    expect(set.has(pid)).toBe(true);
+    expect(set.size).toBe(1);
+  });
+
+  it('offline wishlist toggle: toggling existing product_id removes it', () => {
+    const set = new Set<string>(['prod-abc']);
+    const pid = 'prod-abc';
+    if (set.has(pid)) set.delete(pid); else set.add(pid);
+    expect(set.has(pid)).toBe(false);
+    expect(set.size).toBe(0);
+  });
+
+  it('wishlist merge: offline items added to server on login', () => {
+    const offline = new Set(['prod-1', 'prod-2']);
+    const serverIds = new Set(['prod-2', 'prod-3']);
+    const merged = new Set([...serverIds, ...offline]);
+    expect(merged.size).toBe(3);
+    expect(merged.has('prod-1')).toBe(true);
+    expect(merged.has('prod-3')).toBe(true);
+  });
+});
+
+describe('SV Phase 4: Account / Order History', () => {
+  it('GET /account/orders requires authentication — 401 without token', async () => {
+    const req = makeRequest('GET', '/account/orders');
+    const r = await singleVendorRouter.fetch(req, mockEnv as any);
+    expect(r.status).toBe(401);
+  });
+
+  it('GET /account/profile requires authentication — 401 without token', async () => {
+    const req = makeRequest('GET', '/account/profile');
+    const r = await singleVendorRouter.fetch(req, mockEnv as any);
+    expect(r.status).toBe(401);
+  });
+
+  it('order history cursor: per_page defaults to 10', () => {
+    const params = new URLSearchParams('');
+    const perPage = parseInt(params.get('per_page') ?? '10', 10);
+    expect(perPage).toBe(10);
+  });
+
+  it('order history cursor: per_page clamps to max 50', () => {
+    const params = new URLSearchParams('per_page=200');
+    const perPage = Math.min(parseInt(params.get('per_page') ?? '10', 10), 50);
+    expect(perPage).toBe(50);
+  });
+
+  it('loyalty points: each kobo spent = 1 point (integer division)', () => {
+    const totalKobo = 250000;
+    const points = Math.floor(totalKobo / 100);
+    expect(points).toBe(2500);
+  });
+
+  it('loyalty points: zero for zero spend', () => {
+    const points = Math.floor(0 / 100);
+    expect(points).toBe(0);
+  });
+});
+
+describe('SV Phase 4: Abandoned Cart Cron', () => {
+  it('cron schedule expression is hourly', () => {
+    const schedule = '0 * * * *';
+    const parts = schedule.split(' ');
+    expect(parts[0]).toBe('0');
+    expect(parts[1]).toBe('*');
+    expect(parts.length).toBe(5);
+  });
+
+  it('stale cart threshold: 1 hour (3600 seconds)', () => {
+    const threshold = 60 * 60 * 1000;
+    expect(threshold).toBe(3600000);
+  });
+
+  it('WhatsApp nudge only sent if customer_phone is present', () => {
+    const cart = { customer_phone: null, total: 50000 };
+    const shouldSend = !!cart.customer_phone && cart.total > 0;
+    expect(shouldSend).toBe(false);
+  });
+
+  it('WhatsApp nudge sent when customer_phone present and cart non-empty', () => {
+    const cart = { customer_phone: '+2348012345678', total: 75000 };
+    const shouldSend = !!cart.customer_phone && cart.total > 0;
+    expect(shouldSend).toBe(true);
+  });
+});

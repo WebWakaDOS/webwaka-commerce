@@ -418,6 +418,234 @@ app.get('/customers', async (c) => {
   }
 });
 
+// ── POST /auth/request-otp — Send 6-digit OTP via Termii (NDPR: phone only) ──
+app.post('/auth/request-otp', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const body = await c.req.json<{ phone: string }>();
+
+  const phone = body.phone?.trim();
+  if (!phone) return c.json({ success: false, error: 'phone is required' }, 400);
+  if (!/^\+234[0-9]{10}$/.test(phone) && !/^0[0-9]{10}$/.test(phone)) {
+    return c.json({ success: false, error: 'Invalid Nigerian phone number. Use E.164 (+234...) or local (0...)' }, 400);
+  }
+
+  const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+  const otpCode = String(Math.floor(Math.random() * 900000) + 100000);
+  const otpHash = await hashOtp(otpCode);
+  const now = Date.now();
+  const expiresAt = now + 10 * 60 * 1000; // 10 minutes
+  const otpId = `otp_${now}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
+    ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
+
+    const termiiApiKey = c.env.TERMII_API_KEY ?? '';
+    if (termiiApiKey) {
+      await fetch('https://api.ng.termii.com/api/sms/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: termiiApiKey,
+          to: e164,
+          from: 'WebWaka',
+          sms: `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
+          type: 'plain',
+          channel: 'dnd',
+        }),
+      });
+    }
+
+    return c.json({ success: true, data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 } });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ── POST /auth/verify-otp — Verify OTP → JWT cookie (SV-AUTH) ────────────────
+app.post('/auth/verify-otp', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const body = await c.req.json<{ phone: string; otp: string; cart_token?: string }>();
+
+  const phone = body.phone?.trim();
+  const otp = body.otp?.trim();
+  if (!phone || !otp) return c.json({ success: false, error: 'phone and otp are required' }, 400);
+  if (!/^\d{6}$/.test(otp)) return c.json({ success: false, error: 'OTP must be 6 digits' }, 400);
+
+  const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+
+  try {
+    interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
+    const otpRow = await c.env.DB.prepare(
+      `SELECT id, otp_hash, is_used, attempts, expires_at
+       FROM customer_otps
+       WHERE tenant_id = ? AND phone = ? AND is_used = 0
+       ORDER BY created_at DESC LIMIT 1`
+    ).bind(tenantId, e164).first<OtpRow>();
+
+    if (!otpRow) return c.json({ success: false, error: 'OTP not found or already used' }, 401);
+    if (otpRow.expires_at < Date.now()) return c.json({ success: false, error: 'OTP has expired. Request a new one.' }, 401);
+    if (otpRow.attempts >= 5) return c.json({ success: false, error: 'Too many failed attempts. Request a new OTP.' }, 429);
+
+    const inputHash = await hashOtp(otp);
+    if (inputHash !== otpRow.otp_hash) {
+      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      return c.json({ success: false, error: 'Incorrect OTP' }, 401);
+    }
+
+    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+
+    const now = Date.now();
+    const customerId = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+
+    interface CustomerRow { id: string; loyalty_points: number }
+    let customer = await c.env.DB.prepare(
+      'SELECT id, loyalty_points FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+    ).bind(tenantId, e164).first<CustomerRow>();
+
+    if (!customer) {
+      await c.env.DB.prepare(
+        `INSERT INTO customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`
+      ).bind(customerId, tenantId, e164, e164, now, now, now).run();
+      customer = { id: customerId, loyalty_points: 0 };
+    }
+
+    const token = await signJwt(
+      { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
+      c.env.JWT_SECRET ?? 'dev-secret-change-me'
+    );
+
+    c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
+
+    return c.json({
+      success: true,
+      data: { token, customer_id: customer.id, phone: e164, loyalty_points: customer.loyalty_points },
+    });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ── GET /wishlist — Customer's wishlist (auth required) ───────────────────────
+app.get('/wishlist', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const customer = await authenticateCustomer(c);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT w.id, w.product_id, w.added_at,
+              p.name, p.price, p.image_url, p.category, p.quantity, p.is_active
+       FROM wishlists w
+       LEFT JOIN products p ON p.id = w.product_id AND p.tenant_id = w.tenant_id
+       WHERE w.tenant_id = ? AND w.customer_id = ?
+       ORDER BY w.added_at DESC`
+    ).bind(tenantId, customer.customerId).all();
+    return c.json({ success: true, data: { items: results, count: results.length } });
+  } catch {
+    return c.json({ success: true, data: { items: [], count: 0 } });
+  }
+});
+
+// ── POST /wishlist — Add or remove product (toggles) ─────────────────────────
+app.post('/wishlist', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const customer = await authenticateCustomer(c);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const body = await c.req.json<{ product_id: string }>();
+  if (!body.product_id) return c.json({ success: false, error: 'product_id is required' }, 400);
+
+  try {
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM wishlists WHERE tenant_id = ? AND customer_id = ? AND product_id = ?'
+    ).bind(tenantId, customer.customerId, body.product_id).first<{ id: string }>();
+
+    const now = Date.now();
+    if (existing) {
+      await c.env.DB.prepare('DELETE FROM wishlists WHERE id = ?').bind(existing.id).run();
+      return c.json({ success: true, data: { action: 'removed', product_id: body.product_id } });
+    } else {
+      const wlId = `wl_${now}_${Math.random().toString(36).slice(2, 8)}`;
+      await c.env.DB.prepare(
+        'INSERT INTO wishlists (id, tenant_id, customer_id, product_id, added_at) VALUES (?, ?, ?, ?, ?)'
+      ).bind(wlId, tenantId, customer.customerId, body.product_id, now).run();
+      return c.json({ success: true, data: { action: 'added', product_id: body.product_id } }, 201);
+    }
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ── GET /account/orders — Customer's own orders, paginated ───────────────────
+app.get('/account/orders', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const customer = await authenticateCustomer(c);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const after = c.req.query('after');
+  const perPage = Math.min(Number(c.req.query('per_page') ?? 20), 50);
+
+  try {
+    const params: (string | number)[] = [tenantId, customer.phone];
+    let query =
+      `SELECT id, subtotal, discount_kobo, vat_kobo, total_amount, payment_status,
+              order_status, payment_method, items_json, delivery_address_json,
+              promo_code, created_at
+       FROM orders
+       WHERE tenant_id = ? AND customer_phone = ?
+         AND channel = 'storefront' AND deleted_at IS NULL`;
+
+    if (after) { query += ' AND id < ?'; params.push(after); }
+    query += ' ORDER BY created_at DESC';
+    query += ` LIMIT ${perPage + 1}`;
+
+    const { results } = await c.env.DB.prepare(query).bind(...params).all<{
+      id: string; subtotal: number; discount_kobo: number; vat_kobo: number;
+      total_amount: number; payment_status: string; order_status: string;
+      payment_method: string; items_json: string; delivery_address_json: string | null;
+      promo_code: string | null; created_at: number;
+    }>();
+
+    const hasMore = results.length > perPage;
+    const orders = (hasMore ? results.slice(0, perPage) : results).map(o => ({
+      ...o,
+      items: (() => { try { return JSON.parse(o.items_json ?? '[]'); } catch { return []; } })(),
+      delivery_address: (() => { try { return o.delivery_address_json ? JSON.parse(o.delivery_address_json) : null; } catch { return null; } })(),
+      items_json: undefined,
+      delivery_address_json: undefined,
+    }));
+
+    const nextCursor = hasMore ? orders[orders.length - 1]?.id ?? null : null;
+
+    return c.json({ success: true, data: { orders, next_cursor: nextCursor, has_more: hasMore } });
+  } catch {
+    return c.json({ success: true, data: { orders: [], next_cursor: null, has_more: false } });
+  }
+});
+
+// ── GET /account/profile — Customer loyalty points + profile ─────────────────
+app.get('/account/profile', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const customer = await authenticateCustomer(c);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  try {
+    interface CustomerRow { id: string; name: string | null; phone: string; loyalty_points: number; total_spend: number; created_at: number }
+    const profile = await c.env.DB.prepare(
+      'SELECT id, name, phone, loyalty_points, total_spend, created_at FROM customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
+    ).bind(customer.customerId, tenantId).first<CustomerRow>();
+
+    if (!profile) return c.json({ success: false, error: 'Customer not found' }, 404);
+    return c.json({ success: true, data: profile });
+  } catch {
+    return c.json({ success: false, error: 'Profile not found' }, 404);
+  }
+});
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 export function computeDiscount(discountType: string, discountValue: number, subtotalKobo: number): number {
   if (discountType === 'flat') return Math.min(discountValue, subtotalKobo);
@@ -428,6 +656,69 @@ export function computeDiscount(discountType: string, discountValue: number, sub
 /** Sanitise FTS5 query — escape special chars, trim */
 function sanitizeFts(q: string): string {
   return q.trim().replace(/['"*^]/g, ' ').replace(/\s+/g, ' ') + '*';
+}
+
+/** SHA-256 hash of OTP code (hex) using Web Crypto API */
+async function hashOtp(otp: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(otp));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Minimal HS256 JWT sign using Web Crypto */
+async function signJwt(payload: Record<string, unknown>, secret: string): Promise<string> {
+  const enc = (obj: object) =>
+    btoa(JSON.stringify(obj)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const header = enc({ alg: 'HS256', typ: 'JWT' });
+  const body = enc(payload);
+  const data = `${header}.${body}`;
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)))
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  return `${data}.${sig}`;
+}
+
+/** Verify HS256 JWT and return claims, or null if invalid/expired */
+export async function verifyJwt(token: string, secret: string): Promise<Record<string, unknown> | null> {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [header, payloadB64, sigB64] = parts as [string, string, string];
+  try {
+    const data = `${header}.${payloadB64}`;
+    const key = await crypto.subtle.importKey(
+      'raw', new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
+    );
+    const sigBuf = Uint8Array.from(atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('HMAC', key, sigBuf, new TextEncoder().encode(data));
+    if (!valid) return null;
+    const claims = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
+    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null;
+    return claims;
+  } catch { return null; }
+}
+
+/** Extract and verify customer from Authorization Bearer or sv_auth cookie */
+async function authenticateCustomer(c: { req: { header: (h: string) => string | undefined }; env: { JWT_SECRET?: string } }): Promise<{ customerId: string; phone: string } | null> {
+  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const auth = c.req.header('Authorization');
+  let token: string | null = null;
+
+  if (auth?.startsWith('Bearer ')) {
+    token = auth.slice(7);
+  } else {
+    const cookie = c.req.header('Cookie');
+    const match = cookie?.match(/sv_auth=([^;]+)/);
+    if (match) token = match[1]!;
+  }
+
+  if (!token) return null;
+  const claims = await verifyJwt(token, c.env.JWT_SECRET ?? 'dev-secret-change-me');
+  if (!claims || claims.tenant !== tenantId) return null;
+  return { customerId: String(claims.sub), phone: String(claims.phone) };
 }
 
 export { app as singleVendorRouter };
