@@ -6,6 +6,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { getTranslations, getSupportedLanguages, getLanguageName, formatKoboToNaira, type Language } from './core/i18n';
 import { getCommerceDB, queueMutation, getPendingMutations } from './core/offline/db';
+import { useStorefrontCart } from './modules/single-vendor/useStorefrontCart';
 
 // ============================================================
 // TYPES
@@ -353,52 +354,78 @@ function POSModule({ tenantId, t, isOnline }: { tenantId: string; t: ReturnType<
   );
 }
 
-// Single-Vendor Storefront Module (COM-2)
+// Single-Vendor Storefront Module (COM-2) — SV Phase 1: real API + Dexie cart
 function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
-  const [cart, setCart] = useState<CartItem[]>([]);
+  const { cart, addToCart, clearCart, total, itemCount, token } = useStorefrontCart(tenantId);
   const [step, setStep] = useState<'catalog' | 'checkout' | 'success'>('catalog');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [ndprConsent, setNdprConsent] = useState(false);
   const [orderRef, setOrderRef] = useState('');
+  const [checkoutError, setCheckoutError] = useState('');
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
 
-  const products: Product[] = [
-    { id: 'sv_1', sku: 'SV-001', name: 'Ankara Fabric (6 yards)', price: 1500000, quantity: 20 },
-    { id: 'sv_2', sku: 'SV-002', name: 'Adire Tie-Dye Shirt', price: 450000, quantity: 15 },
-    { id: 'sv_3', sku: 'SV-003', name: 'Kente Headwrap', price: 250000, quantity: 30 },
-    { id: 'sv_4', sku: 'SV-004', name: 'Leather Sandals', price: 800000, quantity: 10 },
-  ];
+  // ── Real catalog from API ──────────────────────────────────────────────────
+  const [products, setProducts] = useState<Product[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [catalogError, setCatalogError] = useState('');
 
-  const addToCart = (p: Product) => {
-    setCart(prev => {
-      const ex = prev.find(i => i.id === p.id);
-      if (ex) return prev.map(i => i.id === p.id ? { ...i, cartQuantity: i.cartQuantity + 1 } : i);
-      return [...prev, { ...p, cartQuantity: 1 }];
-    });
+  useEffect(() => {
+    if (!tenantId) return;
+    setCatalogLoading(true);
+    setCatalogError('');
+    fetch(`/api/single-vendor/catalog?tenant_id=${encodeURIComponent(tenantId)}`, {
+      headers: { 'x-tenant-id': tenantId },
+    })
+      .then(r => r.json() as Promise<{ success: boolean; data: { products: Product[] } }>)
+      .then(d => {
+        if (d.success) setProducts(d.data.products ?? []);
+        else setCatalogError('Failed to load products');
+      })
+      .catch(() => setCatalogError('Network error. Check your connection.'))
+      .finally(() => setCatalogLoading(false));
+  }, [tenantId]);
+
+  const handleAddToCart = (p: Product) => {
+    const existing = cart.find(i => i.id === p.id);
+    const cartQty = (existing?.cartQuantity ?? 0) + 1;
+    if (cartQty > p.quantity) return; // client-side stock guard
+    addToCart({ id: p.id, name: p.name, price: p.price, quantity: p.quantity, imageEmoji: '🛍️' });
   };
-
-  const total = cart.reduce((s, i) => s + i.price * i.cartQuantity, 0);
 
   const handleCheckout = async () => {
     if (!ndprConsent) return;
+    if (!email && !phone) {
+      setCheckoutError('Please enter your email or phone number');
+      return;
+    }
+    setCheckoutLoading(true);
+    setCheckoutError('');
     try {
       const res = await fetch('/api/single-vendor/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
         body: JSON.stringify({
           items: cart.map(i => ({ product_id: i.id, name: i.name, price: i.price, quantity: i.cartQuantity })),
-          customer_email: email, customer_phone: phone,
-          payment_method: 'paystack', ndpr_consent: true,
+          customer_email: email || undefined,
+          customer_phone: phone || undefined,
+          payment_method: 'paystack',
+          ndpr_consent: true,
+          session_token: token,
         }),
       });
-      const data = await res.json() as any;
+      const data = await res.json() as { success: boolean; data?: { payment_reference?: string }; error?: string };
+      if (!res.ok || !data.success) {
+        setCheckoutError(data.error ?? 'Checkout failed. Please try again.');
+        return;
+      }
       setOrderRef(data.data?.payment_reference ?? `ord_${Date.now()}`);
+      await clearCart();
       setStep('success');
-      setCart([]);
     } catch {
-      setOrderRef(`ord_offline_${Date.now()}`);
-      setStep('success');
-      setCart([]);
+      setCheckoutError('Network error. Please try again.');
+    } finally {
+      setCheckoutLoading(false);
     }
   };
 
@@ -409,10 +436,10 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
         <h2 style={{ color: '#16a34a' }}>{t.storefront_order_placed}</h2>
         <p style={{ color: '#6b7280' }}>Ref: {orderRef}</p>
         <button
-          onClick={() => setStep('catalog')}
+          onClick={() => { setStep('catalog'); setOrderRef(''); }}
           style={{ marginTop: '16px', padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
         >
-          {t.common_cancel}
+          Continue Shopping
         </button>
       </div>
     );
@@ -422,14 +449,19 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     return (
       <div style={{ padding: '16px', maxWidth: '480px', margin: '0 auto' }}>
         <h2 style={{ marginBottom: '16px' }}>{t.storefront_checkout}</h2>
+        {checkoutError && (
+          <div style={{ padding: '10px 14px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '6px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>
+            {checkoutError}
+          </div>
+        )}
         <div style={{ marginBottom: '12px' }}>
           <label style={{ display: 'block', fontSize: '13px', marginBottom: '4px' }}>{t.storefront_email}</label>
-          <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+          <input type="email" value={email} onChange={e => { setEmail(e.target.value); setCheckoutError(''); }}
             style={{ width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', boxSizing: 'border-box' }} />
         </div>
         <div style={{ marginBottom: '12px' }}>
           <label style={{ display: 'block', fontSize: '13px', marginBottom: '4px' }}>{t.storefront_phone}</label>
-          <input type="tel" value={phone} onChange={e => setPhone(e.target.value)}
+          <input type="tel" value={phone} onChange={e => { setPhone(e.target.value); setCheckoutError(''); }}
             style={{ width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', boxSizing: 'border-box' }} />
         </div>
         <div style={{ marginBottom: '16px', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
@@ -446,10 +478,10 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
             </button>
             <button
               onClick={handleCheckout}
-              disabled={!ndprConsent || !email}
-              style={{ padding: '10px 20px', backgroundColor: ndprConsent && email ? '#16a34a' : '#d1d5db', color: '#fff', border: 'none', borderRadius: '6px', cursor: ndprConsent && email ? 'pointer' : 'not-allowed', fontWeight: 600 }}
+              disabled={!ndprConsent || checkoutLoading}
+              style={{ padding: '10px 20px', backgroundColor: ndprConsent && !checkoutLoading ? '#16a34a' : '#d1d5db', color: '#fff', border: 'none', borderRadius: '6px', cursor: ndprConsent && !checkoutLoading ? 'pointer' : 'not-allowed', fontWeight: 600 }}
             >
-              {t.storefront_checkout}
+              {checkoutLoading ? 'Processing…' : t.storefront_checkout}
             </button>
           </div>
         </div>
@@ -457,27 +489,54 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     );
   }
 
+  // ── Catalog view ──────────────────────────────────────────────────────────
   return (
     <div style={{ padding: '12px' }}>
+      {catalogLoading && (
+        <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>Loading products…</div>
+      )}
+      {catalogError && !catalogLoading && (
+        <div style={{ padding: '12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', marginBottom: '12px' }}>
+          {catalogError}
+        </div>
+      )}
+      {!catalogLoading && products.length === 0 && !catalogError && (
+        <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>No products available.</div>
+      )}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '12px', marginBottom: '80px' }}>
-        {products.map(p => (
-          <div key={p.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff' }}>
-            <div style={{ backgroundColor: '#f0fdf4', height: '100px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '32px' }}>
-              👗
+        {products.map(p => {
+          const cartEntry = cart.find(i => i.id === p.id);
+          const cartQty = cartEntry?.cartQuantity ?? 0;
+          const outOfStock = p.quantity === 0;
+          return (
+            <div key={p.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff' }}>
+              <div style={{ backgroundColor: '#f0fdf4', height: '100px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '32px' }}>
+                🛍️
+              </div>
+              <div style={{ padding: '10px' }}>
+                <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px' }}>{p.name}</div>
+                <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginBottom: '4px' }}>{formatKoboToNaira(p.price)}</div>
+                <div style={{ fontSize: '11px', color: outOfStock ? '#dc2626' : '#6b7280', marginBottom: '8px' }}>
+                  {outOfStock ? 'Out of stock' : `${p.quantity} in stock`}
+                </div>
+                {cartQty > 0 && (
+                  <div style={{ fontSize: '12px', color: '#16a34a', fontWeight: 600, marginBottom: '4px' }}>In cart: {cartQty}</div>
+                )}
+                <button
+                  onClick={() => handleAddToCart(p)}
+                  disabled={outOfStock || cartQty >= p.quantity}
+                  style={{ width: '100%', padding: '6px', backgroundColor: outOfStock || cartQty >= p.quantity ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: outOfStock || cartQty >= p.quantity ? 'not-allowed' : 'pointer', fontSize: '12px', fontWeight: 600 }}
+                >
+                  {t.storefront_add_to_cart}
+                </button>
+              </div>
             </div>
-            <div style={{ padding: '10px' }}>
-              <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px' }}>{p.name}</div>
-              <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginBottom: '8px' }}>{formatKoboToNaira(p.price)}</div>
-              <button onClick={() => addToCart(p)} style={{ width: '100%', padding: '6px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '12px', fontWeight: 600 }}>
-                {t.storefront_add_to_cart}
-              </button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
-      {cart.length > 0 && (
+      {itemCount > 0 && (
         <div style={{ position: 'fixed', bottom: '60px', left: 0, right: 0, backgroundColor: '#fff', borderTop: '2px solid #16a34a', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ fontSize: '14px' }}>{cart.length} items • {formatKoboToNaira(total)}</span>
+          <span style={{ fontSize: '14px' }}>{itemCount} items • {formatKoboToNaira(total)}</span>
           <button onClick={() => setStep('checkout')} style={{ padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600 }}>
             {t.storefront_checkout}
           </button>
