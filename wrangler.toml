@@ -6,10 +6,16 @@ compatibility_date = "2024-03-14"
 [env.staging]
 name = "webwaka-commerce-api-staging"
 workers_dev = true
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+# JWT_SECRET must be set via: wrangler secret put JWT_SECRET --env staging
+
 kv_namespaces = [
   { binding = "TENANT_CONFIG", id = "018ac3a580104b8b8868712919be71bd" },
   { binding = "EVENTS", id = "ee8c49024b2d43a98c54962dba43f15b" },
-  { binding = "SESSIONS_KV", id = "bde8befc71da40c5a5979ee35830022a" }
+  { binding = "SESSIONS_KV", id = "bde8befc71da40c5a5979ee35830022a" },
+  { binding = "RATE_LIMIT_KV", id = "REPLACE_WITH_STAGING_RATE_LIMIT_KV_ID" }
 ]
 [[env.staging.d1_databases]]
 binding = "DB"
@@ -20,10 +26,16 @@ database_id = "f39bc175-4485-482a-ae87-b1195ead0ef3"
 [env.production]
 name = "webwaka-commerce-api-prod"
 workers_dev = true
+
+[env.production.vars]
+ENVIRONMENT = "production"
+# JWT_SECRET must be set via: wrangler secret put JWT_SECRET --env production
+
 kv_namespaces = [
   { binding = "TENANT_CONFIG", id = "e9a8b3178cf245a7815f4e5bf7e67299" },
   { binding = "EVENTS", id = "4e0bd5d5233f47dbaff75f8b10b89a8d" },
-  { binding = "SESSIONS_KV", id = "f176cebbdf8445838c72d9fde0173628" }
+  { binding = "SESSIONS_KV", id = "f176cebbdf8445838c72d9fde0173628" },
+  { binding = "RATE_LIMIT_KV", id = "REPLACE_WITH_PROD_RATE_LIMIT_KV_ID" }
 ]
 [[env.production.d1_databases]]
 binding = "DB"
