@@ -281,20 +281,88 @@ app.get('/products/barcode/:code', async (c) => {
     let variants: unknown[] = [];
     if (product.has_variants) {
       const { results } = await c.env.DB.prepare(
-        `SELECT id, sku, name, price, quantity, attributes_json
-         FROM product_variants WHERE product_id = ? AND deleted_at IS NULL`,
+        `SELECT id, sku, option_name, option_value, price_delta, quantity
+         FROM product_variants
+         WHERE product_id = ? AND is_active = 1 AND deleted_at IS NULL
+         ORDER BY option_name ASC, option_value ASC`,
       )
         .bind(product.id)
         .all();
-      variants = results.map((v) => ({
-        ...v,
-        attributes: v.attributes_json ? JSON.parse(v.attributes_json as string) : {},
-      }));
+      variants = results;
     }
 
     return c.json({ success: true, data: { ...product, variants } });
   } catch {
     return c.json({ success: false, error: 'Product not found' }, 404);
+  }
+});
+
+// GET /api/pos/products/:id/variants — Variant list for picker modal
+app.get('/products/:id/variants', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, sku, option_name, option_value, price_delta, quantity
+       FROM product_variants
+       WHERE product_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
+       ORDER BY option_name ASC, option_value ASC`,
+    ).bind(productId, tenantId).all();
+    return c.json({ success: true, data: { variants: results } });
+  } catch {
+    return c.json({ success: true, data: { variants: [] } });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CUSTOMERS — Loyalty lookup + inline registration
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/pos/customers/lookup?phone= — Loyalty lookup by phone
+app.get('/customers/lookup', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const phone = c.req.query('phone')?.trim();
+  if (!phone) return c.json({ success: false, error: 'phone query param is required' }, 400);
+  try {
+    const customer = await c.env.DB.prepare(
+      'SELECT id, name, phone, loyalty_points, total_spend FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+    ).bind(tenantId, phone).first<{ id: string; name: string | null; phone: string; loyalty_points: number; total_spend: number }>();
+    if (!customer) return c.json({ success: false, error: 'Customer not found' }, 404);
+    return c.json({
+      success: true,
+      data: {
+        id: customer.id,
+        name: customer.name ?? customer.phone,
+        phone: customer.phone,
+        loyalty_points: customer.loyalty_points ?? 0,
+        total_spend: customer.total_spend ?? 0,
+      },
+    });
+  } catch {
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
+  }
+});
+
+// POST /api/pos/customers — Create customer inline at POS
+app.post('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{ name: string; phone: string; email?: string }>();
+  if (!body.phone?.trim() || !body.name?.trim()) {
+    return c.json({ success: false, error: 'name and phone are required' }, 400);
+  }
+  const now = Date.now();
+  const id = `cust_pos_${now}_${crypto.randomUUID().slice(0, 8)}`;
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO customers (id, tenant_id, name, phone, email, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
+    ).bind(id, tenantId, body.name.trim(), body.phone.trim(), body.email ?? null, now, now, now).run();
+    return c.json({
+      success: true,
+      data: { id, name: body.name.trim(), phone: body.phone.trim(), loyalty_points: 0, total_spend: 0 },
+    }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
   }
 });
 
@@ -577,7 +645,18 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       }
     }
 
-    // Step 8 — Return receipt
+    // Step 8 — Award loyalty points if customer phone provided (non-blocking)
+    // Rate: 1 point per ₦100 spent (10,000 kobo = 1 point)
+    const loyaltyEarned = Math.floor(total / 10000);
+    if (body.customer_phone && loyaltyEarned > 0) {
+      c.env.DB.prepare(
+        `UPDATE customers
+         SET loyalty_points = loyalty_points + ?, total_spend = total_spend + ?, updated_at = ?
+         WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL`,
+      ).bind(loyaltyEarned, total, now, tenantId, body.customer_phone).run().catch(() => {});
+    }
+
+    // Step 9 — Return receipt
     const payRef = resolvedPayments.find((p) => p.reference)?.reference;
     return c.json(
       {
@@ -590,6 +669,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
           payment_method: primaryMethod,
           payments: resolvedPayments,
           ...(payRef ? { payment_reference: payRef } : {}),
+          loyalty_earned: loyaltyEarned,
         },
       },
       201,

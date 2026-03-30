@@ -151,6 +151,25 @@ app.get('/catalog', async (c) => {
   }
 });
 
+// ── GET /products/by-slug/:slug — Product detail by URL slug ─────────────────
+// Must be BEFORE /products/:id/variants to avoid :id capturing "by-slug"
+app.get('/products/by-slug/:slug', async (c) => {
+  const tenantId = getTenantId(c);
+  const slug = c.req.param('slug');
+  try {
+    const product = await c.env.DB.prepare(
+      `SELECT id, name, description, price, quantity, category, image_url, sku,
+              has_variants, slug
+       FROM products
+       WHERE tenant_id = ? AND slug = ? AND is_active = 1 AND deleted_at IS NULL`,
+    ).bind(tenantId, slug).first();
+    if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+    return c.json({ success: true, data: product });
+  } catch {
+    return c.json({ success: false, error: 'Product not found' }, 404);
+  }
+});
+
 // ── GET /products/:id/variants — Product variants (VAR-1) ────────────────────
 app.get('/products/:id/variants', async (c) => {
   const tenantId = getTenantId(c);
@@ -381,6 +400,47 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     }, 201);
   } catch (e) {
     return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ── GET /orders/:id/track — Public order tracking (no customer auth required) ─
+// Must be BEFORE /orders/:id to prevent ":id" from matching the track path
+app.get('/orders/:id/track', async (c) => {
+  const tenantId = getTenantId(c);
+  const orderId = c.req.param('id');
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id, order_status, payment_status, created_at, updated_at
+       FROM orders
+       WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
+    ).bind(orderId, tenantId).first<{
+      id: string; order_status: string; payment_status: string;
+      created_at: number; updated_at: number;
+    }>();
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    const STATUS_SEQUENCE = ['confirmed', 'processing', 'shipped', 'delivered'];
+    const currentIdx = STATUS_SEQUENCE.indexOf(order.order_status);
+    const timeline = STATUS_SEQUENCE.map((status, i) => ({
+      status,
+      label: status.charAt(0).toUpperCase() + status.slice(1),
+      completed: currentIdx === -1 ? false : i <= currentIdx,
+      current: i === currentIdx,
+    }));
+
+    return c.json({
+      success: true,
+      data: {
+        id: order.id,
+        order_status: order.order_status,
+        payment_status: order.payment_status,
+        timeline,
+        placed_at: order.created_at,
+        updated_at: order.updated_at,
+      },
+    });
+  } catch {
+    return c.json({ success: false, error: 'Order not found' }, 404);
   }
 });
 
@@ -737,6 +797,173 @@ app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
     });
   } catch (err) {
     return c.json({ success: false, error: String(err) }, 500);
+  }
+});
+
+// ── GET /delivery-zones — Public delivery zone list for SV tenant ─────────────
+app.get('/delivery-zones', async (c) => {
+  const tenantId = getTenantId(c);
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, state, lga, fee_kobo, estimated_days_min, estimated_days_max
+       FROM delivery_zones
+       WHERE tenant_id = ? AND is_active = 1 AND (vendor_id IS NULL OR vendor_id = '')
+       ORDER BY state ASC, lga ASC`,
+    ).bind(tenantId).all();
+    return c.json({ success: true, data: { zones: results } });
+  } catch {
+    return c.json({ success: true, data: { zones: [] } });
+  }
+});
+
+// ── POST /delivery-zones — Admin: create or update a delivery zone ─────────────
+app.post('/delivery-zones', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    state: string; lga?: string; fee_kobo: number;
+    estimated_days_min?: number; estimated_days_max?: number; is_active?: boolean;
+  }>();
+  if (!body.state?.trim() || body.fee_kobo == null) {
+    return c.json({ success: false, error: 'state and fee_kobo are required' }, 400);
+  }
+  const now = Date.now();
+  const id = `zone_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO delivery_zones (id, tenant_id, state, lga, fee_kobo, estimated_days_min, estimated_days_max, is_active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id, tenantId, body.state.trim(), body.lga?.trim() ?? null,
+      body.fee_kobo, body.estimated_days_min ?? 1, body.estimated_days_max ?? 7,
+      body.is_active !== false ? 1 : 0, now, now,
+    ).run();
+    return c.json({
+      success: true,
+      data: { id, state: body.state, lga: body.lga ?? null, fee_kobo: body.fee_kobo },
+    }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ── GET /shipping/estimate?state=&lga= — Shipping fee for address ──────────────
+app.get('/shipping/estimate', async (c) => {
+  const tenantId = getTenantId(c);
+  const state = c.req.query('state')?.trim();
+  const lga = c.req.query('lga')?.trim();
+  if (!state) return c.json({ success: false, error: 'state is required' }, 400);
+  try {
+    type ZoneRow = { fee_kobo: number; estimated_days_min: number; estimated_days_max: number };
+    let zone: ZoneRow | null = null;
+    // Try LGA-specific first
+    if (lga) {
+      zone = await c.env.DB.prepare(
+        `SELECT fee_kobo, estimated_days_min, estimated_days_max
+         FROM delivery_zones
+         WHERE tenant_id = ? AND state = ? AND lga = ? AND is_active = 1
+           AND (vendor_id IS NULL OR vendor_id = '') LIMIT 1`,
+      ).bind(tenantId, state, lga).first<ZoneRow>();
+    }
+    // Fall back to state-level
+    if (!zone) {
+      zone = await c.env.DB.prepare(
+        `SELECT fee_kobo, estimated_days_min, estimated_days_max
+         FROM delivery_zones
+         WHERE tenant_id = ? AND state = ? AND (lga IS NULL OR lga = '') AND is_active = 1
+           AND (vendor_id IS NULL OR vendor_id = '') LIMIT 1`,
+      ).bind(tenantId, state).first<ZoneRow>();
+    }
+    return c.json({
+      success: true,
+      data: {
+        state, lga: lga ?? null,
+        fee_kobo: zone?.fee_kobo ?? 0,
+        estimated_days_min: zone?.estimated_days_min ?? 1,
+        estimated_days_max: zone?.estimated_days_max ?? 7,
+        is_estimate: true,
+      },
+    });
+  } catch {
+    return c.json({
+      success: true,
+      data: { state, lga: lga ?? null, fee_kobo: 0, estimated_days_min: 1, estimated_days_max: 7, is_estimate: true },
+    });
+  }
+});
+
+// ── GET /products/:id/reviews — Public product reviews ────────────────────────
+app.get('/products/:id/reviews', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, rating, review_text, verified_purchase, customer_phone, created_at
+       FROM product_reviews
+       WHERE product_id = ? AND tenant_id = ? AND deleted_at IS NULL
+       ORDER BY created_at DESC LIMIT 50`,
+    ).bind(productId, tenantId).all<{
+      id: string; rating: number; review_text: string | null;
+      verified_purchase: number; customer_phone: string | null; created_at: number;
+    }>();
+    const avgRating = results.length > 0
+      ? Math.round((results.reduce((s, r) => s + r.rating, 0) / results.length) * 10) / 10
+      : 0;
+    return c.json({
+      success: true,
+      data: {
+        reviews: results.map(r => ({
+          ...r,
+          // Privacy: mask phone — show first 4 + last 3 digits
+          customer_phone: r.customer_phone
+            ? r.customer_phone.slice(0, 4) + '****' + r.customer_phone.slice(-3)
+            : null,
+        })),
+        count: results.length,
+        avg_rating: avgRating,
+      },
+    });
+  } catch {
+    return c.json({ success: true, data: { reviews: [], count: 0, avg_rating: 0 } });
+  }
+});
+
+// ── POST /products/:id/reviews — Authenticated customer submits review ─────────
+app.post('/products/:id/reviews', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const customer = await authenticateCustomer(c as Parameters<typeof authenticateCustomer>[0]);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const body = await c.req.json<{ rating: number; review_text?: string }>();
+  if (!body.rating || body.rating < 1 || body.rating > 5) {
+    return c.json({ success: false, error: 'rating must be an integer between 1 and 5' }, 400);
+  }
+
+  const now = Date.now();
+  const id = `rev_${now}_${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    // Check if this customer made a verified purchase of this product
+    const purchaseCheck = await c.env.DB.prepare(
+      `SELECT id FROM orders
+       WHERE tenant_id = ? AND customer_phone = ? AND channel = 'storefront'
+         AND payment_status = 'paid' AND items_json LIKE ? LIMIT 1`,
+    ).bind(tenantId, customer.phone, `%"${productId}"%`).first();
+
+    await c.env.DB.prepare(
+      `INSERT INTO product_reviews (id, tenant_id, product_id, customer_id, customer_phone, rating, review_text, verified_purchase, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id, tenantId, productId, customer.customerId, customer.phone,
+      body.rating, body.review_text?.trim() ?? null,
+      purchaseCheck ? 1 : 0, now, now,
+    ).run();
+
+    return c.json({
+      success: true,
+      data: { id, rating: body.rating, verified_purchase: !!purchaseCheck },
+    }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
   }
 });
 

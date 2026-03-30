@@ -135,3 +135,48 @@ See `.env.example` for reference:
 - **PendingMutationsDrawer** (P1-T08): Badge in header showing `pendingSync` count (amber, clickable). Slide-over drawer from right listing each pending mutation (entityType, action, entityId, timestamp, error if failed).
 - **Camera BarcodeDetector** (P1-T10): 📷 toggle button in header. Opens full-screen video overlay using `navigator.mediaDevices.getUserMedia`. Uses W3C `BarcodeDetector` API (Chrome 83+) to detect barcodes via `requestAnimationFrame` loop. On detection: closes camera, adds product to cart.
 - **End Shift button**: In header when session open; calls `PATCH /api/pos/sessions/:id/close`. Also in DashboardScreen header.
+
+---
+
+## Phase 1 Remaining + Phase 2 (session March 30 2026)
+
+**Test count:** 755 passing, 27 pre-existing failures (unchanged)
+
+### P1-T11: Variant Picker UI (POS)
+- **`pos/api.ts`**: `GET /products/:id/variants` endpoint added (before `GET /products/:id`).
+- **`pos/ui.tsx`**: `VariantPickerModal` bottom-sheet — groups variants by `option_name`, pill buttons with out-of-stock strikethrough, price delta display, qty stepper, "Add to Cart" CTA with computed variant price.
+
+### P1-T12: Customer Loyalty (POS)
+- **`pos/api.ts`**: `GET /customers/lookup?phone=` + `POST /customers` endpoints. Loyalty earn: `floor(total_kobo / 10000)` = 1 pt/₦100.
+- **`pos/ui.tsx`**: Loyalty points earned shown on receipt.
+
+### P2-T01: WhatsApp Product Sharing + Slug (SV)
+- **`migrations/010_sv_whatsapp.sql`**: `ALTER TABLE products ADD COLUMN slug TEXT UNIQUE`.
+- **`single-vendor/api.ts`**: `GET /products/by-slug/:slug` (before `GET /products/:id`).
+- **`worker.ts`**: `/sitemap.xml` route with D1 query and 24h KV cache.
+- **`app.tsx`**: WhatsApp share button in product modal opens `wa.me/?text=` with product name, price, and slug URL.
+
+### P2-T02: Delivery Zones (SV)
+- **`single-vendor/api.ts`**: `GET /delivery-zones`, `POST /delivery-zones`, `GET /shipping/estimate?state=&lga=`.
+- **`app.tsx`**: `deliveryFeeKobo` state; `useEffect` fetches shipping estimate on `addrState`/`addrLga` change; delivery fee + estimated days shown in order summary; grand total includes delivery fee.
+
+### P2-T03: Order Tracking (SV)
+- **`single-vendor/api.ts`**: `GET /orders/:id/track` (public, no auth, before `GET /orders/:id`); returns `order_status`, `payment_status`, timeline array.
+- **`app.tsx`**: `OrderTrackingSection` component with 5-step timeline (placed→confirmed→processing→shipped→delivered); accessible from success page "Track Your Order" button.
+
+### P2-T04: Paystack Completion
+- **`single-vendor/core.ts`**: `setTimeout` stub removed; real Paystack verify with `payment_status` update.
+
+### P2-T06: Customer Reviews + Ratings (SV)
+- **`migrations/011_sv_reviews.sql`**: `CREATE TABLE product_reviews` (rating 1-5, verified_purchase, review_text).
+- **`single-vendor/api.ts`**: `GET /products/:id/reviews` (public) + `POST /products/:id/reviews` (authenticated).
+- **`app.tsx`**: Reviews fetched when product modal opens. Star rating widget for authenticated users. Verified-purchase badge. Aggregate `★ X.X (N)` in modal header.
+
+### P2-T07: Promo Code UI — already implemented (no change needed).
+
+### P2-T08: SEO Meta Tags + Sitemap
+- **`worker.ts`**: `/sitemap.xml` route with 24h KV cache.
+- **`public/sw.js`**: Version 3 — stale-while-revalidate for `/api/single-vendor/catalog*` and `/api/single-vendor/products*`.
+
+### P2-T09: PWA Offline Catalog (SV)
+- **`app.tsx`**: `isOnline` state via `window.addEventListener('online'/'offline')`. Offline banner rendered in catalog view. Cart bar checkout button grayed + blocked with alert when offline.

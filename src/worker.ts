@@ -84,6 +84,63 @@ app.route('/api/single-vendor', singleVendorRouter);
 app.route('/api/multi-vendor', multiVendorRouter);
 app.route('/api/sync', syncRouter);
 
+// ── GET /sitemap.xml — Product sitemap for SEO (P2-T08) ──────────────────────
+// Tenant ID defaults to "tnt_demo"; in production, this is KV-resolved.
+app.get('/sitemap.xml', async (c) => {
+  const tenantId = c.req.header('x-tenant-id') ?? 'tnt_demo';
+  const baseUrl = `https://${c.req.header('host') ?? 'webwaka.shop'}`;
+
+  try {
+    const KV_KEY = `sitemap:${tenantId}`;
+    // Serve from KV cache (24h TTL) if available
+    if (c.env.CATALOG_CACHE) {
+      const cached = await c.env.CATALOG_CACHE.get(KV_KEY);
+      if (cached) {
+        return new Response(cached, {
+          headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' },
+        });
+      }
+    }
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT slug, id, updated_at FROM products
+       WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
+       ORDER BY updated_at DESC LIMIT 1000`,
+    ).bind(tenantId).all<{ slug: string | null; id: string; updated_at: number }>();
+
+    const urls = results.map((p) => {
+      const path = p.slug ? `/products/${p.slug}` : `/products/${p.id}`;
+      const lastmod = new Date(p.updated_at).toISOString().split('T')[0];
+      return `  <url>\n    <loc>${baseUrl}${path}</loc>\n    <lastmod>${lastmod}</lastmod>\n    <changefreq>weekly</changefreq>\n    <priority>0.8</priority>\n  </url>`;
+    });
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>${baseUrl}/</loc>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+  </url>
+${urls.join('\n')}
+</urlset>`;
+
+    // Cache for 24h
+    if (c.env.CATALOG_CACHE) {
+      c.executionCtx?.waitUntil(
+        c.env.CATALOG_CACHE.put(KV_KEY, xml, { expirationTtl: 86400 }),
+      );
+    }
+
+    return new Response(xml, {
+      headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' },
+    });
+  } catch {
+    // Fallback minimal sitemap
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${baseUrl}/</loc></url>\n</urlset>`;
+    return new Response(xml, { headers: { 'Content-Type': 'application/xml; charset=utf-8' } });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.notFound((c) => {
   return c.json(

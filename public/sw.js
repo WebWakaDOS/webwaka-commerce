@@ -1,14 +1,26 @@
 /**
- * WebWaka Commerce Suite — Service Worker v2
- * Strategy: Cache-First for shell, Network-First for API, Background Sync for mutations
+ * WebWaka Commerce Suite — Service Worker v3
+ * Strategy:
+ *   - Shell (HTML/CSS/JS): Cache-First
+ *   - SV Catalog API (/api/single-vendor/catalog, /api/single-vendor/products):
+ *       Stale-While-Revalidate (serve cached immediately, refresh in background)
+ *   - Other API calls: Network-First with cache fallback
+ *   - Mutations: Background Sync
  * Invariants: Offline-First, PWA-First, Nigeria-First
  */
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const SHELL_CACHE = `webwaka-commerce-shell-${CACHE_VERSION}`;
 const API_CACHE = `webwaka-commerce-api-${CACHE_VERSION}`;
+const CATALOG_CACHE = `webwaka-commerce-catalog-${CACHE_VERSION}`;
 const SYNC_TAG = 'webwaka-commerce-sync';
 
 const SHELL_ASSETS = ['/', '/index.html', '/manifest.json'];
+
+// Catalog API paths that get stale-while-revalidate treatment
+const CATALOG_PATTERNS = [
+  '/api/single-vendor/catalog',
+  '/api/single-vendor/products',
+];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -23,18 +35,41 @@ self.addEventListener('activate', (event) => {
     caches.keys().then((keys) =>
       Promise.all(
         keys
-          .filter((k) => k.startsWith('webwaka-commerce-') && k !== SHELL_CACHE && k !== API_CACHE)
+          .filter((k) => k.startsWith('webwaka-commerce-') && ![SHELL_CACHE, API_CACHE, CATALOG_CACHE].includes(k))
           .map((k) => caches.delete(k))
       )
     ).then(() => self.clients.claim())
   );
 });
 
+function isCatalogRequest(url) {
+  return CATALOG_PATTERNS.some((p) => url.pathname.startsWith(p));
+}
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
   if (request.method !== 'GET' || !url.protocol.startsWith('http')) return;
 
+  // ── Stale-While-Revalidate for SV catalog/products endpoints ──────────────
+  if (isCatalogRequest(url)) {
+    event.respondWith(
+      caches.open(CATALOG_CACHE).then(async (cache) => {
+        const cached = await cache.match(request);
+        const fetchPromise = fetch(request)
+          .then((res) => {
+            if (res.ok) cache.put(request, res.clone());
+            return res;
+          })
+          .catch(() => cached || Response.error());
+        // Serve cached immediately; refresh in background
+        return cached ?? fetchPromise;
+      })
+    );
+    return;
+  }
+
+  // ── Network-First for other API calls ─────────────────────────────────────
   if (url.pathname.startsWith('/api/')) {
     event.respondWith(
       fetch(request)
@@ -45,11 +80,12 @@ self.addEventListener('fetch', (event) => {
           }
           return res;
         })
-        .catch(() => caches.match(request))
+        .catch(() => caches.match(request).then((cached) => cached || Response.error()))
     );
     return;
   }
 
+  // ── Cache-First for shell assets ──────────────────────────────────────────
   event.respondWith(
     caches.match(request).then((cached) => {
       if (cached) return cached;

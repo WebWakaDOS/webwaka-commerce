@@ -390,6 +390,57 @@ declare global {
   }
 }
 
+// ── Order Tracking Section (T005) ────────────────────────────────────────────
+function OrderTrackingSection({ tenantId, orderId }: { tenantId: string; orderId: string }) {
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState('');
+  const [data, setData] = React.useState<{
+    order_id: string; order_status: string; payment_status: string;
+    timeline: Array<{ status: string; timestamp: number; note?: string }>;
+  } | null>(null);
+
+  React.useEffect(() => {
+    if (!orderId) return;
+    setLoading(true); setError('');
+    fetch(`/api/single-vendor/orders/${encodeURIComponent(orderId)}/track`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data: typeof data; error?: string }>)
+      .then(d => { if (d.success) setData(d.data); else setError(d.error ?? 'Order not found'); })
+      .catch(() => setError('Could not load tracking. Try again.'))
+      .finally(() => setLoading(false));
+  }, [orderId, tenantId]);
+
+  const STEPS = ['placed', 'confirmed', 'processing', 'shipped', 'delivered'];
+
+  if (loading) return <div style={{ textAlign: 'center', padding: '12px', fontSize: '13px', color: '#6b7280' }}>Loading tracking…</div>;
+  if (error) return <div style={{ padding: '10px 14px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginTop: '12px' }}>{error}</div>;
+  if (!data) return null;
+
+  const currentIdx = STEPS.indexOf(data.order_status.toLowerCase());
+  return (
+    <div style={{ marginTop: '16px', textAlign: 'left', background: '#f9fafb', borderRadius: '10px', padding: '14px' }}>
+      <div style={{ fontWeight: 700, fontSize: '14px', marginBottom: '12px', color: '#111827' }}>Order Tracking</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {STEPS.map((step, idx) => {
+          const done = idx <= currentIdx;
+          const isCurrent = idx === currentIdx;
+          const event = data.timeline.find(t => t.status.toLowerCase() === step);
+          return (
+            <div key={step} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+              <div style={{ width: '20px', height: '20px', borderRadius: '50%', border: `2px solid ${done ? '#16a34a' : '#d1d5db'}`, backgroundColor: done ? '#16a34a' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: '2px' }}>
+                {done && <span style={{ color: '#fff', fontSize: '10px', fontWeight: 700 }}>✓</span>}
+              </div>
+              <div>
+                <div style={{ fontSize: '13px', fontWeight: isCurrent ? 700 : 600, color: done ? '#111827' : '#9ca3af', textTransform: 'capitalize' }}>{step}</div>
+                {event && <div style={{ fontSize: '11px', color: '#6b7280' }}>{new Date(event.timestamp).toLocaleString('en-NG')}{event.note ? ` · ${event.note}` : ''}</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // Single-Vendor Storefront Module (COM-2) — SV Phase 2: Paystack, VAT, promo, address
 function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
   const { cart, addToCart, clearCart, total, itemCount, token } = useStorefrontCart(tenantId);
@@ -492,11 +543,38 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [promoError, setPromoError] = useState('');
   const [promoDiscount, setPromoDiscount] = useState(0); // kobo
 
+  // ── Delivery fee (T004: Delivery Zones) ──────────────────────────────────
+  const [deliveryFeeKobo, setDeliveryFeeKobo] = useState(0);
+  const [shippingLoading, setShippingLoading] = useState(false);
+  const [shippingEstDays, setShippingEstDays] = useState<{ min: number; max: number } | null>(null);
+
+  // ── Offline status ────────────────────────────────────────────────────────
+  const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  useEffect(() => {
+    const on = () => setIsOnline(true);
+    const off = () => setIsOnline(false);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off); };
+  }, []);
+
+  // ── Reviews (T007) ────────────────────────────────────────────────────────
+  const [modalReviews, setModalReviews] = useState<Array<{ id: string; rating: number; review_text: string | null; verified_purchase: number; customer_phone: string | null; created_at: number }>>([]);
+  const [modalAvgRating, setModalAvgRating] = useState(0);
+  const [modalReviewCount, setModalReviewCount] = useState(0);
+  const [reviewText, setReviewText] = useState('');
+  const [reviewRating, setReviewRating] = useState(0);
+  const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  const [reviewError, setReviewError] = useState('');
+
+  // ── Order tracking (T005) ─────────────────────────────────────────────────
+  const [trackingOrderId, setTrackingOrderId] = useState('');
+
   // ── Computed totals (client preview — server re-verifies) ─────────────────
   const subtotal = total; // from cart hook (kobo)
   const afterDiscount = Math.max(0, subtotal - promoDiscount);
   const vatKobo = Math.round(afterDiscount * VAT_RATE);
-  const grandTotal = afterDiscount + vatKobo;
+  const grandTotal = afterDiscount + vatKobo + deliveryFeeKobo;
 
   // ── Catalog — paginated, search, category ────────────────────────────────
   const [products, setProducts] = useState<Product[]>([]);
@@ -585,6 +663,12 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     setModalQty(1);
     setSelectedVariant(null);
     setModalVariants([]);
+    setModalReviews([]);
+    setModalAvgRating(0);
+    setModalReviewCount(0);
+    setReviewText('');
+    setReviewRating(0);
+    setReviewError('');
     if (p.has_variants) {
       setModalVariantsLoading(true);
       try {
@@ -594,13 +678,25 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
       } catch { /* show modal without variants */ }
       finally { setModalVariantsLoading(false); }
     }
-  }, [tenantId]);
+    // Fetch reviews in background (non-blocking)
+    fetch(`/api/single-vendor/products/${p.id}/reviews`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data: { reviews: typeof modalReviews; count: number; avg_rating: number } }>)
+      .then(d => {
+        if (d.success) {
+          setModalReviews(d.data.reviews ?? []);
+          setModalAvgRating(d.data.avg_rating ?? 0);
+          setModalReviewCount(d.data.count ?? 0);
+        }
+      })
+      .catch(() => {});
+  }, [tenantId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const closeModal = useCallback(() => {
     setModalProduct(null);
     setModalVariants([]);
     setSelectedVariant(null);
     setModalQty(1);
+    setModalReviews([]);
   }, []);
 
   // ── Load Paystack Inline JS ───────────────────────────────────────────────
@@ -631,6 +727,52 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     if (cartQty > availableQty) return;
     addToCart({ id: p.id, name: variant ? `${p.name} — ${variant.option_value}` : p.name, price: effectivePrice, quantity: availableQty, imageEmoji: '🛍️' });
   };
+
+  // ── Shipping estimate — fetch when state/LGA changes (T004) ─────────────
+  useEffect(() => {
+    if (!addrState) { setDeliveryFeeKobo(0); setShippingEstDays(null); return; }
+    setShippingLoading(true);
+    const params = new URLSearchParams({ state: addrState });
+    if (addrLga.trim()) params.set('lga', addrLga.trim());
+    fetch(`/api/single-vendor/shipping/estimate?${params}`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data: { fee_kobo: number; estimated_days_min: number; estimated_days_max: number } }>)
+      .then(d => {
+        if (d.success) {
+          setDeliveryFeeKobo(d.data.fee_kobo ?? 0);
+          setShippingEstDays({ min: d.data.estimated_days_min ?? 1, max: d.data.estimated_days_max ?? 7 });
+        }
+      })
+      .catch(() => { setDeliveryFeeKobo(0); })
+      .finally(() => setShippingLoading(false));
+  }, [addrState, addrLga, tenantId]);
+
+  // ── Review submit handler (T007) ─────────────────────────────────────────
+  const handleSubmitReview = useCallback(async () => {
+    if (!modalProduct || !authToken) return;
+    if (reviewRating < 1 || reviewRating > 5) { setReviewError('Please select a star rating'); return; }
+    setReviewSubmitting(true);
+    setReviewError('');
+    try {
+      const res = await fetch(`/api/single-vendor/products/${modalProduct.id}/reviews`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+        body: JSON.stringify({ rating: reviewRating, review_text: reviewText.trim() || undefined }),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) {
+        setReviewText('');
+        setReviewRating(0);
+        // Refresh reviews
+        fetch(`/api/single-vendor/products/${modalProduct.id}/reviews`, { headers: { 'x-tenant-id': tenantId } })
+          .then(r => r.json() as Promise<{ success: boolean; data: { reviews: typeof modalReviews; count: number; avg_rating: number } }>)
+          .then(d2 => { if (d2.success) { setModalReviews(d2.data.reviews ?? []); setModalAvgRating(d2.data.avg_rating ?? 0); setModalReviewCount(d2.data.count ?? 0); } })
+          .catch(() => {});
+      } else {
+        setReviewError(d.error ?? 'Could not submit review');
+      }
+    } catch { setReviewError('Network error. Try again.'); }
+    finally { setReviewSubmitting(false); }
+  }, [modalProduct, authToken, tenantId, reviewRating, reviewText]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handlePromoValidate = async () => {
     if (!promoCode.trim()) return;
@@ -728,11 +870,37 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
         <h2 style={{ color: '#16a34a' }}>{t.storefront_order_placed}</h2>
         <p style={{ color: '#6b7280' }}>Ref: {orderRef}</p>
         <p style={{ color: '#6b7280', fontSize: '13px' }}>A confirmation will be sent to {email || phone}</p>
+
+        {/* Order Tracking Link (T005) */}
+        {orderRef && (
+          <button
+            onClick={() => setTrackingOrderId(orderRef)}
+            style={{ display: 'block', margin: '12px auto 0', padding: '8px 16px', backgroundColor: '#f0fdf4', color: '#16a34a', border: '1px solid #bbf7d0', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}
+          >
+            Track Your Order →
+          </button>
+        )}
+
+        {trackingOrderId === orderRef && orderRef && (
+          <OrderTrackingSection tenantId={tenantId} orderId={orderRef} />
+        )}
+
         <button
-          onClick={() => { setStep('catalog'); setOrderRef(''); setPromoDiscount(0); setPromoCode(''); }}
+          onClick={() => { setStep('catalog'); setOrderRef(''); setPromoDiscount(0); setPromoCode(''); setDeliveryFeeKobo(0); setTrackingOrderId(''); }}
           style={{ marginTop: '16px', padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
         >
           Continue Shopping
+        </button>
+
+        {/* WhatsApp share of order */}
+        <button
+          onClick={() => {
+            const text = `My WebWaka order is confirmed!\nRef: ${orderRef}\nTotal: ${formatKoboToNaira(grandTotal)}\nTrack: ${window.location.origin}/?order=${orderRef}`;
+            window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener');
+          }}
+          style={{ marginTop: '8px', padding: '10px 20px', backgroundColor: '#25D366', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}
+        >
+          Share via WhatsApp
         </button>
       </div>
     );
@@ -857,6 +1025,15 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
             <span style={{ color: '#6b7280' }}>VAT (7.5% FIRS)</span>
             <span>{formatKoboToNaira(vatKobo)}</span>
           </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+            <span style={{ color: '#6b7280' }}>
+              Delivery {shippingLoading ? '(estimating…)' : addrState ? '' : '(select state)'}
+              {shippingEstDays && !shippingLoading && addrState && (
+                <span style={{ fontSize: '11px', color: '#9ca3af' }}> · {shippingEstDays.min}–{shippingEstDays.max} days</span>
+              )}
+            </span>
+            <span>{shippingLoading ? '…' : deliveryFeeKobo === 0 && addrState ? 'Free' : formatKoboToNaira(deliveryFeeKobo)}</span>
+          </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '15px', marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #d1fae5' }}>
             <span>Total</span>
             <span style={{ color: '#16a34a' }}>{formatKoboToNaira(grandTotal)}</span>
@@ -939,6 +1116,14 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
         );
       })()}
 
+      {/* Offline banner (T010) */}
+      {!isOnline && (
+        <div role="status" aria-live="polite" style={{ margin: '6px 12px', padding: '10px 14px', backgroundColor: '#fef3c7', border: '1px solid #fcd34d', borderRadius: '8px', fontSize: '13px', fontWeight: 600, color: '#92400e', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span>⚠️</span>
+          <span>You are offline. Showing cached products. Checkout unavailable.</span>
+        </div>
+      )}
+
       {/* Status */}
       {catalogError && (
         <div style={{ margin: '8px 12px', padding: '10px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px' }}>
@@ -1015,7 +1200,17 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
       {itemCount > 0 && (
         <div style={{ position: 'fixed', bottom: '60px', left: 0, right: 0, backgroundColor: '#fff', borderTop: '2px solid #16a34a', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', zIndex: 40 }}>
           <span style={{ fontSize: '14px', fontWeight: 600 }}>{itemCount} items • {formatKoboToNaira(total)}</span>
-          <button onClick={() => setStep('checkout')} style={{ padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 700 }}>
+          <button
+            onClick={() => {
+              if (!isOnline) {
+                alert('You are offline. Please reconnect to the internet before checking out.');
+                return;
+              }
+              setStep('checkout');
+            }}
+            style={{ padding: '10px 20px', backgroundColor: isOnline ? '#16a34a' : '#9ca3af', color: '#fff', border: 'none', borderRadius: '8px', cursor: isOnline ? 'pointer' : 'not-allowed', fontWeight: 700 }}
+            title={!isOnline ? 'Checkout unavailable while offline' : undefined}
+          >
             {t.storefront_checkout}
           </button>
         </div>
@@ -1148,6 +1343,80 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
             >
               {modalProduct.quantity === 0 ? 'Out of Stock' : (!!modalProduct.has_variants && modalVariants.length > 0 && !selectedVariant) ? 'Select an option' : `Add ${modalQty > 1 ? `${modalQty}x ` : ''}to Cart — ${formatKoboToNaira((modalProduct.price + (selectedVariant?.price_delta ?? 0)) * modalQty)}`}
             </button>
+
+            {/* WhatsApp share button (T003) */}
+            <button
+              onClick={() => {
+                const slug = (modalProduct as Product & { slug?: string }).slug ?? modalProduct.id;
+                const shareUrl = `${window.location.origin}/products/${slug}`;
+                const text = `Check out *${modalProduct.name}* for ${formatKoboToNaira(modalProduct.price + (selectedVariant?.price_delta ?? 0))}!\n${shareUrl}`;
+                window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener');
+              }}
+              aria-label={`Share ${modalProduct.name} on WhatsApp`}
+              style={{ width: '100%', marginTop: '10px', padding: '12px', fontSize: '14px', fontWeight: 600, borderRadius: '10px', border: 'none', backgroundColor: '#25D366', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+            >
+              Share on WhatsApp
+            </button>
+
+            {/* Reviews section (T007) */}
+            <div style={{ marginTop: '24px', borderTop: '1px solid #e5e7eb', paddingTop: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+                <div style={{ fontWeight: 700, fontSize: '14px' }}>Customer Reviews</div>
+                {modalReviewCount > 0 && (
+                  <div style={{ fontSize: '12px', color: '#6b7280' }}>
+                    {'★'.repeat(Math.round(modalAvgRating))}{'☆'.repeat(5 - Math.round(modalAvgRating))} {modalAvgRating.toFixed(1)} ({modalReviewCount})
+                  </div>
+                )}
+              </div>
+
+              {/* Submit review (authenticated users only) */}
+              {authToken && (
+                <div style={{ background: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '14px' }}>
+                  <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '8px', color: '#374151' }}>Write a Review</div>
+                  <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
+                    {[1,2,3,4,5].map(star => (
+                      <button key={star} onClick={() => setReviewRating(star)}
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '20px', padding: '2px', color: star <= reviewRating ? '#f59e0b' : '#d1d5db' }}>
+                        ★
+                      </button>
+                    ))}
+                  </div>
+                  <textarea
+                    value={reviewText}
+                    onChange={e => setReviewText(e.target.value)}
+                    placeholder="Share your experience (optional)"
+                    rows={3}
+                    style={{ width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '13px', resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit' }}
+                  />
+                  {reviewError && <div style={{ fontSize: '12px', color: '#dc2626', marginTop: '4px' }}>{reviewError}</div>}
+                  <button
+                    onClick={handleSubmitReview}
+                    disabled={reviewSubmitting || reviewRating === 0}
+                    style={{ marginTop: '8px', padding: '8px 16px', backgroundColor: reviewRating === 0 ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: reviewRating === 0 ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 600 }}
+                  >
+                    {reviewSubmitting ? 'Submitting…' : 'Submit Review'}
+                  </button>
+                </div>
+              )}
+
+              {/* Review list */}
+              {modalReviews.length === 0 && !authToken && (
+                <p style={{ fontSize: '13px', color: '#9ca3af', textAlign: 'center' }}>No reviews yet. Sign in to be the first!</p>
+              )}
+              {modalReviews.length === 0 && authToken && (
+                <p style={{ fontSize: '13px', color: '#9ca3af', textAlign: 'center' }}>No reviews yet. Be the first!</p>
+              )}
+              {modalReviews.map(rv => (
+                <div key={rv.id} style={{ padding: '10px 0', borderBottom: '1px solid #f3f4f6' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                    <span style={{ color: '#f59e0b', fontSize: '13px' }}>{'★'.repeat(rv.rating)}{'☆'.repeat(5 - rv.rating)}</span>
+                    {rv.verified_purchase === 1 && <span style={{ fontSize: '10px', backgroundColor: '#dcfce7', color: '#16a34a', padding: '1px 6px', borderRadius: '10px', fontWeight: 600 }}>Verified</span>}
+                    <span style={{ fontSize: '11px', color: '#9ca3af', marginLeft: 'auto' }}>{new Date(rv.created_at).toLocaleDateString('en-NG', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                  </div>
+                  {rv.review_text && <p style={{ margin: 0, fontSize: '13px', color: '#374151', lineHeight: '1.5' }}>{rv.review_text}</p>}
+                </div>
+              ))}
+            </div>
 
             <button onClick={closeModal} style={{ width: '100%', marginTop: '10px', padding: '12px', fontSize: '14px', fontWeight: 600, borderRadius: '10px', border: '1px solid #e5e7eb', backgroundColor: '#fff', color: '#374151', cursor: 'pointer' }}>
               Close

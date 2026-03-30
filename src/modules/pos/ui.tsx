@@ -66,6 +66,16 @@ interface Product {
   category?: string;
   barcode?: string;
   low_stock_threshold?: number;
+  has_variants?: boolean;
+}
+
+interface ProductVariant {
+  id: string;
+  sku?: string;
+  option_name: string;
+  option_value: string;
+  price_delta: number;
+  quantity: number;
 }
 
 interface PaymentEntry {
@@ -88,6 +98,7 @@ interface ReceiptData {
   whatsapp_url?: string;
   issued_at?: number;
   items?: unknown[];
+  loyalty_earned?: number;
 }
 
 type PaymentMode = 'cash' | 'card' | 'transfer' | 'split' | 'cod' | 'agency_banking';
@@ -231,6 +242,54 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [cameraOpen, setCameraOpen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+
+  // ── Phase 6: Variant picker modal ────────────────────────────────────────
+  const [variantPickerProduct, setVariantPickerProduct] = useState<Product | null>(null);
+  const [variantPickerVariants, setVariantPickerVariants] = useState<ProductVariant[]>([]);
+  const [variantPickerLoading, setVariantPickerLoading] = useState(false);
+  const [selectedPosVariant, setSelectedPosVariant] = useState<ProductVariant | null>(null);
+  const [variantPickerQty, setVariantPickerQty] = useState(1);
+
+  const openVariantPicker = useCallback(async (product: Product) => {
+    setVariantPickerProduct(product);
+    setSelectedPosVariant(null);
+    setVariantPickerQty(1);
+    setVariantPickerVariants([]);
+    setVariantPickerLoading(true);
+    try {
+      const res = await fetch(`/api/pos/products/${product.id}/variants`, {
+        headers: { 'x-tenant-id': tenantId },
+      });
+      if (res.ok) {
+        const json = await res.json() as { success: boolean; data: { variants: ProductVariant[] } };
+        if (json.success) setVariantPickerVariants(json.data.variants);
+      }
+    } catch { /* offline — show empty */ } finally {
+      setVariantPickerLoading(false);
+    }
+  }, [tenantId]);
+
+  const handleVariantPickerAdd = useCallback(() => {
+    if (!variantPickerProduct || !selectedPosVariant) return;
+    const effectivePrice = variantPickerProduct.price + selectedPosVariant.price_delta;
+    const cartItem: CartItem = {
+      id: variantPickerProduct.id,
+      sku: variantPickerProduct.sku,
+      name: `${variantPickerProduct.name} (${selectedPosVariant.option_value})`,
+      price: effectivePrice,
+      quantity: selectedPosVariant.quantity,
+      cartQuantity: variantPickerQty,
+    };
+    setCart((prev) => {
+      const key = `${variantPickerProduct.id}__${selectedPosVariant.id}`;
+      const existing = prev.find((i) => i.id === key);
+      if (existing) {
+        return prev.map((i) => i.id === key ? { ...i, cartQuantity: i.cartQuantity + variantPickerQty } : i);
+      }
+      return [...prev, { ...cartItem, id: key }];
+    });
+    setVariantPickerProduct(null);
+  }, [variantPickerProduct, selectedPosVariant, variantPickerQty, setCart]);
   const barcodeDetectorRef = useRef<unknown>(null);
 
   // ── useVirtualizer: 3-column product grid ────────────────────────────────
@@ -910,6 +969,17 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
           <hr className="receipt-divider" style={{ border: 'none', borderTop: '1px dashed #ccc', margin: '0.75rem 0' }} />
 
+          {receipt.loyalty_earned != null && receipt.loyalty_earned > 0 && (
+            <div
+              aria-live="polite"
+              style={{ marginTop: '0.5rem', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px', padding: '0.4rem 0.6rem', textAlign: 'center' }}
+            >
+              <span style={{ fontWeight: 700, color: '#16a34a', fontSize: '0.82rem' }}>
+                +{receipt.loyalty_earned} loyalty point{receipt.loyalty_earned !== 1 ? 's' : ''} earned!
+              </span>
+            </div>
+          )}
+
           <div className="receipt-footer" style={{ fontSize: '0.68rem', color: '#9ca3af' }}>
             Thank you for shopping at WebWaka!
           </div>
@@ -1073,6 +1143,107 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
                 ))}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Variant Picker Modal (P1-T11) */}
+      {variantPickerProduct && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Select variant for ${variantPickerProduct.name}`}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 60, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}
+          onClick={() => setVariantPickerProduct(null)}
+        >
+          <div
+            style={{ background: '#fff', borderRadius: '16px 16px 0 0', width: '100%', maxWidth: '480px', padding: '20px', maxHeight: '80vh', overflowY: 'auto' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: '1rem' }}>{variantPickerProduct.name}</div>
+                <div style={{ fontSize: '0.82rem', color: '#6b7280' }}>
+                  Base: ₦{(variantPickerProduct.price / 100).toFixed(2)}
+                </div>
+              </div>
+              <button onClick={() => setVariantPickerProduct(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.3rem', color: '#6b7280' }}>✕</button>
+            </div>
+
+            {variantPickerLoading && (
+              <p style={{ color: '#9ca3af', textAlign: 'center', padding: '1rem' }}>Loading options…</p>
+            )}
+
+            {!variantPickerLoading && variantPickerVariants.length === 0 && (
+              <p style={{ color: '#9ca3af', textAlign: 'center', padding: '1rem' }}>No variants available.</p>
+            )}
+
+            {/* Group variants by option_name */}
+            {!variantPickerLoading && (() => {
+              const groups = variantPickerVariants.reduce<Record<string, ProductVariant[]>>((acc, v) => {
+                (acc[v.option_name] ??= []).push(v);
+                return acc;
+              }, {});
+              return Object.entries(groups).map(([optName, variants]) => (
+                <div key={optName} style={{ marginBottom: '14px' }}>
+                  <div style={{ fontSize: '0.75rem', fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>{optName}</div>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    {variants.map((v) => {
+                      const isSelected = selectedPosVariant?.id === v.id;
+                      const outOfStock = v.quantity === 0;
+                      return (
+                        <button
+                          key={v.id}
+                          onClick={() => !outOfStock && setSelectedPosVariant(isSelected ? null : v)}
+                          disabled={outOfStock}
+                          aria-pressed={isSelected}
+                          style={{
+                            padding: '6px 14px', borderRadius: '20px', fontSize: '0.82rem', fontWeight: 600,
+                            cursor: outOfStock ? 'not-allowed' : 'pointer',
+                            border: `2px solid ${isSelected ? '#16a34a' : '#e5e7eb'}`,
+                            background: isSelected ? '#f0fdf4' : outOfStock ? '#f9fafb' : '#fff',
+                            color: outOfStock ? '#9ca3af' : '#111827',
+                            textDecoration: outOfStock ? 'line-through' : 'none',
+                          }}
+                        >
+                          {v.option_value}
+                          {v.price_delta !== 0 ? ` (${v.price_delta > 0 ? '+' : ''}₦${(v.price_delta / 100).toFixed(2)})` : ''}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ));
+            })()}
+
+            {/* Quantity stepper */}
+            {selectedPosVariant && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '12px', marginBottom: '16px' }}>
+                <span style={{ fontSize: '0.82rem', color: '#374151', fontWeight: 600 }}>Qty</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', background: '#f3f4f6', borderRadius: '8px', padding: '4px 8px' }}>
+                  <button onClick={() => setVariantPickerQty(q => Math.max(1, q - 1))} style={{ width: '24px', height: '24px', border: 'none', background: 'transparent', fontSize: '1rem', cursor: 'pointer', fontWeight: 700, color: '#374151' }}>−</button>
+                  <span style={{ fontSize: '0.9rem', fontWeight: 700, minWidth: '20px', textAlign: 'center' }}>{variantPickerQty}</span>
+                  <button onClick={() => setVariantPickerQty(q => Math.min(q + 1, selectedPosVariant.quantity))} style={{ width: '24px', height: '24px', border: 'none', background: 'transparent', fontSize: '1rem', cursor: 'pointer', fontWeight: 700, color: '#374151' }}>+</button>
+                </div>
+                <span style={{ fontSize: '0.75rem', color: '#6b7280' }}>{selectedPosVariant.quantity} available</span>
+              </div>
+            )}
+
+            {/* Add to cart CTA */}
+            <button
+              onClick={handleVariantPickerAdd}
+              disabled={!selectedPosVariant}
+              aria-label={selectedPosVariant ? `Add ${variantPickerQty} × ${variantPickerProduct.name} (${selectedPosVariant.option_value}) to cart` : 'Select a variant first'}
+              style={{
+                width: '100%', padding: '12px', fontWeight: 700, fontSize: '0.95rem',
+                borderRadius: '8px', border: 'none', cursor: selectedPosVariant ? 'pointer' : 'not-allowed',
+                background: selectedPosVariant ? '#16a34a' : '#d1d5db', color: '#fff',
+              }}
+            >
+              {selectedPosVariant
+                ? `Add ${variantPickerQty > 1 ? `${variantPickerQty}× ` : ''}to Cart — ₦${((variantPickerProduct.price + selectedPosVariant.price_delta) * variantPickerQty / 100).toFixed(2)}`
+                : 'Select an option above'}
+            </button>
           </div>
         </div>
       )}
@@ -1241,7 +1412,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
                             </span>
                           )}
                           <button
-                            onClick={() => addToCart(product)}
+                            onClick={() => product.has_variants ? openVariantPicker(product) : addToCart(product)}
                             disabled={isOutOfStock}
                             aria-label={`${product.name}, ₦${(product.price / 100).toFixed(2)}, ${isOutOfStock ? 'out of stock' : `${product.quantity} in stock`}`}
                             style={{
