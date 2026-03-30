@@ -74,6 +74,31 @@ See `.env.example` for reference:
 - Vite configured with `host: '0.0.0.0'` and `allowedHosts: true` for Replit proxy compatibility
 - SV Phase 4 adds: `migrations/005_sv_auth.sql` (customer_otps, wishlists, abandoned_carts), JWT helper (`signJwt`/`verifyJwt`), Termii SMS OTP, Dexie v5 wishlists, hourly abandoned-cart cron, `AccountPage` component
 
+## Deep Audit Bug-Fix Pass (session March 30 2026 — second pass)
+
+### TypeScript strict-mode violations fixed (production files only)
+- **`src/worker.ts`**: Added `/// <reference types="@cloudflare/workers-types" />` — `D1Database`, `KVNamespace`, `ScheduledEvent`, `ExecutionContext` are now properly typed. This also fixes downstream implicit-`any` in D1 callback parameters across `multi-vendor/api.ts` and `single-vendor/api.ts`.
+- **`src/modules/pos/api.ts`**: Fixed `noUncheckedIndexedAccess` — `stockResults[i]` and `rows[0]` now extracted to named locals with explicit guards before use; `resolvedPayments[0]?.method` with `?? 'cash'` fallback. Fixed `exactOptionalPropertyTypes` — `reference: string | undefined` in `PaymentEntry` map now uses conditional spread `...(ref != null ? { reference: ref } : {})`.
+- **`src/core/offline/db.ts`**: Fixed `exactOptionalPropertyTypes` — `imageEmoji: string | undefined` in `toggleWishlistItem` wishlists.put now uses conditional spread.
+- **`src/modules/single-vendor/useStorefrontCart.ts`**: Same `imageEmoji` conditional spread fix in both `cartEntriesToDexie` and `dexieToCartEntries`.
+- **`src/app.tsx`**: (1) `groups[v.option_name]!.push(v)` — non-null assertion after explicit guard silences `noUncheckedIndexedAccess`; (2) `...(nextCursor != null ? { after: nextCursor } : {})` — conditional spread for `exactOptionalPropertyTypes`; (3) Analytics ledger array type extended with `order_id?: string` to match the `.map(e => e.order_id)` callback usage.
+
+### Architecture/correctness bugs fixed
+- **`multi-vendor/api.ts` — 7 inline tenant reads**: `GET /catalog`, `POST /cart`, `GET /cart/:token`, `POST /delivery-zones`, `GET /shipping/estimate`, `GET /vendors/:id/settlements`, `POST /vendors/:id/payout-request` all replaced `c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!` with `getTenantId(c)` + 400 null guard.
+- **`multi-vendor/api.ts` — variable shadowing**: Renamed inner `const vendor` (D1 bank_details query) to `const vendorRecord` in `POST /vendors/:id/payout-request`; it previously shadowed the outer `const vendor` from `authenticateVendor(c)`.
+- **`multi-vendor/api.ts` — non-atomic payout**: `INSERT payout_requests` + all settlement `UPDATE … 'released'` statements are now in a single `DB.batch([...])` call; partial failure no longer leaves orphaned payout records. Also parallelized the bank_details and eligible settlements fetches via `Promise.all`.
+
+### Known pre-existing issues NOT fixed this session (require architectural decisions)
+- **`src/core/sync/client.ts`**: Orphaned parallel Dexie DB `WebWakaDB_{tenantId}` (v1 schema) conflicts with primary `WebWakaCommerce_{tenantId}` (v6). `handleSyncErrors` is an empty stub. `result` is typed `unknown` (2 TS errors).
+- **`src/core/event-bus/index.ts`**: In-memory `EventBusRegistry` singleton — incompatible with Cloudflare Workers isolate model (handlers don't survive across requests).
+- **`src/core/sync/server.ts`**: `syncRouter` defined but never mounted in `worker.ts`.
+- **`src/core/tenant/index.ts`**: `tenantResolver` middleware uses hardcoded mock KV and is not mounted in `worker.ts`.
+- **`src/middleware/auth.ts`**: `@webwaka/core` (`file:../webwaka-core`) does not resolve in this environment — 1 TS error; the `src/__mocks__/webwaka-core.ts` covers Vitest test runs only.
+- **`src/worker.ts`**: `origin: '*'` CORS too permissive for production; should be an env-configurable allowlist.
+- **`verifyJwt`**: Identical implementation duplicated in both `single-vendor/api.ts` and `multi-vendor/api.ts`; should be moved to a shared util.
+
+---
+
 ## RBAC & Offline-First Refactor (session March 30 2026)
 
 ### Backend API hardening

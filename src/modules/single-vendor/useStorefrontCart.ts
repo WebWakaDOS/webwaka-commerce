@@ -31,7 +31,7 @@ function cartEntriesToDexie(entries: StorefrontCartEntry[]): StorefrontCartItem[
     productName: e.name,
     price: e.price,
     quantity: e.cartQuantity,
-    imageEmoji: e.imageEmoji,
+    ...(e.imageEmoji != null ? { imageEmoji: e.imageEmoji } : {}),
   }));
 }
 
@@ -42,7 +42,7 @@ function dexieToCartEntries(items: StorefrontCartItem[]): StorefrontCartEntry[] 
     price: i.price,
     quantity: 9999,        // server stock unknown after restore; re-fetched on catalog load
     cartQuantity: i.quantity,
-    imageEmoji: i.imageEmoji,
+    ...(i.imageEmoji != null ? { imageEmoji: i.imageEmoji } : {}),
   }));
 }
 

@@ -1034,7 +1034,8 @@ app.post('/vendors/:id/kyc', async (c) => {
  * Tenant isolation: tenant_id from header enforced in all DB predicates.
  */
 app.get('/catalog', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const search    = c.req.query('search')?.trim()     ?? '';
   const category  = c.req.query('category')?.trim()   ?? '';
   const vendorId  = c.req.query('vendor_id')?.trim()  ?? '';
@@ -1229,7 +1230,8 @@ function computeVendorBreakdown(
  * Returns: { token, items, vendor_breakdown, total_amount, expires_at, vendor_count }
  */
 app.post('/cart', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
 
   type CartItem = {
     product_id: string;
@@ -1344,7 +1346,8 @@ app.post('/cart', async (c) => {
  * 404 when token not found, belongs to a different tenant, or expired.
  */
 app.get('/cart/:token', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const token = c.req.param('token');
   const now = Date.now();
 
@@ -1535,7 +1538,8 @@ const NIGERIA_STATES = new Set([
  * Body: { vendor_id, state, lga?, base_fee, per_kg_fee?, free_above?, estimated_days_min?, estimated_days_max? }
  */
 app.post('/delivery-zones', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
   const jwtVendorId = vendor.vendorId;
@@ -1598,7 +1602,8 @@ app.post('/delivery-zones', async (c) => {
  * Returns fee breakdown + estimated days. Returns 0 fee if no zone found (free/unlimited delivery).
  */
 app.get('/shipping/estimate', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.query('vendor_id');
   const state = c.req.query('state');
   const lga = c.req.query('lga');
@@ -1673,7 +1678,8 @@ app.get('/shipping/estimate', async (c) => {
  * Automatically marks held settlements as eligible if hold_until has passed.
  */
 app.get('/vendors/:id/settlements', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.param('id');
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
@@ -1740,7 +1746,8 @@ app.get('/vendors/:id/settlements', async (c) => {
  * Returns 422 if eligible_total === 0.
  */
 app.post('/vendors/:id/payout-request', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.param('id');
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
@@ -1752,7 +1759,7 @@ app.post('/vendors/:id/payout-request', async (c) => {
   const now = Date.now();
 
   try {
-    // Promote held → eligible
+    // Promote held → eligible (must run first so the subsequent SELECT captures them)
     await c.env.DB.prepare(
       `UPDATE settlements SET status = 'eligible', updated_at = ?
        WHERE tenant_id = ? AND vendor_id = ? AND status = 'held' AND hold_until <= ?`
@@ -1772,11 +1779,16 @@ app.post('/vendors/:id/payout-request', async (c) => {
       }, 409);
     }
 
-    // Fetch eligible settlements
-    const eligible = await c.env.DB.prepare(
-      `SELECT id, amount FROM settlements
-       WHERE tenant_id = ? AND vendor_id = ? AND status = 'eligible'`
-    ).bind(tenantId, vendorId).all<{ id: string; amount: number }>();
+    // Fetch eligible settlements and vendor bank snapshot in parallel
+    const [eligible, vendorRecord] = await Promise.all([
+      c.env.DB.prepare(
+        `SELECT id, amount FROM settlements
+         WHERE tenant_id = ? AND vendor_id = ? AND status = 'eligible'`
+      ).bind(tenantId, vendorId).all<{ id: string; amount: number }>(),
+      c.env.DB.prepare(
+        `SELECT bank_details_json FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
+      ).bind(vendorId, tenantId).first<{ bank_details_json: string | null }>(),
+    ]);
 
     const eligibleRows = eligible.results ?? [];
     if (eligibleRows.length === 0) {
@@ -1784,32 +1796,28 @@ app.post('/vendors/:id/payout-request', async (c) => {
     }
 
     const totalAmount = eligibleRows.reduce((s, r) => s + r.amount, 0);
-
-    // Fetch vendor bank_details snapshot
-    const vendor = await c.env.DB.prepare(
-      `SELECT bank_details_json FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
-    ).bind(vendorId, tenantId).first<{ bank_details_json: string | null }>();
-
     const prId = `pr_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
-    await c.env.DB.prepare(
-      `INSERT INTO payout_requests
-         (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
-          status, requested_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
-    ).bind(
-      prId, tenantId, vendorId, totalAmount, eligibleRows.length,
-      vendor?.bank_details_json ?? null, now, now, now,
-    ).run();
-
-    // Link settlements to payout request and mark as released
-    for (const row of eligibleRows) {
-      await c.env.DB.prepare(
-        `UPDATE settlements
-         SET status = 'released', payout_request_id = ?, updated_at = ?
-         WHERE id = ?`
-      ).bind(prId, now, row.id).run();
-    }
+    // Atomic batch: INSERT payout_request + UPDATE all settlements in a single D1 transaction.
+    // If any statement fails the entire batch is rolled back, preventing orphaned payout records.
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO payout_requests
+           (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
+            status, requested_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
+      ).bind(
+        prId, tenantId, vendorId, totalAmount, eligibleRows.length,
+        vendorRecord?.bank_details_json ?? null, now, now, now,
+      ),
+      ...eligibleRows.map(row =>
+        c.env.DB.prepare(
+          `UPDATE settlements
+           SET status = 'released', payout_request_id = ?, updated_at = ?
+           WHERE id = ?`
+        ).bind(prId, now, row.id)
+      ),
+    ]);
 
     return c.json({
       success: true,

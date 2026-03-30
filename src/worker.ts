@@ -1,3 +1,4 @@
+/// <reference types="@cloudflare/workers-types" />
 /**
  * WebWaka Commerce Suite - Unified Cloudflare Worker Entry Point
  * Mounts all Commerce modules: POS, Single-Vendor, Multi-Vendor

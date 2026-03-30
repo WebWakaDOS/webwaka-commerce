@@ -523,7 +523,7 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     const groups: Record<string, ProductVariant[]> = {};
     for (const v of modalVariants) {
       if (!groups[v.option_name]) groups[v.option_name] = [];
-      groups[v.option_name].push(v);
+      groups[v.option_name]!.push(v);
     }
     return groups;
   }, [modalVariants]);
@@ -572,7 +572,7 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     if (!sentinel) return;
     const observer = new IntersectionObserver(entries => {
       if (entries[0]?.isIntersecting && hasMore && !isFetchingMore && !catalogLoading) {
-        fetchCatalog({ after: nextCursor ?? undefined, category: activeCategory, search: searchQuery });
+        fetchCatalog({ ...(nextCursor != null ? { after: nextCursor } : {}), category: activeCategory, search: searchQuery });
       }
     }, { threshold: 0.1 });
     observer.observe(sentinel);
@@ -1717,12 +1717,12 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   useEffect(() => {
     if (!authToken || !vendorId || activeTab !== 'overview') return;
     fetch('/api/multi-vendor/ledger', { headers: apiHeaders() })
-      .then(r => r.json() as Promise<{ success: boolean; data: Array<{ account_type: string; amount: number; type: string }> }>)
+      .then(r => r.json() as Promise<{ success: boolean; data: Array<{ account_type: string; amount: number; type: string; order_id?: string }> }>)
       .then(d => {
         if (!d.success) return;
         const revenue = d.data.filter(e => e.account_type === 'revenue' && e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
         const commission = d.data.filter(e => e.account_type === 'commission' && e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
-        const totalOrders = new Set(d.data.filter(e => e.account_type === 'revenue').map((e: { order_id?: string }) => e.order_id)).size;
+        const totalOrders = new Set(d.data.filter(e => e.account_type === 'revenue').map(e => e.order_id)).size;
         setOverview({ total_revenue: revenue, total_orders: totalOrders, pending_payout: revenue - commission });
       })
       .catch(() => {});

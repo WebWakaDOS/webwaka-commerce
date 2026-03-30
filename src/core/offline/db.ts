@@ -420,7 +420,7 @@ export async function toggleWishlistItem(
     productId: product.id,
     productName: product.name,
     productPrice: product.price,
-    imageEmoji: product.imageEmoji,
+    ...(product.imageEmoji != null ? { imageEmoji: product.imageEmoji } : {}),
     addedAt: Date.now(),
     syncStatus: 'PENDING',
   });

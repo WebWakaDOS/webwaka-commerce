@@ -430,19 +430,24 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     const insufficientItems: Array<{ product_id: string; available: number; requested: number }> =
       [];
     for (let i = 0; i < lineItems.length; i++) {
-      const rows = stockResults[i].results as Array<{ id: string; quantity: number; name: string }>;
+      const batchResult = stockResults[i];
+      const lineItem = lineItems[i];
+      if (!batchResult || !lineItem) continue;
+      const rows = batchResult.results as Array<{ id: string; quantity: number; name: string }>;
       if (rows.length === 0) {
         return c.json(
-          { success: false, error: `Product not found: ${lineItems[i].product_id}` },
+          { success: false, error: `Product not found: ${lineItem.product_id}` },
           404,
         );
       }
-      const available = rows[0].quantity;
-      if (available < lineItems[i].quantity) {
+      const firstRow = rows[0];
+      if (!firstRow) continue;
+      const available = firstRow.quantity;
+      if (available < lineItem.quantity) {
         insufficientItems.push({
-          product_id: lineItems[i].product_id,
+          product_id: lineItem.product_id,
           available,
-          requested: lineItems[i].quantity,
+          requested: lineItem.quantity,
         });
       }
     }
@@ -473,19 +478,22 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     }
 
     // Step 5 — Resolve payment entries: generate Paystack ref for card/transfer
-    const resolvedPayments: PaymentEntry[] = paymentEntries.map((p) => ({
-      ...p,
-      amount_kobo: body.payments ? p.amount_kobo : total,
-      reference:
+    const resolvedPayments: PaymentEntry[] = paymentEntries.map((p) => {
+      const ref =
         p.reference ??
         (p.method === 'card' || p.method === 'transfer' || p.method === 'agency_banking'
           ? generatePayRef()
-          : undefined),
-    }));
+          : undefined);
+      return {
+        ...p,
+        amount_kobo: body.payments ? p.amount_kobo : total,
+        ...(ref != null ? { reference: ref } : {}),
+      };
+    });
 
     // Derive primary payment_method for backward-compat column
     const primaryMethod =
-      resolvedPayments.length === 1 ? resolvedPayments[0].method : 'split';
+      resolvedPayments.length === 1 ? (resolvedPayments[0]?.method ?? 'cash') : 'split';
 
     // Step 6 — Atomic D1 batch: deduct stock + insert order
     const deductStmts = lineItems.map((item) =>
