@@ -53,11 +53,34 @@ app.get('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asyn
   }
 });
 
+// GET /api/pos/sessions/history — Paginated closed sessions for Z-report history
+app.get('/sessions/history', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '20', 10), 100);
+  const offset = parseInt(c.req.query('offset') ?? '0', 10);
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, cashier_id, cashier_name, initial_float_kobo, status,
+              opened_at, closed_at, total_sales_kobo, cash_sales_kobo, order_count
+       FROM pos_sessions
+       WHERE tenant_id = ? AND status = 'closed'
+       ORDER BY closed_at DESC
+       LIMIT ? OFFSET ?`,
+    )
+      .bind(tenantId, limit, offset)
+      .all();
+    return c.json({ success: true, data: results, limit, offset });
+  } catch {
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
+  }
+});
+
 // POST /api/pos/sessions — Open a new cashier shift
 app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     cashier_id: string;
+    cashier_name?: string;
     cashier_pin?: string;
     initial_float_kobo?: number;
   }>();
@@ -66,16 +89,31 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     return c.json({ success: false, error: 'cashier_id is required' }, 400);
   }
 
-  const id = `sess_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
-  const now = Date.now();
-  const floatKobo = body.initial_float_kobo ?? 0;
-
   try {
-    await c.env.DB.prepare(
-      `INSERT INTO pos_sessions (id, tenant_id, cashier_id, initial_float_kobo, status, opened_at)
-       VALUES (?, ?, ?, ?, 'open', ?)`,
+    // 409 guard: refuse if an open session already exists for this tenant
+    const existing = await c.env.DB.prepare(
+      "SELECT id FROM pos_sessions WHERE tenant_id = ? AND status = 'open' LIMIT 1",
     )
-      .bind(id, tenantId, body.cashier_id.trim(), floatKobo, now)
+      .bind(tenantId)
+      .first<{ id: string }>();
+
+    if (existing) {
+      return c.json(
+        { success: false, error: 'A shift is already open', session_id: existing.id },
+        409,
+      );
+    }
+
+    const id = `sess_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+    const now = Date.now();
+    const floatKobo = body.initial_float_kobo ?? 0;
+    const cashierName = body.cashier_name?.trim() ?? null;
+
+    await c.env.DB.prepare(
+      `INSERT INTO pos_sessions (id, tenant_id, cashier_id, cashier_name, initial_float_kobo, status, opened_at)
+       VALUES (?, ?, ?, ?, ?, 'open', ?)`,
+    )
+      .bind(id, tenantId, body.cashier_id.trim(), cashierName, floatKobo, now)
       .run();
 
     return c.json(
@@ -85,6 +123,7 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
           id,
           tenant_id: tenantId,
           cashier_id: body.cashier_id.trim(),
+          cashier_name: cashierName,
           initial_float_kobo: floatKobo,
           status: 'open',
           opened_at: now,
@@ -223,18 +262,37 @@ app.get('/products', async (c) => {
   }
 });
 
-// GET /api/pos/products/barcode/:code — Barcode / SKU lookup
+// GET /api/pos/products/barcode/:code — Barcode / SKU lookup with variant hint
 app.get('/products/barcode/:code', async (c) => {
   const tenantId = getTenantId(c);
   const code = c.req.param('code');
   try {
     const product = await c.env.DB.prepare(
-      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold FROM products WHERE tenant_id = ? AND (barcode = ? OR sku = ?) AND is_active = 1 AND deleted_at IS NULL',
+      `SELECT id, sku, name, description, category, price, quantity, barcode,
+              low_stock_threshold, has_variants
+       FROM products
+       WHERE tenant_id = ? AND (barcode = ? OR sku = ?)
+         AND is_active = 1 AND deleted_at IS NULL`,
     )
       .bind(tenantId, code, code)
-      .first();
+      .first<Record<string, unknown>>();
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
-    return c.json({ success: true, data: product });
+
+    let variants: unknown[] = [];
+    if (product.has_variants) {
+      const { results } = await c.env.DB.prepare(
+        `SELECT id, sku, name, price, quantity, attributes_json
+         FROM product_variants WHERE product_id = ? AND deleted_at IS NULL`,
+      )
+        .bind(product.id)
+        .all();
+      variants = results.map((v) => ({
+        ...v,
+        attributes: v.attributes_json ? JSON.parse(v.attributes_json as string) : {},
+      }));
+    }
+
+    return c.json({ success: true, data: { ...product, variants } });
   } catch {
     return c.json({ success: false, error: 'Product not found' }, 404);
   }

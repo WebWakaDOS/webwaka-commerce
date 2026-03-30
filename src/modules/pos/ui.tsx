@@ -1,7 +1,8 @@
 /**
- * WebWaka POS UI — Phase 4
- * Phase 4: Customer lookup, discount%, hold/park sale, VAT 7.5% display,
- *          useVirtualizer product grid, COD/agency banking payment modes
+ * WebWaka POS UI — Phase 5
+ * Phase 5: ShiftScreen, active session gating, enhanced split payment (N legs),
+ *          receipt Dexie save, void order, pending mutations drawer,
+ *          dashboard tab, camera BarcodeDetector, cashier info
  */
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -91,6 +92,24 @@ interface ReceiptData {
 
 type PaymentMode = 'cash' | 'card' | 'transfer' | 'split' | 'cod' | 'agency_banking';
 
+// ─── Phase 5 types ─────────────────────────────────────────────────────────────
+interface PosSession {
+  id: string;
+  cashier_id: string;
+  cashier_name?: string | null;
+  initial_float_kobo: number;
+  status: 'open' | 'closed';
+  opened_at: number;
+  closed_at?: number;
+  total_sales_kobo?: number;
+  order_count?: number;
+}
+
+interface SplitLeg {
+  method: PaymentEntry['method'];
+  amount: string; // user-entered Naira string
+}
+
 // ─── Stable session token (persisted in sessionStorage) ───────────────────────
 function getSessionToken(tenantId: string): string {
   const key = `pos_cart_session_${tenantId}`;
@@ -174,8 +193,10 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   // ── Payment state ────────────────────────────────────────────────────────
   const [paymentMode, setPaymentMode] = useState<PaymentMode>('cash');
   const [tenderedKobo, setTenderedKobo] = useState('');
-  const [splitCashKobo, setSplitCashKobo] = useState('');
-  const [splitCardKobo, setSplitCardKobo] = useState('');
+  const [splitLegs, setSplitLegs] = useState<SplitLeg[]>([
+    { method: 'cash', amount: '' },
+    { method: 'card', amount: '' },
+  ]);
 
   // ── Receipt + errors ─────────────────────────────────────────────────────
   const [receipt, setReceipt] = useState<ReceiptData | null>(null);
@@ -193,6 +214,24 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [customerSearching, setCustomerSearching] = useState(false);
   const [heldCarts, setHeldCarts] = useState<HeldCart[]>([]);
   const productGridRef = useRef<HTMLDivElement>(null);
+
+  // ── Phase 5: Active session / shift ──────────────────────────────────────
+  const [activeSession, setActiveSession] = useState<PosSession | null | undefined>(undefined);
+  const [screen, setScreen] = useState<'pos' | 'dashboard'>('pos');
+  const [shiftCashierId, setShiftCashierId] = useState('');
+  const [shiftCashierName, setShiftCashierName] = useState('');
+  const [shiftFloat, setShiftFloat] = useState('');
+  const [shiftError, setShiftError] = useState<string | null>(null);
+  const [shiftLoading, setShiftLoading] = useState(false);
+  const [sessionHistory, setSessionHistory] = useState<PosSession[]>([]);
+  // ── Phase 5: Pending mutations drawer ────────────────────────────────────
+  const [mutationsDrawerOpen, setMutationsDrawerOpen] = useState(false);
+  const [pendingMutations, setPendingMutations] = useState<import('../../core/offline/db').CommerceMutation[]>([]);
+  // ── Phase 5: Camera BarcodeDetector ──────────────────────────────────────
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const barcodeDetectorRef = useRef<unknown>(null);
 
   // ── useVirtualizer: 3-column product grid ────────────────────────────────
   const GRID_COLS = 3;
@@ -216,10 +255,14 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const totalAmount = afterDiscountKobo + vatKobo;
   const tenderedKoboNum = Math.round(parseFloat(tenderedKobo || '0') * 100);
   const changeKobo = tenderedKoboNum - totalAmount;
-  const splitCashNum = Math.round(parseFloat(splitCashKobo || '0') * 100);
-  const splitCardNum = Math.round(parseFloat(splitCardKobo || '0') * 100);
-  const splitTotal = splitCashNum + splitCardNum;
-  const splitValid = splitTotal === totalAmount;
+  // N-leg split computed values
+  const splitLegsTotal = splitLegs.reduce(
+    (sum, l) => sum + Math.round(parseFloat(l.amount || '0') * 100),
+    0,
+  );
+  const splitLegsValid =
+    splitLegsTotal === totalAmount &&
+    splitLegs.some((l) => Math.round(parseFloat(l.amount || '0') * 100) > 0);
 
   // ── Cart operations ───────────────────────────────────────────────────────
   const addToCart = useCallback(
@@ -364,18 +407,157 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     [barcodeInput, tenantId, addToCart],
   );
 
+  // ── Phase 5: Session management handlers ──────────────────────────────────
+  const loadActiveSession = useCallback(async () => {
+    try {
+      const res = await fetch('/api/pos/sessions', { headers: { 'x-tenant-id': tenantId } });
+      if (res.ok) {
+        const json = await res.json() as { success: boolean; data: PosSession | null };
+        setActiveSession(json.data ?? null);
+      } else {
+        setActiveSession(null);
+      }
+    } catch {
+      setActiveSession(null);
+    }
+  }, [tenantId]);
+
+  useEffect(() => { loadActiveSession(); }, [loadActiveSession]);
+
+  const loadSessionHistory = useCallback(async () => {
+    try {
+      const res = await fetch('/api/pos/sessions/history', { headers: { 'x-tenant-id': tenantId } });
+      if (res.ok) {
+        const json = await res.json() as { success: boolean; data: PosSession[] };
+        if (json.success) setSessionHistory(json.data);
+      }
+    } catch { /* no-op */ }
+  }, [tenantId]);
+
+  const loadPendingMutations = useCallback(async () => {
+    try {
+      const { getPendingMutations } = await import('../../core/offline/db');
+      const items = await getPendingMutations(tenantId);
+      setPendingMutations(items);
+    } catch { /* no-op */ }
+  }, [tenantId]);
+
+  useEffect(() => {
+    if (mutationsDrawerOpen) loadPendingMutations();
+  }, [mutationsDrawerOpen, loadPendingMutations]);
+
+  useEffect(() => {
+    if (screen === 'dashboard') loadSessionHistory();
+  }, [screen, loadSessionHistory]);
+
+  const handleOpenShift = useCallback(async () => {
+    if (!shiftCashierId.trim()) { setShiftError('Cashier ID is required'); return; }
+    setShiftLoading(true);
+    setShiftError(null);
+    try {
+      const res = await fetch('/api/pos/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({
+          cashier_id: shiftCashierId.trim(),
+          cashier_name: shiftCashierName.trim() || undefined,
+          initial_float_kobo: Math.round(parseFloat(shiftFloat || '0') * 100),
+        }),
+      });
+      const json = await res.json() as { success: boolean; data?: PosSession; error?: string };
+      if (res.status === 409) {
+        await loadActiveSession();
+      } else if (res.ok && json.success && json.data) {
+        setActiveSession(json.data);
+      } else {
+        setShiftError(json.error ?? 'Failed to open shift');
+      }
+    } catch { setShiftError('Network error. Please try again.'); }
+    finally { setShiftLoading(false); }
+  }, [shiftCashierId, shiftCashierName, shiftFloat, tenantId, loadActiveSession]);
+
+  const handleCloseShift = useCallback(async () => {
+    if (!activeSession) return;
+    setShiftLoading(true);
+    try {
+      const res = await fetch(`/api/pos/sessions/${activeSession.id}/close`, {
+        method: 'PATCH',
+        headers: { 'x-tenant-id': tenantId },
+      });
+      const json = await res.json() as { success: boolean };
+      if (res.ok && json.success) { setActiveSession(null); setScreen('pos'); }
+    } catch { /* no-op */ } finally { setShiftLoading(false); }
+  }, [activeSession, tenantId]);
+
+  const handleVoidOrder = useCallback(async (orderId: string) => {
+    try {
+      const res = await fetch(`/api/pos/orders/${orderId}/void`, {
+        method: 'PATCH',
+        headers: { 'x-tenant-id': tenantId },
+      });
+      const json = await res.json() as { success: boolean; error?: string };
+      if (res.ok && json.success) {
+        setReceipt((r) => r ? { ...r, order_status: 'cancelled', payment_status: 'voided' } : r);
+      } else {
+        alert(json.error ?? 'Void failed');
+      }
+    } catch { alert('Network error — could not void order'); }
+  }, [tenantId]);
+
+  // ── Phase 5: Camera BarcodeDetector ───────────────────────────────────────
+  useEffect(() => {
+    if (!cameraOpen) {
+      cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
+      cameraStreamRef.current = null;
+      return;
+    }
+    let animId = 0;
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        cameraStreamRef.current = stream;
+        if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play(); }
+        if ('BarcodeDetector' in window) {
+          const BD = (window as { BarcodeDetector: new (o: object) => unknown }).BarcodeDetector;
+          barcodeDetectorRef.current = new BD({ formats: ['ean_13', 'ean_8', 'qr_code', 'code_128', 'code_39'] });
+          const detect = async () => {
+            if (!videoRef.current || !barcodeDetectorRef.current) return;
+            try {
+              type BarcodeResult = { rawValue: string };
+              const barcodes = await (barcodeDetectorRef.current as { detect(v: HTMLVideoElement): Promise<BarcodeResult[]> }).detect(videoRef.current);
+              const firstBarcode = barcodes[0];
+              if (barcodes.length > 0 && firstBarcode) {
+                const code = firstBarcode.rawValue;
+                setCameraOpen(false);
+                setBarcodeInput(code);
+                const r = await fetch(`/api/pos/products/barcode/${encodeURIComponent(code)}`, { headers: { 'x-tenant-id': tenantId } });
+                if (r.ok) {
+                  const j = await r.json() as { success: boolean; data: Product };
+                  if (j.success && j.data) addToCart(j.data);
+                }
+                return;
+              }
+            } catch { /* no-op */ }
+            animId = requestAnimationFrame(detect);
+          };
+          animId = requestAnimationFrame(detect);
+        }
+      } catch { setCameraOpen(false); }
+    })();
+    return () => { cancelAnimationFrame(animId); };
+  }, [cameraOpen, tenantId, addToCart]);
+
   // ── Build payments array ───────────────────────────────────────────────────
   const buildPayments = useCallback((): PaymentEntry[] | null => {
     if (paymentMode === 'split') {
-      if (!splitValid) return null;
-      const entries: PaymentEntry[] = [];
-      if (splitCashNum > 0) entries.push({ method: 'cash', amount_kobo: splitCashNum });
-      if (splitCardNum > 0) entries.push({ method: 'card', amount_kobo: splitCardNum });
-      return entries;
+      if (!splitLegsValid) return null;
+      return splitLegs
+        .map((l) => ({ method: l.method, amount_kobo: Math.round(parseFloat(l.amount || '0') * 100) }))
+        .filter((e) => e.amount_kobo > 0);
     }
     const method = paymentMode as PaymentEntry['method'];
     return [{ method, amount_kobo: totalAmount }];
-  }, [paymentMode, splitValid, splitCashNum, splitCardNum, totalAmount]);
+  }, [paymentMode, splitLegsValid, splitLegs, totalAmount]);
 
   // ── Checkout ──────────────────────────────────────────────────────────────
   const handleCheckout = useCallback(async () => {
@@ -399,9 +581,9 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       return;
     }
 
-    if (paymentMode === 'split' && !splitValid) {
+    if (paymentMode === 'split' && !splitLegsValid) {
       setCheckoutError(
-        `Split total ₦${(splitTotal / 100).toFixed(2)} must equal order total ₦${(totalAmount / 100).toFixed(2)}.`,
+        `Split total ₦${(splitLegsTotal / 100).toFixed(2)} must equal order total ₦${(totalAmount / 100).toFixed(2)}.`,
       );
       return;
     }
@@ -424,7 +606,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
             name: i.name,
           })),
           payments,
-          session_id: sessionToken,
+          session_id: activeSession?.id ?? sessionToken,
           ...(discountPctNum > 0 && { discount_pct: discountPctNum }),
           ...(customerId && { customer_id: customerId }),
           ...(customerPhone.trim() && !customerId && { customer_phone: customerPhone.trim() }),
@@ -463,12 +645,24 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         }),
       );
 
+      // Save receipt to Dexie for offline reprint
+      try {
+        const { cacheReceipt } = await import('../../core/offline/db');
+        const rId = receiptData.receipt_id ?? `rcpt_${Date.now()}`;
+        await cacheReceipt({
+          id: rId,
+          orderId: orderId ?? '',
+          tenantId,
+          receiptJson: JSON.stringify({ ...receiptData, cashier_name: activeSession?.cashier_name, session_id: activeSession?.id }),
+          createdAt: Date.now(),
+        });
+      } catch { /* non-critical */ }
+
       setReceipt(receiptData);
       setCart([]);
       await clearPersistedCart();
       setTenderedKobo('');
-      setSplitCashKobo('');
-      setSplitCardKobo('');
+      setSplitLegs([{ method: 'cash', amount: '' }, { method: 'card', amount: '' }]);
       setDiscountPct('');
       setCustomerId(null);
       setCustomerName(null);
@@ -477,10 +671,146 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       setCheckoutError('Network error. Check connection and retry.');
     }
   }, [
-    cart, isOnline, paymentMode, splitValid, splitTotal, totalAmount,
+    cart, isOnline, paymentMode, splitLegsValid, splitLegsTotal, totalAmount,
     buildPayments, setCart, clearPersistedCart, tenantId, sessionToken,
-    discountPctNum, customerId, customerPhone,
+    discountPctNum, customerId, customerPhone, activeSession,
   ]);
+
+  // ── Phase 5: Session loading spinner ──────────────────────────────────────
+  if (activeSession === undefined) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', fontFamily: 'sans-serif', color: '#6b7280' }}>
+        Loading session…
+      </div>
+    );
+  }
+
+  // ── Phase 5: ShiftScreen — shown when no open session ─────────────────────
+  if (activeSession === null) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: '#f9fafb', fontFamily: 'sans-serif' }}>
+        <div style={{ background: '#fff', borderRadius: '12px', padding: '2rem', maxWidth: '400px', width: '100%', boxShadow: '0 4px 16px rgba(0,0,0,0.08)' }}>
+          <h2 style={{ margin: '0 0 0.25rem', fontSize: '1.25rem' }}>WebWaka POS</h2>
+          <p style={{ color: '#6b7280', fontSize: '0.85rem', margin: '0 0 1.5rem' }}>Open a new cashier shift to start selling</p>
+
+          {shiftError && (
+            <div role="alert" style={{ background: '#fee2e2', color: '#dc2626', borderRadius: '6px', padding: '0.6rem 0.75rem', fontSize: '0.82rem', marginBottom: '1rem' }}>
+              {shiftError}
+            </div>
+          )}
+
+          <label style={{ display: 'block', fontSize: '0.8rem', color: '#374151', marginBottom: '0.25rem' }}>Cashier ID *</label>
+          <input
+            type="text"
+            placeholder="e.g. cashier001"
+            value={shiftCashierId}
+            onChange={(e) => setShiftCashierId(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleOpenShift(); }}
+            autoFocus
+            style={{ width: '100%', padding: '0.6rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.9rem', marginBottom: '0.75rem', boxSizing: 'border-box' }}
+          />
+
+          <label style={{ display: 'block', fontSize: '0.8rem', color: '#374151', marginBottom: '0.25rem' }}>Cashier Name (optional)</label>
+          <input
+            type="text"
+            placeholder="e.g. Amaka Okonkwo"
+            value={shiftCashierName}
+            onChange={(e) => setShiftCashierName(e.target.value)}
+            style={{ width: '100%', padding: '0.6rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.9rem', marginBottom: '0.75rem', boxSizing: 'border-box' }}
+          />
+
+          <label style={{ display: 'block', fontSize: '0.8rem', color: '#374151', marginBottom: '0.25rem' }}>Opening Float (₦)</label>
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            placeholder="0.00"
+            value={shiftFloat}
+            onChange={(e) => setShiftFloat(e.target.value)}
+            style={{ width: '100%', padding: '0.6rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.9rem', marginBottom: '1.25rem', boxSizing: 'border-box' }}
+          />
+
+          <button
+            onClick={handleOpenShift}
+            disabled={shiftLoading || !shiftCashierId.trim()}
+            style={{
+              width: '100%', padding: '0.75rem',
+              background: shiftLoading || !shiftCashierId.trim() ? '#d1d5db' : '#16a34a',
+              color: '#fff', border: 'none', borderRadius: '8px',
+              fontSize: '1rem', fontWeight: 'bold',
+              cursor: shiftLoading || !shiftCashierId.trim() ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {shiftLoading ? 'Opening…' : 'Open Shift'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Phase 5: DashboardScreen — session history + low-stock ────────────────
+  if (screen === 'dashboard') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
+        <header style={{ padding: '0.75rem 1rem', backgroundColor: '#000', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <h1 style={{ margin: 0, fontSize: '1rem' }}>WebWaka POS — Dashboard</h1>
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            {activeSession && (
+              <span style={{ fontSize: '0.75rem', color: '#86efac', borderRight: '1px solid #374151', paddingRight: '0.75rem' }}>
+                {activeSession.cashier_name ?? activeSession.cashier_id}
+              </span>
+            )}
+            <button
+              onClick={() => setScreen('pos')}
+              style={{ padding: '0.35rem 0.75rem', background: '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}
+            >
+              ← Back to POS
+            </button>
+            {activeSession && (
+              <button
+                onClick={handleCloseShift}
+                disabled={shiftLoading}
+                style={{ padding: '0.35rem 0.75rem', background: '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}
+              >
+                {shiftLoading ? '…' : 'Close Shift'}
+              </button>
+            )}
+          </div>
+        </header>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '1.5rem' }}>
+          {activeSession && (
+            <div style={{ background: '#dcfce7', border: '1px solid #86efac', borderRadius: '8px', padding: '1rem', marginBottom: '1.5rem' }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#166534', marginBottom: '0.4rem' }}>
+                Active Shift — {activeSession.cashier_name ?? activeSession.cashier_id}
+              </div>
+              <div style={{ fontSize: '0.78rem', color: '#15803d' }}>
+                ID: {activeSession.id} · Float: ₦{(activeSession.initial_float_kobo / 100).toFixed(2)} · Opened: {new Date(activeSession.opened_at).toLocaleString()}
+              </div>
+            </div>
+          )}
+          <h3 style={{ margin: '0 0 0.75rem', fontSize: '1rem' }}>Session History</h3>
+          {sessionHistory.length === 0 ? (
+            <p style={{ color: '#9ca3af', fontSize: '0.85rem' }}>No closed sessions yet. <button onClick={loadSessionHistory} style={{ background: 'none', border: 'none', color: '#2563eb', cursor: 'pointer', fontSize: '0.85rem' }}>Refresh</button></p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              {sessionHistory.map((s) => (
+                <div key={s.id} style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '0.75rem 1rem', fontSize: '0.82rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.25rem' }}>
+                    <span style={{ fontWeight: 600 }}>{s.cashier_name ?? s.cashier_id}</span>
+                    <span style={{ color: '#6b7280' }}>{new Date(s.opened_at).toLocaleDateString()}</span>
+                  </div>
+                  <div style={{ color: '#6b7280', fontSize: '0.75rem' }}>
+                    {s.order_count ?? 0} orders · ₦{((s.total_sales_kobo ?? 0) / 100).toFixed(2)} total sales
+                    {s.closed_at ? ` · Closed ${new Date(s.closed_at).toLocaleTimeString()}` : ''}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // ── Receipt screen ─────────────────────────────────────────────────────────
   if (receipt) {
@@ -521,6 +851,16 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           <p style={{ color: '#6b7280', fontSize: '0.78rem', wordBreak: 'break-all', margin: '0.25rem 0' }}>
             {receiptId}
           </p>
+          {activeSession && (
+            <p style={{ color: '#6b7280', fontSize: '0.72rem', margin: '0.15rem 0' }}>
+              Cashier: {activeSession.cashier_name ?? activeSession.cashier_id}
+            </p>
+          )}
+          {activeSession && (
+            <p style={{ color: '#9ca3af', fontSize: '0.68rem', margin: '0.1rem 0' }}>
+              Session: {activeSession.id}
+            </p>
+          )}
 
           <hr className="receipt-divider" style={{ border: 'none', borderTop: '1px dashed #ccc', margin: '0.75rem 0' }} />
 
@@ -537,6 +877,12 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           )}
 
           <hr className="receipt-divider" style={{ border: 'none', borderTop: '1px dashed #ccc', margin: '0.75rem 0' }} />
+
+          {/* VAT line on receipt */}
+          <div className="receipt-row" style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: '#6b7280', marginBottom: '0.15rem' }}>
+            <span>VAT 7.5%</span>
+            <span>₦{(vatKobo / 100).toFixed(2)}</span>
+          </div>
 
           <div
             className="receipt-row receipt-total"
@@ -617,6 +963,29 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               WhatsApp
             </button>
 
+            {/* Void order */}
+            {orderId && receipt.order_status !== 'cancelled' && (
+              <button
+                onClick={() => {
+                  if (window.confirm('Void this order? This cannot be undone.')) {
+                    handleVoidOrder(orderId);
+                  }
+                }}
+                aria-label="Void this order"
+                style={{
+                  padding: '0.6rem 1rem',
+                  background: '#fff',
+                  color: '#dc2626',
+                  border: '2px solid #dc2626',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                }}
+              >
+                Void
+              </button>
+            )}
+
             {/* New sale */}
             <button
               onClick={() => { setReceipt(null); fetchProducts(); }}
@@ -671,11 +1040,48 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         </div>
       )}
 
+      {/* Camera BarcodeDetector overlay */}
+      {cameraOpen && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 50, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1rem' }}>
+          <video ref={videoRef} style={{ width: '100%', maxWidth: '480px', borderRadius: '8px' }} playsInline muted />
+          <p style={{ color: '#fff', fontSize: '0.85rem' }}>Point camera at barcode. Detected codes add to cart automatically.</p>
+          <button onClick={() => setCameraOpen(false)} style={{ padding: '0.5rem 1.25rem', background: '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.9rem' }}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {/* Pending mutations drawer */}
+      {mutationsDrawerOpen && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 40, display: 'flex', justifyContent: 'flex-end' }}>
+          <div onClick={() => setMutationsDrawerOpen(false)} style={{ flex: 1, background: 'rgba(0,0,0,0.3)' }} />
+          <div style={{ width: '320px', background: '#fff', height: '100%', overflowY: 'auto', padding: '1rem', boxShadow: '-4px 0 16px rgba(0,0,0,0.15)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>Pending Sync ({pendingMutations.length})</h3>
+              <button onClick={() => setMutationsDrawerOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.2rem', color: '#6b7280' }}>✕</button>
+            </div>
+            {pendingMutations.length === 0 ? (
+              <p style={{ color: '#9ca3af', fontSize: '0.85rem' }}>All mutations synced.</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                {pendingMutations.map((m) => (
+                  <div key={m.id} style={{ background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: '6px', padding: '0.6rem 0.75rem', fontSize: '0.78rem' }}>
+                    <div style={{ fontWeight: 600, marginBottom: '0.15rem' }}>{m.entityType} — {m.action}</div>
+                    <div style={{ color: '#6b7280' }}>ID: {m.entityId} · {new Date(m.timestamp).toLocaleTimeString()}</div>
+                    {m.status === 'FAILED' && <div style={{ color: '#dc2626', marginTop: '0.15rem' }}>✕ {m.error}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <header
         style={{
           padding: '0.75rem 1rem', backgroundColor: '#000', color: '#fff',
-          display: 'flex', alignItems: 'center', gap: '0.75rem',
+          display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap',
         }}
       >
         <h1 style={{ margin: 0, fontSize: '1rem', whiteSpace: 'nowrap' }}>WebWaka POS</h1>
@@ -695,6 +1101,20 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           }}
         />
 
+        {/* Camera toggle */}
+        <button
+          onClick={() => setCameraOpen((o) => !o)}
+          aria-label="Toggle camera barcode scanner"
+          title="Camera scanner"
+          style={{
+            padding: '0.4rem 0.6rem', background: cameraOpen ? '#f59e0b' : '#374151',
+            color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer',
+            fontSize: '1rem', whiteSpace: 'nowrap',
+          }}
+        >
+          📷
+        </button>
+
         {/* Product search */}
         <input
           type="text"
@@ -707,6 +1127,55 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
             border: 'none', fontSize: '0.9rem', minWidth: 0,
           }}
         />
+
+        {/* Pending mutations badge */}
+        {pendingSync > 0 && (
+          <button
+            onClick={() => setMutationsDrawerOpen(true)}
+            aria-label={`${pendingSync} pending sync items`}
+            style={{
+              padding: '0.3rem 0.6rem', background: '#f59e0b', color: '#000',
+              border: 'none', borderRadius: '12px', cursor: 'pointer',
+              fontSize: '0.75rem', fontWeight: 700, whiteSpace: 'nowrap',
+            }}
+          >
+            ⏳ {pendingSync}
+          </button>
+        )}
+
+        {/* Dashboard tab */}
+        <button
+          onClick={() => setScreen('dashboard')}
+          aria-label="Open dashboard"
+          style={{
+            padding: '0.35rem 0.65rem', background: '#374151', color: '#fff',
+            border: 'none', borderRadius: '4px', cursor: 'pointer',
+            fontSize: '0.78rem', whiteSpace: 'nowrap',
+          }}
+        >
+          Dashboard
+        </button>
+
+        {/* Cashier info + Close Shift */}
+        {activeSession && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', borderLeft: '1px solid #374151', paddingLeft: '0.75rem' }}>
+            <span style={{ fontSize: '0.75rem', color: '#86efac', whiteSpace: 'nowrap' }}>
+              {activeSession.cashier_name ?? activeSession.cashier_id}
+            </span>
+            <button
+              onClick={handleCloseShift}
+              disabled={shiftLoading}
+              aria-label="Close cashier shift"
+              style={{
+                padding: '0.3rem 0.55rem', background: '#7f1d1d', color: '#fff',
+                border: 'none', borderRadius: '4px', cursor: 'pointer',
+                fontSize: '0.72rem', whiteSpace: 'nowrap',
+              }}
+            >
+              {shiftLoading ? '…' : 'End Shift'}
+            </button>
+          </div>
+        )}
       </header>
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
@@ -1072,37 +1541,65 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               </div>
             )}
 
-            {/* Split: cash + card inputs */}
+            {/* Split: N-leg inputs (up to 3) */}
             {paymentMode === 'split' && (
               <div style={{ marginBottom: '0.5rem' }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.4rem' }}>
-                  <div>
-                    <label style={{ fontSize: '0.68rem', color: '#6b7280', display: 'block', marginBottom: '0.15rem' }}>Cash (₦)</label>
+                {splitLegs.map((leg, idx) => (
+                  <div key={idx} style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: '0.3rem', marginBottom: '0.35rem', alignItems: 'center' }}>
+                    <select
+                      value={leg.method}
+                      onChange={(e) => {
+                        const updated = splitLegs.map((l, i) =>
+                          i === idx ? { ...l, method: e.target.value as SplitLeg['method'] } : l,
+                        );
+                        setSplitLegs(updated);
+                      }}
+                      aria-label={`Split leg ${idx + 1} payment method`}
+                      style={{ padding: '0.3rem 0.25rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.72rem' }}
+                    >
+                      <option value="cash">Cash</option>
+                      <option value="card">Card</option>
+                      <option value="transfer">Transfer</option>
+                      <option value="agency_banking">Agency Banking</option>
+                    </select>
                     <input
-                      type="number" min="0" step="0.01" placeholder="0.00"
-                      value={splitCashKobo} onChange={(e) => setSplitCashKobo(e.target.value)}
-                      aria-label="Split: cash amount in Naira"
-                      style={{ width: '100%', padding: '0.35rem 0.4rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.85rem', boxSizing: 'border-box' }}
+                      type="number" min="0" step="0.01" placeholder="₦0.00"
+                      value={leg.amount}
+                      onChange={(e) => {
+                        const updated = splitLegs.map((l, i) =>
+                          i === idx ? { ...l, amount: e.target.value } : l,
+                        );
+                        setSplitLegs(updated);
+                      }}
+                      aria-label={`Split leg ${idx + 1} amount in Naira`}
+                      style={{ width: '80px', padding: '0.3rem 0.35rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.8rem', textAlign: 'right' }}
                     />
+                    {splitLegs.length > 2 && (
+                      <button
+                        onClick={() => setSplitLegs((legs) => legs.filter((_, i) => i !== idx))}
+                        aria-label={`Remove split leg ${idx + 1}`}
+                        style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: '0.85rem', padding: '0 2px' }}
+                      >✕</button>
+                    )}
+                    {splitLegs.length <= 2 && <span />}
                   </div>
-                  <div>
-                    <label style={{ fontSize: '0.68rem', color: '#6b7280', display: 'block', marginBottom: '0.15rem' }}>Card (₦)</label>
-                    <input
-                      type="number" min="0" step="0.01" placeholder="0.00"
-                      value={splitCardKobo} onChange={(e) => setSplitCardKobo(e.target.value)}
-                      aria-label="Split: card amount in Naira"
-                      style={{ width: '100%', padding: '0.35rem 0.4rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.85rem', boxSizing: 'border-box' }}
-                    />
-                  </div>
-                </div>
+                ))}
+                {splitLegs.length < 3 && (
+                  <button
+                    onClick={() => setSplitLegs((legs) => [...legs, { method: 'cash', amount: '' }])}
+                    style={{ fontSize: '0.72rem', color: '#2563eb', background: 'none', border: 'none', cursor: 'pointer', padding: '0.15rem 0', marginBottom: '0.25rem' }}
+                  >
+                    + Add payment leg
+                  </button>
+                )}
                 <div
-                  style={{ marginTop: '0.3rem', fontSize: '0.72rem', color: splitValid ? '#16a34a' : splitTotal > 0 ? '#dc2626' : '#9ca3af' }}
+                  style={{ marginTop: '0.2rem', fontSize: '0.72rem', color: splitLegsValid ? '#16a34a' : splitLegsTotal > 0 ? '#dc2626' : '#9ca3af' }}
                   aria-live="polite"
                 >
-                  {splitTotal > 0 && !splitValid
-                    ? `Split ₦${(splitTotal / 100).toFixed(2)} ≠ total ₦${(totalAmount / 100).toFixed(2)}`
-                    : splitValid ? '✓ Split matches total'
-                    : 'Enter amounts for each method'}
+                  {splitLegsTotal > 0 && !splitLegsValid
+                    ? `Split ₦${(splitLegsTotal / 100).toFixed(2)} ≠ total ₦${(totalAmount / 100).toFixed(2)}`
+                    : splitLegsValid ? '✓ Split matches total'
+                    : 'Enter amounts for each payment leg'}
                 </div>
               </div>
             )}
@@ -1140,14 +1637,14 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
             <button
               onClick={handleCheckout}
-              disabled={cart.length === 0 || (paymentMode === 'split' && !splitValid)}
+              disabled={cart.length === 0 || (paymentMode === 'split' && !splitLegsValid)}
               aria-label={cart.length === 0 ? 'Cart is empty' : `Charge ₦${(totalAmount / 100).toFixed(2)} via ${paymentMode}`}
               style={{
                 width: '100%', padding: '0.75rem',
-                background: cart.length === 0 || (paymentMode === 'split' && !splitValid) ? '#d1d5db' : '#16a34a',
+                background: cart.length === 0 || (paymentMode === 'split' && !splitLegsValid) ? '#d1d5db' : '#16a34a',
                 color: '#fff', border: 'none', borderRadius: '6px',
                 fontSize: '0.95rem', fontWeight: 'bold',
-                cursor: cart.length === 0 || (paymentMode === 'split' && !splitValid) ? 'not-allowed' : 'pointer',
+                cursor: cart.length === 0 || (paymentMode === 'split' && !splitLegsValid) ? 'not-allowed' : 'pointer',
               }}
             >
               {isOnline ? `Charge ₦${(totalAmount / 100).toFixed(2)}` : 'Queue Sale (Offline)'}

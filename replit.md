@@ -110,3 +110,28 @@ See `.env.example` for reference:
 
 ### Multi-Vendor marketplace UI rewrite
 - **`multi-vendor/ui.tsx`**: Replaced mock `useState` inventory with Dexie offline-first — loads `mvProducts` from IndexedDB immediately (offline-safe), background-fetches API and writes to cache, queues checkout via `queueMutation`, optimistically decrements Dexie quantities on success.
+
+---
+
+## Phase 1 POS Production Readiness (session March 30 2026)
+
+### Migration 009
+- **`migrations/009_pos_sessions.sql`**: `CREATE TABLE pos_sessions` (id, tenant_id, cashier_id, cashier_name, initial_float_kobo, status, opened_at, closed_at, total_sales_kobo, cash_sales_kobo, order_count, z_report_json) + `ALTER TABLE orders ADD COLUMN session_id` FK + indexes.
+
+### Session API (P1-T01)
+- **`pos/api.ts` — `POST /sessions`**: Added 409 guard (duplicate open session check before INSERT); added `cashier_name` field.
+- **`pos/api.ts` — `GET /sessions/history`**: New endpoint returning paginated closed sessions (`requireRole TENANT_ADMIN`), ordered by `closed_at DESC`.
+
+### Barcode API variants (P1-T02)
+- **`pos/api.ts` — `GET /products/barcode/:code`**: Now selects `has_variants` flag; when true, performs a second query on `product_variants` and returns parsed `variants` array (with `attributes` JSON decoded).
+
+### POS UI Phase 5 (P1-T04 through P1-T10)
+- **ShiftScreen** (P1-T04): Full-screen gating when `activeSession === null`. Form has cashier_id (required), cashier_name, opening float. Open Shift calls `POST /sessions`, handles 409 by re-loading existing session.
+- **Active session state**: Loads on mount from `GET /api/pos/sessions`. Passes `activeSession.id` as `session_id` to checkout (not sessionToken).
+- **DashboardScreen** (P1-T09): Tab screen showing active shift card + paginated session history from `GET /api/pos/sessions/history`. Toggle via "Dashboard" button in header.
+- **N-leg split payment** (P1-T05): Replaced 2-field cash+card with dynamic legs (up to 3). Each leg has a method dropdown (cash/card/transfer/agency_banking) + amount input. "+ Add payment leg" button. Validation: sum of all legs must equal order total.
+- **Receipt enhancements** (P1-T06): Cashier name + session ID shown on receipt. VAT 7.5% line printed on receipt. Receipt saved to Dexie `posReceipts` via `cacheReceipt()` after successful checkout.
+- **Void order** (P1-T07): "Void" button on receipt screen (shown when order not cancelled). Calls `PATCH /api/pos/orders/:id/void` with browser confirm dialog. Optimistically updates receipt status.
+- **PendingMutationsDrawer** (P1-T08): Badge in header showing `pendingSync` count (amber, clickable). Slide-over drawer from right listing each pending mutation (entityType, action, entityId, timestamp, error if failed).
+- **Camera BarcodeDetector** (P1-T10): 📷 toggle button in header. Opens full-screen video overlay using `navigator.mediaDevices.getUserMedia`. Uses W3C `BarcodeDetector` API (Chrome 83+) to detect barcodes via `requestAnimationFrame` loop. On detection: closes camera, adds product to cart.
+- **End Shift button**: In header when session open; calls `PATCH /api/pos/sessions/:id/close`. Also in DashboardScreen header.
