@@ -33,7 +33,7 @@ const mockDb = {
   ]),
 };
 
-const mockEnv = { DB: mockDb, TENANT_CONFIG: {}, EVENTS: {}, PAYSTACK_SECRET: 'sk_test_mock' };
+const mockEnv = { DB: mockDb, TENANT_CONFIG: {}, EVENTS: {}, PAYSTACK_SECRET: 'sk_test_mock', ADMIN_API_KEY: 'admin-secret' };
 
 // ── Mock fetch (Paystack API) ─────────────────────────────────────────────────
 const PAYSTACK_SUCCESS_RESPONSE = {

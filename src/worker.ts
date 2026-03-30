@@ -224,6 +224,56 @@ export default {
       console.error('[cron] Settlement release error:', err);
     }
 
+    // ── Auto payout-request: create pending requests for vendors ────────────
+    // For each vendor+tenant that has eligible settlements and no pending payout
+    // request, automatically create a payout_request and release the settlements.
+    try {
+      interface VendorEligible { vendor_id: string; tenant_id: string; total: number; count: number }
+      const { results: eligibleGroups } = await env.DB.prepare(
+        `SELECT vendor_id, tenant_id, SUM(amount) AS total, COUNT(*) AS count
+         FROM settlements
+         WHERE status = 'eligible' AND payout_request_id IS NULL
+         GROUP BY vendor_id, tenant_id
+         LIMIT 20`,
+      ).bind().all<VendorEligible>();
+
+      for (const group of eligibleGroups) {
+        // Skip if a payout request is already pending for this vendor
+        const existing = await env.DB.prepare(
+          `SELECT id FROM payout_requests
+           WHERE vendor_id = ? AND tenant_id = ? AND status IN ('pending', 'processing')
+           LIMIT 1`,
+        ).bind(group.vendor_id, group.tenant_id).first<{ id: string }>();
+        if (existing) continue;
+
+        // Get settlement IDs to release
+        const { results: stls } = await env.DB.prepare(
+          `SELECT id FROM settlements
+           WHERE vendor_id = ? AND tenant_id = ? AND status = 'eligible' AND payout_request_id IS NULL`,
+        ).bind(group.vendor_id, group.tenant_id).all<{ id: string }>();
+        if (!stls.length) continue;
+
+        const prId = `pr_auto_${now}_${group.vendor_id.slice(-6)}`;
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO payout_requests
+               (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
+                status, requested_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?, ?, ?)`,
+          ).bind(prId, group.tenant_id, group.vendor_id, group.total, stls.length, now, now, now),
+          ...stls.map(s =>
+            env.DB.prepare(
+              `UPDATE settlements SET status = 'released', payout_request_id = ?, updated_at = ?
+               WHERE id = ?`,
+            ).bind(prId, now, s.id),
+          ),
+        ]);
+        console.log(`[cron] Auto payout ${prId} for vendor ${group.vendor_id}: ₦${(group.total / 100).toFixed(2)}`);
+      }
+    } catch (err) {
+      console.error('[cron] Auto payout-request error:', err);
+    }
+
     // ── Abandoned cart nudge ─────────────────────────────────────────────────
     const nudgeAfterMs = 60 * 60 * 1000; // 1 hour
     const cutoff = now - nudgeAfterMs;

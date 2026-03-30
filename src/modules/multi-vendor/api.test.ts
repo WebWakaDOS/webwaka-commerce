@@ -31,6 +31,7 @@ const mockEnv = {
   SESSIONS_KV: {},
   JWT_SECRET: 'test-secret-32-chars-minimum!!!',
   CATALOG_CACHE: mockCatalogCache,
+  ADMIN_API_KEY: 'admin-secret-key',
 };
 
 // ── JWT helpers ───────────────────────────────────────────────────────────────

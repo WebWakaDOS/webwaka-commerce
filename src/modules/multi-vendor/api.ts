@@ -304,8 +304,8 @@ app.get('/vendors/:id/products', async (c) => {
  */
 app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  const expectedKey = ((c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined) ?? 'admin-secret-key';
-  if (!adminKey || adminKey !== expectedKey) {
+  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
   const tenantId = getTenantId(c);
@@ -362,8 +362,8 @@ app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => 
  */
 app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  const expectedKey = ((c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined) ?? 'admin-secret-key';
-  if (!adminKey || adminKey !== expectedKey) {
+  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
   const tenantId = getTenantId(c);
@@ -497,8 +497,28 @@ app.get('/orders', async (c) => {
          AND deleted_at IS NULL
        ORDER BY created_at DESC
        LIMIT 100`
-    ).bind(tenantId, vendorPattern).all();
-    return c.json({ success: true, data: results });
+    ).bind(tenantId, vendorPattern).all<{
+      id: string; tenant_id: string; customer_email: string | null;
+      subtotal: number; total_amount: number; payment_method: string | null;
+      payment_status: string; order_status: string; payment_reference: string | null;
+      items_json: string; channel: string; created_at: number; updated_at: number;
+    }>();
+
+    const data = results.map(row => {
+      let items: unknown[] = [];
+      try { items = JSON.parse(row.items_json ?? '[]'); } catch { items = []; }
+      const vendorItems = (items as Array<{ vendor_id: string; price: number; quantity: number }>)
+        .filter(i => i.vendor_id === vendor.vendorId);
+      return {
+        ...row,
+        items_json: undefined,
+        items,
+        vendor_items: vendorItems,
+        vendor_subtotal: vendorItems.reduce((s, i) => s + (i.price ?? 0) * (i.quantity ?? 0), 0),
+        item_count: vendorItems.reduce((s, i) => s + (i.quantity ?? 0), 0),
+      };
+    });
+    return c.json({ success: true, data });
   } catch {
     return c.json({ success: true, data: [] });
   }
