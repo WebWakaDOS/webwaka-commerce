@@ -302,7 +302,12 @@ app.get('/vendors/:id/products', async (c) => {
  * Sets status = 'pending' awaiting KYC review and admin activation.
  * bank_account stored as Paystack subaccount code in MV-2 (see MULTI_VENDOR_REVIEW_AND_ENHANCEMENTS.md §7.2).
  */
-app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.post('/vendors', async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  if (!adminKey || (expectedKey && adminKey !== expectedKey)) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     name: string;
@@ -355,7 +360,12 @@ app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => 
  * Valid status values: pending, active, suspended.
  * Suspended vendors immediately disappear from public GET /vendors.
  */
-app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.patch('/vendors/:id', async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  if (!adminKey || (expectedKey && adminKey !== expectedKey)) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
   const tenantId = getTenantId(c);
   const id = c.req.param('id');
   const body = await c.req.json<{ status?: string; commission_rate?: number }>();
@@ -1335,6 +1345,7 @@ app.get('/cart/:token', async (c) => {
         total_amount: totalAmount,
         item_count: (items as Array<{ quantity: number }>).reduce((s, i) => s + (i.quantity ?? 0), 0),
         expires_at: cart.expires_at,
+        expires_in: Math.ceil((cart.expires_at - now) / 1000),
         created_at: cart.created_at,
         updated_at: cart.updated_at,
       },

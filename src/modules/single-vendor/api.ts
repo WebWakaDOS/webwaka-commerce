@@ -730,7 +730,12 @@ app.get('/account/profile', async (c) => {
 });
 
 // ── GET /analytics — Today/week revenue, conversion %, top products (ANLT-1) ─
-app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.get('/analytics', async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  if (!adminKey || (expectedKey && adminKey !== expectedKey)) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
   const tenantId = getTenantId(c);
 
   const now = Date.now();
