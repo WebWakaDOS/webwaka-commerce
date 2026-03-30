@@ -190,8 +190,42 @@ export default {
 
   // ── Scheduled cron handler ────────────────────────────────────────────────
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
-    const nudgeAfterMs = 60 * 60 * 1000; // 1 hour
     const now = Date.now();
+
+    // ── T+7 Settlement Release: held → eligible ─────────────────────────────
+    // Runs every cron invocation; finds settlements whose hold period has expired
+    // and marks them as 'eligible' so vendors can request payout.
+    try {
+      const { results: heldSettlements } = await env.DB.prepare(
+        `SELECT id, tenant_id, vendor_id
+         FROM settlements
+         WHERE status = 'held' AND hold_until <= ?
+         LIMIT 200`,
+      ).bind(now).all<{ id: string; tenant_id: string; vendor_id: string }>();
+
+      if (heldSettlements.length > 0) {
+        // Batch update in groups of 50 to avoid D1 batch limits
+        const BATCH_SIZE = 50;
+        for (let i = 0; i < heldSettlements.length; i += BATCH_SIZE) {
+          const chunk = heldSettlements.slice(i, i + BATCH_SIZE);
+          await env.DB.batch(
+            chunk.map(s =>
+              env.DB.prepare(
+                `UPDATE settlements
+                 SET status = 'eligible', updated_at = ?
+                 WHERE id = ? AND status = 'held'`,
+              ).bind(now, s.id),
+            ),
+          );
+        }
+        console.log(`[cron] Released ${heldSettlements.length} settlements to eligible`);
+      }
+    } catch (err) {
+      console.error('[cron] Settlement release error:', err);
+    }
+
+    // ── Abandoned cart nudge ─────────────────────────────────────────────────
+    const nudgeAfterMs = 60 * 60 * 1000; // 1 hour
     const cutoff = now - nudgeAfterMs;
 
     try {

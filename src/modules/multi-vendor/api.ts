@@ -302,10 +302,10 @@ app.get('/vendors/:id/products', async (c) => {
  * Sets status = 'pending' awaiting KYC review and admin activation.
  * bank_account stored as Paystack subaccount code in MV-2 (see MULTI_VENDOR_REVIEW_AND_ENHANCEMENTS.md §7.2).
  */
-app.post('/vendors', async (c) => {
+app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
-  if (!adminKey || (expectedKey && adminKey !== expectedKey)) {
+  const expectedKey = ((c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined) ?? 'admin-secret-key';
+  if (!adminKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
   const tenantId = getTenantId(c);
@@ -360,10 +360,10 @@ app.post('/vendors', async (c) => {
  * Valid status values: pending, active, suspended.
  * Suspended vendors immediately disappear from public GET /vendors.
  */
-app.patch('/vendors/:id', async (c) => {
+app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
-  if (!adminKey || (expectedKey && adminKey !== expectedKey)) {
+  const expectedKey = ((c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined) ?? 'admin-secret-key';
+  if (!adminKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
   const tenantId = getTenantId(c);
