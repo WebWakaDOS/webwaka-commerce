@@ -1601,9 +1601,170 @@ function vendorBadgeColor(vendorSlug: string) {
   return VENDOR_BADGE_COLORS[h % VENDOR_BADGE_COLORS.length]!;
 }
 
+// ── MV marketplace cart item ──────────────────────────────────────────────────
+interface MvCartItem {
+  product_id: string;
+  vendor_id: string;
+  vendor_name: string;
+  vendor_slug: string;
+  name: string;
+  price: number; // kobo
+  quantity: number;
+  image_url: string | null;
+}
+
 // Multi-Vendor Marketplace Module (COM-3 — MV-3 updated)
 function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
+  const isOnline = useOnlineStatus();
   const [activeTab, setActiveTab] = useState<'browse' | 'vendors' | 'vendor-dashboard'>('browse');
+
+  // ── Cart state ────────────────────────────────────────────────────────────
+  const MV_CART_KEY = `ww_mv_cart_${tenantId}`;
+  const MV_CART_TOKEN_KEY = `ww_mv_cart_token_${tenantId}`;
+  const [mvCart, setMvCart] = useState<MvCartItem[]>(() => {
+    try { return JSON.parse(localStorage.getItem(MV_CART_KEY) ?? '[]'); } catch { return []; }
+  });
+  const [cartToken, setCartToken] = useState<string | null>(() =>
+    localStorage.getItem(MV_CART_TOKEN_KEY)
+  );
+  const [showCart, setShowCart] = useState(false);
+  const [showCheckout, setShowCheckout] = useState(false);
+  const [orderSuccess, setOrderSuccess] = useState<{ marketplace_order_id: string } | null>(null);
+
+  // Persist cart to localStorage whenever it changes
+  useEffect(() => {
+    localStorage.setItem(MV_CART_KEY, JSON.stringify(mvCart));
+  }, [mvCart, MV_CART_KEY]);
+
+  const addToMvCart = useCallback((p: CatalogProduct) => {
+    setMvCart(prev => {
+      const existing = prev.find(i => i.product_id === p.id);
+      if (existing) {
+        return prev.map(i => i.product_id === p.id ? { ...i, quantity: i.quantity + 1 } : i);
+      }
+      return [...prev, {
+        product_id: p.id, vendor_id: p.vendor_id,
+        vendor_name: p.vendor_name, vendor_slug: p.vendor_slug,
+        name: p.name, price: p.price, quantity: 1, image_url: p.image_url,
+      }];
+    });
+  }, []);
+
+  const removeFromMvCart = useCallback((productId: string) => {
+    setMvCart(prev => prev.filter(i => i.product_id !== productId));
+  }, []);
+
+  const adjustMvCartQty = useCallback((productId: string, delta: number) => {
+    setMvCart(prev => prev
+      .map(i => i.product_id === productId ? { ...i, quantity: Math.max(0, i.quantity + delta) } : i)
+      .filter(i => i.quantity > 0)
+    );
+  }, []);
+
+  const mvCartTotal = mvCart.reduce((s, i) => s + i.price * i.quantity, 0);
+  const mvCartCount = mvCart.reduce((s, i) => s + i.quantity, 0);
+
+  // ── Product detail modal ──────────────────────────────────────────────────
+  const [selectedProduct, setSelectedProduct] = useState<CatalogProduct | null>(null);
+  const [modalQty, setModalQty] = useState(1);
+
+  const openProductModal = (p: CatalogProduct) => {
+    setSelectedProduct(p);
+    setModalQty(1);
+  };
+
+  const closeProductModal = () => setSelectedProduct(null);
+
+  const handleAddFromModal = () => {
+    if (!selectedProduct) return;
+    for (let i = 0; i < modalQty; i++) addToMvCart(selectedProduct);
+    closeProductModal();
+  };
+
+  // ── Checkout form state ───────────────────────────────────────────────────
+  const [ckEmail, setCkEmail] = useState('');
+  const [ckPhone, setCkPhone] = useState('');
+  const [ckState, setCkState] = useState('');
+  const [ckLga, setCkLga] = useState('');
+  const [ckStreet, setCkStreet] = useState('');
+  const [ckNdpr, setCkNdpr] = useState(false);
+  const [ckLoading, setCkLoading] = useState(false);
+  const [ckError, setCkError] = useState('');
+  const [shippingEst, setShippingEst] = useState<{ fee: number; min_days: number; max_days: number } | null>(null);
+  const [shippingLoading, setShippingLoading] = useState(false);
+
+  // Fetch shipping estimate when state changes (one call per unique vendor)
+  useEffect(() => {
+    if (!ckState || mvCart.length === 0) { setShippingEst(null); return; }
+    const vendorId = mvCart[0]?.vendor_id ?? '';
+    setShippingLoading(true);
+    const params = new URLSearchParams({ vendor_id: vendorId, state: ckState });
+    if (ckLga.trim()) params.set('lga', ckLga.trim());
+    fetch(`/api/multi-vendor/shipping/estimate?${params}`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data?: { fee: number; min_days: number; max_days: number } }>)
+      .then(d => { if (d.success && d.data) setShippingEst(d.data); })
+      .catch(() => {})
+      .finally(() => setShippingLoading(false));
+  }, [ckState, ckLga, tenantId, mvCart]);
+
+  // Per-vendor breakdown
+  const vendorBreakdown = useMemo(() => {
+    const map = new Map<string, { vendor_name: string; vendor_slug: string; items: MvCartItem[]; subtotal: number }>();
+    for (const item of mvCart) {
+      const existing = map.get(item.vendor_id);
+      if (existing) {
+        existing.items.push(item);
+        existing.subtotal += item.price * item.quantity;
+      } else {
+        map.set(item.vendor_id, { vendor_name: item.vendor_name, vendor_slug: item.vendor_slug, items: [item], subtotal: item.price * item.quantity });
+      }
+    }
+    return Array.from(map.values());
+  }, [mvCart]);
+
+  const handleCheckout = async () => {
+    if (!ckEmail.trim()) { setCkError('Email is required'); return; }
+    if (!ckNdpr) { setCkError('Please accept NDPR data consent to continue'); return; }
+    if (mvCart.length === 0) return;
+    setCkLoading(true); setCkError('');
+    try {
+      const body = {
+        items: mvCart.map(i => ({
+          product_id: i.product_id,
+          vendor_id: i.vendor_id,
+          quantity: i.quantity,
+          price: i.price,
+          name: i.name,
+        })),
+        customer_email: ckEmail.trim(),
+        customer_phone: ckPhone.trim() || undefined,
+        payment_method: 'pay_on_delivery',
+        ndpr_consent: true,
+        delivery_address: ckState ? { state: ckState, lga: ckLga, street: ckStreet } : undefined,
+      };
+      const res = await fetch('/api/multi-vendor/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify(body),
+      });
+      const d = await res.json() as { success: boolean; data?: { marketplace_order_id: string }; error?: string };
+      if (d.success && d.data) {
+        setOrderSuccess({ marketplace_order_id: d.data.marketplace_order_id });
+        setMvCart([]);
+        setCartToken(null);
+        localStorage.removeItem(MV_CART_KEY);
+        localStorage.removeItem(MV_CART_TOKEN_KEY);
+        setShowCheckout(false);
+        setShowCart(false);
+      } else {
+        setCkError(d.error ?? 'Checkout failed. Please try again.');
+      }
+    } catch {
+      setCkError('Network error. Please try again.');
+    } finally {
+      setCkLoading(false);
+    }
+  };
 
   // ── Catalog state (MV-3 live fetch + infinite scroll) ────────────────────
   const [products, setProducts] = useState<CatalogProduct[]>([]);
@@ -1682,8 +1843,290 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
     { id: 'vendor-dashboard', label: '🏪 Vendor' },
   ];
 
+  // ── Shared input style ────────────────────────────────────────────────────
+  const inp: React.CSSProperties = { width: '100%', padding: '10px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', boxSizing: 'border-box', marginBottom: '10px' };
+  const lbl: React.CSSProperties = { fontSize: '12px', fontWeight: 600, color: '#374151', display: 'block', marginBottom: '4px' };
+
   return (
-    <div>
+    <div style={{ position: 'relative' }}>
+
+      {/* ── Offline banner ─────────────────────────────────────────────────── */}
+      {!isOnline && (
+        <div style={{ backgroundColor: '#fef3c7', borderBottom: '1px solid #fcd34d', padding: '8px 12px', fontSize: '12px', color: '#92400e', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span>⚠️</span>
+          <span>You are offline. Browsing cached products. Checkout is unavailable until you reconnect.</span>
+        </div>
+      )}
+
+      {/* ── Order success screen ────────────────────────────────────────────── */}
+      {orderSuccess && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '16px', padding: '32px 24px', maxWidth: '360px', width: '100%', textAlign: 'center' }}>
+            <div style={{ fontSize: '48px', marginBottom: '16px' }}>🎉</div>
+            <div style={{ fontSize: '20px', fontWeight: 700, marginBottom: '8px', color: '#111827' }}>Order Placed!</div>
+            <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '16px' }}>Your order has been received and vendors have been notified.</div>
+            <div style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '8px', padding: '12px', marginBottom: '20px' }}>
+              <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>Order Reference</div>
+              <div style={{ fontSize: '14px', fontWeight: 700, color: '#15803d', wordBreak: 'break-all' }}>{orderSuccess.marketplace_order_id}</div>
+            </div>
+            <button
+              onClick={() => { setOrderSuccess(null); setActiveTab('browse'); }}
+              style={{ width: '100%', padding: '12px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '15px' }}
+            >
+              Continue Shopping
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Product detail bottom-sheet modal ──────────────────────────────── */}
+      {selectedProduct && (
+        <div
+          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}
+          onClick={closeProductModal}
+        >
+          <div
+            style={{ backgroundColor: '#fff', borderRadius: '20px 20px 0 0', width: '100%', maxWidth: '600px', padding: '20px', maxHeight: '85vh', overflowY: 'auto' }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Drag handle */}
+            <div style={{ width: '40px', height: '4px', backgroundColor: '#e5e7eb', borderRadius: '2px', margin: '0 auto 16px' }} />
+
+            {/* Product image */}
+            {selectedProduct.image_url ? (
+              <img src={selectedProduct.image_url} alt={selectedProduct.name} style={{ width: '100%', height: '200px', objectFit: 'cover', borderRadius: '12px', marginBottom: '16px' }} />
+            ) : (
+              <div style={{ backgroundColor: '#fef9c3', height: '160px', borderRadius: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '48px', marginBottom: '16px' }}>
+                🛍️
+              </div>
+            )}
+
+            {/* Vendor badge */}
+            {(() => {
+              const badge = vendorBadgeColor(selectedProduct.vendor_slug);
+              return (
+                <span style={{ display: 'inline-block', fontSize: '11px', fontWeight: 600, backgroundColor: badge.bg, color: badge.text, borderRadius: '4px', padding: '2px 8px', marginBottom: '8px' }}>
+                  @{selectedProduct.vendor_slug}
+                </span>
+              );
+            })()}
+
+            {selectedProduct.category && (
+              <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '4px' }}>{selectedProduct.category}</div>
+            )}
+            <div style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px', color: '#111827' }}>{selectedProduct.name}</div>
+            <div style={{ fontSize: '22px', fontWeight: 800, color: '#16a34a', marginBottom: '12px' }}>{formatKoboToNaira(selectedProduct.price)}</div>
+
+            {selectedProduct.rating_avg != null && (
+              <div style={{ fontSize: '12px', color: '#f59e0b', marginBottom: '10px' }}>
+                {'★'.repeat(Math.round(selectedProduct.rating_avg))}{'☆'.repeat(5 - Math.round(selectedProduct.rating_avg))}
+                <span style={{ color: '#9ca3af', marginLeft: '4px' }}>({selectedProduct.rating_count} reviews)</span>
+              </div>
+            )}
+
+            {selectedProduct.description && (
+              <div style={{ fontSize: '13px', color: '#4b5563', lineHeight: '1.6', marginBottom: '16px' }}>{selectedProduct.description}</div>
+            )}
+
+            <div style={{ fontSize: '12px', color: selectedProduct.quantity > 0 ? '#16a34a' : '#dc2626', marginBottom: '16px', fontWeight: 600 }}>
+              {selectedProduct.quantity > 0 ? `${selectedProduct.quantity} in stock` : 'Out of stock'}
+            </div>
+
+            {/* Quantity stepper */}
+            {selectedProduct.quantity > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
+                <span style={{ fontSize: '13px', color: '#374151', fontWeight: 600 }}>Quantity:</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0', border: '1px solid #e5e7eb', borderRadius: '8px', overflow: 'hidden' }}>
+                  <button onClick={() => setModalQty(q => Math.max(1, q - 1))} style={{ padding: '8px 14px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '16px', fontWeight: 700 }}>−</button>
+                  <span style={{ padding: '8px 16px', fontSize: '15px', fontWeight: 700, minWidth: '40px', textAlign: 'center' }}>{modalQty}</span>
+                  <button onClick={() => setModalQty(q => Math.min(selectedProduct.quantity, q + 1))} style={{ padding: '8px 14px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '16px', fontWeight: 700 }}>+</button>
+                </div>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div style={{ display: 'flex', gap: '10px', marginBottom: '12px' }}>
+              <button
+                onClick={handleAddFromModal}
+                disabled={selectedProduct.quantity === 0}
+                style={{ flex: 1, padding: '13px', backgroundColor: selectedProduct.quantity === 0 ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: selectedProduct.quantity === 0 ? 'not-allowed' : 'pointer' }}
+              >
+                {selectedProduct.quantity === 0 ? 'Out of Stock' : 'Add to Cart'}
+              </button>
+              {/* WhatsApp share */}
+              <a
+                href={`https://wa.me/?text=${encodeURIComponent(`Check out ${selectedProduct.name} for ${formatKoboToNaira(selectedProduct.price)} on WebWaka Marketplace! ${window.location.origin}`)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '13px 16px', backgroundColor: '#25d366', color: '#fff', borderRadius: '10px', textDecoration: 'none', fontSize: '20px' }}
+                title="Share on WhatsApp"
+              >
+                💬
+              </a>
+            </div>
+
+            <button
+              onClick={closeProductModal}
+              style={{ width: '100%', padding: '10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Checkout modal ──────────────────────────────────────────────────── */}
+      {showCheckout && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '20px 20px 0 0', width: '100%', maxWidth: '600px', padding: '20px', maxHeight: '90vh', overflowY: 'auto' }}>
+            <div style={{ width: '40px', height: '4px', backgroundColor: '#e5e7eb', borderRadius: '2px', margin: '0 auto 16px' }} />
+            <div style={{ fontWeight: 700, fontSize: '18px', marginBottom: '16px' }}>Checkout</div>
+
+            {/* Per-vendor breakdown */}
+            <div style={{ marginBottom: '16px' }}>
+              <div style={{ fontSize: '13px', fontWeight: 600, color: '#374151', marginBottom: '8px' }}>Order Summary</div>
+              {vendorBreakdown.map(vg => {
+                const badge = vendorBadgeColor(vg.vendor_slug);
+                return (
+                  <div key={vg.vendor_slug} style={{ border: '1px solid #e5e7eb', borderRadius: '8px', padding: '10px 12px', marginBottom: '8px' }}>
+                    <span style={{ display: 'inline-block', fontSize: '11px', fontWeight: 600, backgroundColor: badge.bg, color: badge.text, borderRadius: '4px', padding: '1px 6px', marginBottom: '6px' }}>@{vg.vendor_slug}</span>
+                    {vg.items.map(item => (
+                      <div key={item.product_id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#4b5563', padding: '2px 0' }}>
+                        <span>{item.name} × {item.quantity}</span>
+                        <span style={{ fontWeight: 600 }}>{formatKoboToNaira(item.price * item.quantity)}</span>
+                      </div>
+                    ))}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', fontWeight: 700, color: '#111827', marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #f3f4f6' }}>
+                      <span>Vendor subtotal</span>
+                      <span style={{ color: '#16a34a' }}>{formatKoboToNaira(vg.subtotal)}</span>
+                    </div>
+                  </div>
+                );
+              })}
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '15px', padding: '8px 0', borderTop: '2px solid #e5e7eb', marginTop: '4px' }}>
+                <span>Total</span>
+                <span style={{ color: '#16a34a' }}>{formatKoboToNaira(mvCartTotal)}</span>
+              </div>
+              {shippingEst && (
+                <div style={{ fontSize: '12px', color: '#6b7280', marginTop: '4px' }}>
+                  Estimated delivery: {shippingEst.min_days}–{shippingEst.max_days} days{shippingEst.fee > 0 ? ` · Shipping: ${formatKoboToNaira(shippingEst.fee)}` : ' · Free shipping'}
+                </div>
+              )}
+              {shippingLoading && <div style={{ fontSize: '12px', color: '#9ca3af', marginTop: '4px' }}>Estimating shipping…</div>}
+            </div>
+
+            {/* Customer info */}
+            <div style={{ marginBottom: '12px' }}>
+              <label style={lbl}>Email <span style={{ color: '#dc2626' }}>*</span></label>
+              <input type="email" placeholder="you@example.com" value={ckEmail} onChange={e => { setCkEmail(e.target.value); setCkError(''); }} style={inp} />
+              <label style={lbl}>Phone (optional)</label>
+              <input type="tel" placeholder="08012345678" value={ckPhone} onChange={e => setCkPhone(e.target.value)} style={inp} />
+            </div>
+
+            {/* Delivery address */}
+            <div style={{ backgroundColor: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
+              <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Delivery Address <span style={{ color: '#6b7280', fontWeight: 400 }}>(optional)</span></div>
+              <label style={lbl}>State</label>
+              <select value={ckState} onChange={e => setCkState(e.target.value)} style={{ ...inp, backgroundColor: '#fff' }}>
+                <option value="">— Select State —</option>
+                {NIGERIAN_STATES.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <label style={lbl}>LGA / Area</label>
+              <input type="text" placeholder="e.g. Ikeja" value={ckLga} onChange={e => setCkLga(e.target.value)} style={inp} />
+              <label style={lbl}>Street Address</label>
+              <input type="text" placeholder="e.g. 12 Allen Avenue" value={ckStreet} onChange={e => setCkStreet(e.target.value)} style={inp} />
+            </div>
+
+            {/* NDPR consent */}
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: '16px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={ckNdpr}
+                onChange={e => { setCkNdpr(e.target.checked); setCkError(''); }}
+                style={{ marginTop: '2px', width: '16px', height: '16px', flexShrink: 0 }}
+              />
+              <span style={{ fontSize: '12px', color: '#4b5563', lineHeight: '1.5' }}>
+                I consent to the processing of my personal data (email, phone, address) for order fulfillment in accordance with the <strong>Nigeria Data Protection Regulation (NDPR)</strong>. My data will not be shared with third parties beyond vendors fulfilling my order.
+              </span>
+            </label>
+
+            {ckError && (
+              <div style={{ padding: '10px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>
+                {ckError}
+              </div>
+            )}
+
+            <button
+              onClick={handleCheckout}
+              disabled={ckLoading || !isOnline}
+              style={{ width: '100%', padding: '13px', backgroundColor: (!isOnline || ckLoading) ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: (!isOnline || ckLoading) ? 'not-allowed' : 'pointer', marginBottom: '10px' }}
+            >
+              {!isOnline ? 'Offline — Cannot Checkout' : ckLoading ? 'Placing Order…' : `Place Order · ${formatKoboToNaira(mvCartTotal)}`}
+            </button>
+            <button
+              onClick={() => { setShowCheckout(false); setShowCart(true); }}
+              style={{ width: '100%', padding: '10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
+            >
+              Back to Cart
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Cart bottom-sheet ────────────────────────────────────────────────── */}
+      {showCart && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '20px 20px 0 0', width: '100%', maxWidth: '600px', padding: '20px', maxHeight: '85vh', overflowY: 'auto' }}>
+            <div style={{ width: '40px', height: '4px', backgroundColor: '#e5e7eb', borderRadius: '2px', margin: '0 auto 16px' }} />
+            <div style={{ fontWeight: 700, fontSize: '18px', marginBottom: '16px' }}>Your Cart ({mvCartCount})</div>
+            {mvCart.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#9ca3af', padding: '32px 0', fontSize: '14px' }}>Your cart is empty.</div>
+            ) : (
+              <>
+                {mvCart.map(item => {
+                  const badge = vendorBadgeColor(item.vendor_slug);
+                  return (
+                    <div key={item.product_id} style={{ display: 'flex', gap: '10px', padding: '10px 0', borderBottom: '1px solid #f3f4f6', alignItems: 'center' }}>
+                      <div style={{ width: '48px', height: '48px', borderRadius: '8px', backgroundColor: '#fef9c3', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px', flexShrink: 0, overflow: 'hidden' }}>
+                        {item.image_url ? <img src={item.image_url} alt={item.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : '🛍️'}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '13px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</div>
+                        <span style={{ display: 'inline-block', fontSize: '10px', backgroundColor: badge.bg, color: badge.text, borderRadius: '3px', padding: '1px 4px', marginTop: '2px' }}>@{item.vendor_slug}</span>
+                        <div style={{ fontSize: '13px', fontWeight: 700, color: '#16a34a', marginTop: '2px' }}>{formatKoboToNaira(item.price * item.quantity)}</div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0', border: '1px solid #e5e7eb', borderRadius: '8px', overflow: 'hidden', flexShrink: 0 }}>
+                        <button onClick={() => adjustMvCartQty(item.product_id, -1)} style={{ padding: '6px 10px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '14px', fontWeight: 700 }}>−</button>
+                        <span style={{ padding: '6px 10px', fontSize: '13px', fontWeight: 700 }}>{item.quantity}</span>
+                        <button onClick={() => adjustMvCartQty(item.product_id, 1)} style={{ padding: '6px 10px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '14px', fontWeight: 700 }}>+</button>
+                      </div>
+                      <button onClick={() => removeFromMvCart(item.product_id)} style={{ border: 'none', background: 'none', color: '#dc2626', cursor: 'pointer', fontSize: '18px', padding: '4px', flexShrink: 0 }}>×</button>
+                    </div>
+                  );
+                })}
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '16px', padding: '12px 0 4px', borderTop: '2px solid #e5e7eb' }}>
+                  <span>Total</span>
+                  <span style={{ color: '#16a34a' }}>{formatKoboToNaira(mvCartTotal)}</span>
+                </div>
+                <button
+                  onClick={() => { setShowCart(false); setShowCheckout(true); }}
+                  disabled={!isOnline}
+                  style={{ width: '100%', padding: '13px', backgroundColor: !isOnline ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: !isOnline ? 'not-allowed' : 'pointer', marginTop: '12px', marginBottom: '8px' }}
+                >
+                  {!isOnline ? 'Offline — Cannot Checkout' : 'Proceed to Checkout'}
+                </button>
+              </>
+            )}
+            <button
+              onClick={() => setShowCart(false)}
+              style={{ width: '100%', padding: '10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
+            >
+              Continue Shopping
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Tabs */}
       <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', padding: '0 12px' }}>
         {tabs.map(tab => (
@@ -1702,6 +2145,15 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             {tab.label}
           </button>
         ))}
+        {/* Cart button */}
+        {mvCartCount > 0 && (
+          <button
+            onClick={() => setShowCart(true)}
+            style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 12px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 700, margin: '6px 0 6px auto' }}
+          >
+            🛒 {mvCartCount}
+          </button>
+        )}
       </div>
 
       {/* ── BROWSE TAB — live catalog, search, infinite scroll ────────────── */}
@@ -1742,22 +2194,23 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
           </div>
 
           {/* Category filter pills */}
-          {['', 'fashion', 'electronics', 'food', 'beauty', 'home'].map(cat => (
-            <button
-              key={cat}
-              onClick={() => { setCategory(cat); setProducts([]); }}
-              style={{
-                margin: cat === '' ? '8px 0 8px 12px' : '8px 4px 8px 0',
-                padding: '4px 10px', borderRadius: '20px',
-                border: `1px solid ${category === cat ? '#16a34a' : '#e5e7eb'}`,
-                backgroundColor: category === cat ? '#dcfce7' : '#fff',
-                color: category === cat ? '#15803d' : '#6b7280',
-                fontSize: '11px', cursor: 'pointer',
-              }}
-            >
-              {cat === '' ? 'All' : cat.charAt(0).toUpperCase() + cat.slice(1)}
-            </button>
-          ))}
+          <div style={{ padding: '8px 12px 0', display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+            {['', 'fashion', 'electronics', 'food', 'beauty', 'home'].map(cat => (
+              <button
+                key={cat}
+                onClick={() => { setCategory(cat); setProducts([]); }}
+                style={{
+                  padding: '4px 10px', borderRadius: '20px',
+                  border: `1px solid ${category === cat ? '#16a34a' : '#e5e7eb'}`,
+                  backgroundColor: category === cat ? '#dcfce7' : '#fff',
+                  color: category === cat ? '#15803d' : '#6b7280',
+                  fontSize: '11px', cursor: 'pointer',
+                }}
+              >
+                {cat === '' ? 'All' : cat.charAt(0).toUpperCase() + cat.slice(1)}
+              </button>
+            ))}
+          </div>
 
           {/* Product grid */}
           {catalogError && (
@@ -1772,11 +2225,19 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
           <div style={{ padding: '12px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(155px, 1fr))', gap: '12px' }}>
             {products.map(p => {
               const badge = vendorBadgeColor(p.vendor_slug);
+              const cartItem = mvCart.find(i => i.product_id === p.id);
               return (
                 <div
                   key={p.id}
-                  style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', display: 'flex', flexDirection: 'column' }}
+                  onClick={() => openProductModal(p)}
+                  style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', display: 'flex', flexDirection: 'column', cursor: 'pointer', position: 'relative' }}
                 >
+                  {/* Cart badge */}
+                  {cartItem && (
+                    <div style={{ position: 'absolute', top: '6px', right: '6px', backgroundColor: '#16a34a', color: '#fff', borderRadius: '50%', width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', fontWeight: 700, zIndex: 1 }}>
+                      {cartItem.quantity}
+                    </div>
+                  )}
                   {/* Product image or placeholder */}
                   {p.image_url ? (
                     <img
@@ -1813,6 +2274,14 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
                         <span style={{ color: '#9ca3af', marginLeft: '3px' }}>({p.rating_count})</span>
                       </div>
                     )}
+                    {/* Quick add button */}
+                    <button
+                      onClick={e => { e.stopPropagation(); addToMvCart(p); }}
+                      disabled={p.quantity === 0}
+                      style={{ marginTop: '6px', padding: '5px', borderRadius: '6px', border: 'none', backgroundColor: p.quantity === 0 ? '#d1d5db' : '#16a34a', color: '#fff', fontSize: '11px', cursor: p.quantity === 0 ? 'not-allowed' : 'pointer', fontWeight: 600 }}
+                    >
+                      {p.quantity === 0 ? 'Out of Stock' : '+ Add'}
+                    </button>
                   </div>
                 </div>
               );

@@ -142,6 +142,7 @@ export interface MvProduct {
   vendorName: string;
   sku: string;
   name: string;
+  description?: string;
   price: number;     // kobo — strict integer
   quantity: number;
   category?: string;
