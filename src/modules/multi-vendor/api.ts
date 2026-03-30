@@ -1142,7 +1142,8 @@ app.post('/vendors/:id/kyc', async (c) => {
 app.get('/catalog', async (c) => {
   const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
-  const search    = c.req.query('search')?.trim()     ?? '';
+  // Accept both 'q' (frontend convention) and 'search' (legacy) for backward compatibility
+  const search    = (c.req.query('q') ?? c.req.query('search') ?? '').trim();
   const category  = c.req.query('category')?.trim()   ?? '';
   const vendorId  = c.req.query('vendor_id')?.trim()  ?? '';
   const after     = c.req.query('after')?.trim()      ?? '';
@@ -1208,7 +1209,7 @@ app.get('/catalog', async (c) => {
     const sql = `
       SELECT
         p.id, p.sku, p.name, p.description, p.category,
-        p.price, p.quantity, p.image_url, p.vendor_id,
+        p.price, p.quantity, p.image_url, p.has_variants, p.vendor_id,
         v.name  AS vendor_name,
         v.slug  AS vendor_slug,
         v.rating_avg, v.rating_count,
@@ -1301,6 +1302,73 @@ app.get('/catalog', async (c) => {
         return c.json({ success: false, error: String(e2) }, 500);
       }
     }
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-3: PUBLIC ORDER TRACKING — GET /orders/track
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /orders/track?marketplace_order_id=... — Public buyer order tracking
+ * Returns the umbrella order status + per-vendor child order statuses.
+ * No authentication required — marketplace_order_id acts as the lookup key.
+ * NDPR: only returns status fields, no PII beyond masked email.
+ */
+app.get('/orders/track', async (c) => {
+  const tenantId = getTenantId(c);
+  const mkpOrderId = c.req.query('marketplace_order_id')?.trim();
+
+  if (!mkpOrderId) {
+    return c.json({ success: false, error: 'marketplace_order_id is required' }, 400);
+  }
+
+  try {
+    const umbrella = await c.env.DB.prepare(
+      `SELECT id, payment_status, order_status, vendor_count, total_amount,
+              customer_email, created_at, updated_at
+       FROM marketplace_orders
+       WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    ).bind(mkpOrderId, tenantId).first<{
+      id: string; payment_status: string; order_status: string;
+      vendor_count: number; total_amount: number;
+      customer_email: string; created_at: number; updated_at: number;
+    }>();
+
+    if (!umbrella) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    const { results: childOrders } = await c.env.DB.prepare(
+      `SELECT id, vendor_id, order_status, payment_status, total_amount
+       FROM orders
+       WHERE marketplace_order_id = ? AND tenant_id = ? AND deleted_at IS NULL
+       ORDER BY created_at ASC`
+    ).bind(mkpOrderId, tenantId).all<{
+      id: string; vendor_id: string; order_status: string; payment_status: string; total_amount: number;
+    }>();
+
+    // Mask email for NDPR — show first 3 chars + domain
+    const maskedEmail = (() => {
+      const [local, domain] = umbrella.customer_email.split('@');
+      if (!local || !domain) return '***';
+      return `${local.slice(0, 3)}***@${domain}`;
+    })();
+
+    return c.json({
+      success: true,
+      data: {
+        marketplace_order_id: umbrella.id,
+        payment_status: umbrella.payment_status,
+        order_status: umbrella.order_status,
+        vendor_count: umbrella.vendor_count,
+        total_amount: umbrella.total_amount,
+        customer_email_masked: maskedEmail,
+        created_at: umbrella.created_at,
+        updated_at: umbrella.updated_at,
+        vendor_orders: childOrders,
+      },
+    });
+  } catch (e) {
     return c.json({ success: false, error: String(e) }, 500);
   }
 });

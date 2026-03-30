@@ -1292,6 +1292,108 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const data = await res.json() as any;
       expect(data.meta.count).toBe(data.data.length);
     });
+
+    it('accepts "q" query param as search term (frontend convention)', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog?q=Ankara'),
+        mockEnv as any,
+      );
+      const bindArgs = mockDb.bind.mock.calls.flat().map(String);
+      const hasSearch = bindArgs.some(a => a.includes('Ankara'));
+      expect(hasSearch).toBe(true);
+    });
+
+    it('includes has_variants field in catalog SELECT response', async () => {
+      const rowsWithVariants = [
+        { id: 'prod_1', sku: 'SKU001', name: 'Shirt', description: null, category: 'fashion',
+          price: 1500000, quantity: 8, image_url: null, has_variants: 1, vendor_id: 'vnd_1',
+          vendor_name: 'Ade Fashion', vendor_slug: 'ade', rating_avg: null, rating_count: null, created_at: 100 },
+      ];
+      mockDb.all.mockResolvedValue({ results: rowsWithVariants });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/catalog'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data[0]).toHaveProperty('has_variants');
+      expect(data.data[0].has_variants).toBe(1);
+    });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MV-3: PUBLIC ORDER TRACKING — GET /orders/track
+  // ─────────────────────────────────────────────────────────────────────────
+  describe('GET /orders/track — buyer order tracking (MV-3)', () => {
+    const umbrellaRow = {
+      id: 'mkp_order_abc123', payment_status: 'pending', order_status: 'confirmed',
+      vendor_count: 2, total_amount: 3500000,
+      customer_email: 'buyer@example.ng', created_at: 1700000000, updated_at: 1700000010,
+    };
+    const childOrders = [
+      { id: 'ord_1', vendor_id: 'vnd_1', order_status: 'confirmed', payment_status: 'pending', total_amount: 2000000 },
+      { id: 'ord_2', vendor_id: 'vnd_2', order_status: 'confirmed', payment_status: 'pending', total_amount: 1500000 },
+    ];
+
+    it('returns 200 with order status for a valid marketplace_order_id', async () => {
+      mockDb.first.mockResolvedValue(umbrellaRow);
+      mockDb.all.mockResolvedValue({ results: childOrders });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_order_abc123'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.marketplace_order_id).toBe('mkp_order_abc123');
+      expect(data.data.payment_status).toBe('pending');
+      expect(data.data.order_status).toBe('confirmed');
+      expect(data.data.vendor_orders).toHaveLength(2);
+    });
+
+    it('returns 404 when marketplace_order_id is not found', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_nonexistent'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+      const data = await res.json() as any;
+      expect(data.success).toBe(false);
+    });
+
+    it('returns 400 when marketplace_order_id param is missing', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/orders/track'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.success).toBe(false);
+    });
+
+    it('masks customer email for NDPR compliance', async () => {
+      mockDb.first.mockResolvedValue(umbrellaRow);
+      mockDb.all.mockResolvedValue({ results: [] });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_order_abc123'),
+        mockEnv as any,
+      );
+      const data = await res.json() as any;
+      expect(data.data.customer_email_masked).toBe('buy***@example.ng');
+      expect(data.data).not.toHaveProperty('customer_email');
+    });
+
+    it('does not require authentication (public endpoint)', async () => {
+      mockDb.first.mockResolvedValue(umbrellaRow);
+      mockDb.all.mockResolvedValue({ results: [] });
+      const req = new Request('http://localhost/orders/track?marketplace_order_id=mkp_order_abc123', {
+        headers: { 'x-tenant-id': 'tnt_test' },
+      });
+      const res = await multiVendorRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(200);
+    });
+  });
+
   });
 
   // ─────────────────────────────────────────────────────────────────────────

@@ -1639,6 +1639,11 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   const [showCart, setShowCart] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
   const [orderSuccess, setOrderSuccess] = useState<{ marketplace_order_id: string } | null>(null);
+  const [trackingData, setTrackingData] = useState<{
+    payment_status: string; order_status: string; vendor_count: number;
+    vendor_orders: Array<{ id: string; vendor_id: string; order_status: string; payment_status: string; total_amount: number }>;
+  } | null>(null);
+  const [trackingLoading, setTrackingLoading] = useState(false);
 
   // Rehydrate cart from server on mount if we have a token
   useEffect(() => {
@@ -2002,13 +2007,15 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
       {/* ── Order success screen ────────────────────────────────────────────── */}
       {orderSuccess && (
         <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }}>
-          <div style={{ backgroundColor: '#fff', borderRadius: '16px', padding: '32px 24px', maxWidth: '360px', width: '100%', textAlign: 'center' }}>
-            <div style={{ fontSize: '48px', marginBottom: '16px' }}>🎉</div>
-            <div style={{ fontSize: '20px', fontWeight: 700, marginBottom: '8px', color: '#111827' }}>Order Placed!</div>
-            <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '16px' }}>Your order has been received and vendors have been notified.</div>
-            <div style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '16px', padding: '28px 20px', maxWidth: '380px', width: '100%', maxHeight: '90vh', overflowY: 'auto' }}>
+            <div style={{ textAlign: 'center', marginBottom: '16px' }}>
+              <div style={{ fontSize: '48px', marginBottom: '8px' }}>🎉</div>
+              <div style={{ fontSize: '20px', fontWeight: 700, color: '#111827' }}>Order Placed!</div>
+              <div style={{ fontSize: '13px', color: '#6b7280', marginTop: '4px' }}>Your order has been received and vendors have been notified.</div>
+            </div>
+            <div style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '8px', padding: '12px', marginBottom: '12px', textAlign: 'center' }}>
               <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>Order Reference</div>
-              <div style={{ fontSize: '14px', fontWeight: 700, color: '#15803d', wordBreak: 'break-all' }}>{orderSuccess.marketplace_order_id}</div>
+              <div style={{ fontSize: '13px', fontWeight: 700, color: '#15803d', wordBreak: 'break-all' }}>{orderSuccess.marketplace_order_id}</div>
               <button
                 onClick={() => { navigator.clipboard?.writeText(orderSuccess.marketplace_order_id).catch(() => {}); }}
                 style={{ marginTop: '8px', padding: '5px 14px', backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px', fontSize: '12px', color: '#15803d', cursor: 'pointer', fontWeight: 600 }}
@@ -2016,21 +2023,46 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
                 📋 Copy Reference
               </button>
             </div>
-            <div style={{ backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', textAlign: 'left' }}>
-              <div style={{ fontSize: '12px', color: '#1d4ed8', fontWeight: 600, marginBottom: '4px' }}>📦 Track your order</div>
-              <div style={{ fontSize: '12px', color: '#374151', lineHeight: '1.5' }}>
-                Use your order reference to track delivery status with each vendor. Updates will be sent to your email.
+
+            {/* Track order button + live status */}
+            <button
+              onClick={() => {
+                if (trackingData) { setTrackingData(null); return; }
+                setTrackingLoading(true);
+                fetch(`/api/multi-vendor/orders/track?marketplace_order_id=${encodeURIComponent(orderSuccess.marketplace_order_id)}`, {
+                  headers: { 'x-tenant-id': tenantId },
+                })
+                  .then(r => r.json() as Promise<{ success: boolean; data?: typeof trackingData }>)
+                  .then(d => { if (d.success && d.data) setTrackingData(d.data); })
+                  .catch(() => {})
+                  .finally(() => setTrackingLoading(false));
+              }}
+              style={{ width: '100%', padding: '10px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '8px', fontWeight: 600, cursor: 'pointer', fontSize: '13px', marginBottom: '10px' }}
+            >
+              {trackingLoading ? 'Fetching status…' : trackingData ? 'Hide Status' : '📦 Track This Order'}
+            </button>
+
+            {trackingData && (
+              <div style={{ backgroundColor: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                  <span style={{ padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600, backgroundColor: trackingData.payment_status === 'paid' ? '#dcfce7' : '#fef9c3', color: trackingData.payment_status === 'paid' ? '#15803d' : '#ca8a04' }}>
+                    {trackingData.payment_status}
+                  </span>
+                  <span style={{ padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600, backgroundColor: '#e0f2fe', color: '#0369a1' }}>
+                    {trackingData.order_status}
+                  </span>
+                </div>
+                {trackingData.vendor_orders.map((vo, i) => (
+                  <div key={vo.id} style={{ fontSize: '12px', color: '#374151', borderTop: i > 0 ? '1px solid #e5e7eb' : 'none', paddingTop: i > 0 ? '6px' : 0, marginTop: i > 0 ? '6px' : 0 }}>
+                    <span style={{ fontWeight: 600 }}>Vendor order {i + 1}:</span> {vo.order_status} · {vo.payment_status} · {formatKoboToNaira(vo.total_amount)}
+                  </div>
+                ))}
               </div>
-            </div>
+            )}
+
             <div style={{ display: 'flex', gap: '8px' }}>
               <button
-                onClick={() => { setOrderSuccess(null); setActiveTab('vendor-dashboard'); }}
-                style={{ flex: 1, padding: '11px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '8px', fontWeight: 600, cursor: 'pointer', fontSize: '13px' }}
-              >
-                View Orders
-              </button>
-              <button
-                onClick={() => { setOrderSuccess(null); setActiveTab('browse'); }}
+                onClick={() => { setOrderSuccess(null); setTrackingData(null); setActiveTab('browse'); }}
                 style={{ flex: 1, padding: '11px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '13px' }}
               >
                 Shop More
