@@ -353,6 +353,51 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
+  describe('GET /vendors/:id/products/:productId/variants — public product variants', () => {
+    it('returns 404 when product not found', async () => {
+      mockDb.first.mockResolvedValueOnce(null);
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/vendors/vnd_1/products/prod_nonexistent/variants'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('returns variants grouped for a valid product', async () => {
+      mockDb.first.mockResolvedValueOnce({ id: 'prod_1' });
+      mockDb.all.mockResolvedValueOnce({
+        results: [
+          { id: 'var_1', option_name: 'Size', option_value: 'S', price_delta: 0, quantity: 10 },
+          { id: 'var_2', option_name: 'Size', option_value: 'M', price_delta: 500, quantity: 5 },
+          { id: 'var_3', option_name: 'Color', option_value: 'Red', price_delta: 0, quantity: 8 },
+        ],
+      });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/vendors/vnd_1/products/prod_1/variants'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.variants).toHaveLength(3);
+      expect(data.data.variants[0]).toMatchObject({ option_name: 'Size', option_value: 'S' });
+      expect(data.data.variants[1]).toMatchObject({ option_name: 'Size', option_value: 'M', price_delta: 500 });
+    });
+
+    it('returns empty variants array when product has no variants', async () => {
+      mockDb.first.mockResolvedValueOnce({ id: 'prod_1' });
+      mockDb.all.mockResolvedValueOnce({ results: [] });
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/vendors/vnd_1/products/prod_1/variants'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.variants).toHaveLength(0);
+    });
+  });
+
   describe('GET /orders — vendor JWT scoped (G-2 fix)', () => {
     it('returns 401 without JWT', async () => {
       const res = await multiVendorRouter.fetch(makeRequest('GET', '/orders'), mockEnv as any);

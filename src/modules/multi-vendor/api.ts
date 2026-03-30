@@ -293,6 +293,36 @@ app.get('/vendors/:id/products', async (c) => {
   }
 });
 
+/**
+ * GET /vendors/:id/products/:productId/variants — List product variants (public)
+ * Returns grouped variant options so the storefront can render a picker.
+ */
+app.get('/vendors/:id/products/:productId/variants', async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('productId');
+
+  try {
+    // Guard: product must belong to this vendor and tenant, and be active
+    const product = await c.env.DB.prepare(
+      "SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL"
+    ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+
+    if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, option_name, option_value, price_delta, quantity
+       FROM product_variants
+       WHERE product_id = ?
+       ORDER BY option_name ASC, option_value ASC`
+    ).bind(productId).all();
+
+    return c.json({ success: true, data: { variants: results } });
+  } catch {
+    return c.json({ success: true, data: { variants: [] } });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADMIN ENDPOINTS — requireRole(['SUPER_ADMIN', 'TENANT_ADMIN'])
 // ═══════════════════════════════════════════════════════════════════════════════

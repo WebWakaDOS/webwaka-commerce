@@ -1585,6 +1585,15 @@ interface CatalogProduct {
   vendor_slug: string;
   rating_avg: number | null;
   rating_count: number | null;
+  has_variants?: number;
+}
+
+interface MvProductVariant {
+  id: string;
+  option_name: string;
+  option_value: string;
+  price_delta: number;
+  quantity: number;
 }
 
 // ── Vendor badge colours (deterministic from vendor_slug hash) ────────────────
@@ -1631,10 +1640,52 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   const [showCheckout, setShowCheckout] = useState(false);
   const [orderSuccess, setOrderSuccess] = useState<{ marketplace_order_id: string } | null>(null);
 
-  // Persist cart to localStorage whenever it changes
+  // Rehydrate cart from server on mount if we have a token
+  useEffect(() => {
+    const token = localStorage.getItem(MV_CART_TOKEN_KEY);
+    if (!token) return;
+    fetch(`/api/multi-vendor/cart/${encodeURIComponent(token)}`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data?: { items: MvCartItem[] } }>)
+      .then(d => {
+        if (d.success && d.data?.items?.length) {
+          setMvCart(d.data.items);
+          localStorage.setItem(MV_CART_KEY, JSON.stringify(d.data.items));
+        } else {
+          // Token expired or cart gone — fall back to localStorage items
+          const saved = localStorage.getItem(MV_CART_KEY);
+          if (saved) { try { setMvCart(JSON.parse(saved)); } catch { /* noop */ } }
+        }
+      })
+      .catch(() => {
+        const saved = localStorage.getItem(MV_CART_KEY);
+        if (saved) { try { setMvCart(JSON.parse(saved)); } catch { /* noop */ } }
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenantId]);
+
+  // Sync cart to server (POST /cart) and persist to localStorage whenever it changes
+  const cartSyncRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     localStorage.setItem(MV_CART_KEY, JSON.stringify(mvCart));
-  }, [mvCart, MV_CART_KEY]);
+    if (mvCart.length === 0) return;
+    // Debounce server sync by 600ms to avoid hammering API on rapid adds
+    if (cartSyncRef.current) clearTimeout(cartSyncRef.current);
+    cartSyncRef.current = setTimeout(async () => {
+      try {
+        const token = localStorage.getItem(MV_CART_TOKEN_KEY);
+        const res = await fetch('/api/multi-vendor/cart', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+          body: JSON.stringify({ items: mvCart, ndpr_consent: true, ...(token ? { token } : {}) }),
+        });
+        const d = await res.json() as { success: boolean; data?: { token: string } };
+        if (d.success && d.data?.token) {
+          localStorage.setItem(MV_CART_TOKEN_KEY, d.data.token);
+          setCartToken(d.data.token);
+        }
+      } catch { /* noop — cart already persisted in localStorage */ }
+    }, 600);
+  }, [mvCart, MV_CART_KEY, MV_CART_TOKEN_KEY, tenantId]);
 
   const addToMvCart = useCallback((p: CatalogProduct) => {
     setMvCart(prev => {
@@ -1667,17 +1718,58 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   // ── Product detail modal ──────────────────────────────────────────────────
   const [selectedProduct, setSelectedProduct] = useState<CatalogProduct | null>(null);
   const [modalQty, setModalQty] = useState(1);
+  const [mvVariants, setMvVariants] = useState<MvProductVariant[]>([]);
+  const [mvVariantsLoading, setMvVariantsLoading] = useState(false);
+  const [mvSelectedVariant, setMvSelectedVariant] = useState<MvProductVariant | null>(null);
+
+  const mvVariantGroups = useMemo<Record<string, MvProductVariant[]>>(() => {
+    const groups: Record<string, MvProductVariant[]> = {};
+    for (const v of mvVariants) {
+      if (!groups[v.option_name]) groups[v.option_name] = [];
+      groups[v.option_name]!.push(v);
+    }
+    return groups;
+  }, [mvVariants]);
 
   const openProductModal = (p: CatalogProduct) => {
     setSelectedProduct(p);
     setModalQty(1);
+    setMvVariants([]);
+    setMvSelectedVariant(null);
+    if (p.has_variants) {
+      setMvVariantsLoading(true);
+      fetch(`/api/multi-vendor/vendors/${p.vendor_id}/products/${p.id}/variants`, {
+        headers: { 'x-tenant-id': tenantId },
+      })
+        .then(r => r.json() as Promise<{ success: boolean; data: { variants: MvProductVariant[] } }>)
+        .then(d => { if (d.success) setMvVariants(d.data.variants ?? []); })
+        .catch(() => {})
+        .finally(() => setMvVariantsLoading(false));
+    }
   };
 
   const closeProductModal = () => setSelectedProduct(null);
 
   const handleAddFromModal = () => {
     if (!selectedProduct) return;
-    for (let i = 0; i < modalQty; i++) addToMvCart(selectedProduct);
+    const effectivePrice = selectedProduct.price + (mvSelectedVariant?.price_delta ?? 0);
+    const availableQty = mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity;
+    const name = mvSelectedVariant ? `${selectedProduct.name} — ${mvSelectedVariant.option_value}` : selectedProduct.name;
+    const cartKey = mvSelectedVariant ? `${selectedProduct.id}__${mvSelectedVariant.id}` : selectedProduct.id;
+    const qty = Math.min(modalQty, availableQty);
+    setMvCart(prev => {
+      const existing = prev.find(i => i.product_id === cartKey);
+      if (existing) {
+        return prev.map(i => i.product_id === cartKey ? { ...i, quantity: i.quantity + qty } : i);
+      }
+      return [...prev, {
+        product_id: cartKey,
+        vendor_id: selectedProduct.vendor_id,
+        vendor_name: selectedProduct.vendor_name,
+        vendor_slug: selectedProduct.vendor_slug,
+        name, price: effectivePrice, quantity: qty, image_url: selectedProduct.image_url,
+      }];
+    });
     closeProductModal();
   };
 
@@ -1771,6 +1863,7 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [category, setCategory] = useState('');
+  const [vendorFilter, setVendorFilter] = useState<string>(''); // vendor id for pill filter
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [catalogLoading, setCatalogLoading] = useState(false);
@@ -1781,29 +1874,52 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
     setCatalogLoading(true);
     setCatalogError('');
     try {
-      const params = new URLSearchParams({ per_page: '12' });
-      if (cursor)   params.set('after', cursor);
-      if (search)   params.set('search', search);
-      if (category) params.set('category', category);
-      const res = await fetch(`/api/multi-vendor/catalog?${params}`, {
-        headers: { 'x-tenant-id': tenantId },
-      });
-      if (!res.ok) throw new Error(`Catalog fetch failed (${res.status})`);
-      const json = await res.json() as {
-        success: boolean;
-        data: CatalogProduct[];
-        meta: { has_more: boolean; next_cursor: string | null };
-      };
-      setProducts(prev => reset ? json.data : [...prev, ...json.data]);
-      setHasMore(json.meta.has_more);
-      setNextCursor(json.meta.next_cursor);
+      let url: string;
+      let fetchedProducts: CatalogProduct[] = [];
+      let fetchedHasMore = false;
+      let fetchedNextCursor: string | null = null;
+
+      if (vendorFilter) {
+        // Vendor pill selected — fetch that vendor's products
+        const res = await fetch(`/api/multi-vendor/vendors/${encodeURIComponent(vendorFilter)}/products`, {
+          headers: { 'x-tenant-id': tenantId },
+        });
+        if (!res.ok) throw new Error(`Vendor products fetch failed (${res.status})`);
+        const json = await res.json() as { success: boolean; data: CatalogProduct[] };
+        // Client-side category filter
+        fetchedProducts = json.data ?? [];
+        if (category) fetchedProducts = fetchedProducts.filter(p => p.category === category);
+        if (search) fetchedProducts = fetchedProducts.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
+        fetchedHasMore = false;
+        fetchedNextCursor = null;
+      } else {
+        const params = new URLSearchParams({ per_page: '12' });
+        if (cursor)   params.set('after', cursor);
+        if (search)   params.set('q', search);
+        if (category) params.set('category', category);
+        url = `/api/multi-vendor/catalog?${params}`;
+        const res = await fetch(url, { headers: { 'x-tenant-id': tenantId } });
+        if (!res.ok) throw new Error(`Catalog fetch failed (${res.status})`);
+        const json = await res.json() as {
+          success: boolean;
+          data: CatalogProduct[];
+          meta: { has_more: boolean; next_cursor: string | null };
+        };
+        fetchedProducts = json.data;
+        fetchedHasMore = json.meta.has_more;
+        fetchedNextCursor = json.meta.next_cursor;
+      }
+
+      setProducts(prev => reset ? fetchedProducts : [...prev, ...fetchedProducts]);
+      setHasMore(fetchedHasMore);
+      setNextCursor(fetchedNextCursor);
     } catch (e) {
       setCatalogError(String(e));
       if (reset) setProducts([]);
     } finally {
       setCatalogLoading(false);
     }
-  }, [tenantId, search, category]);
+  }, [tenantId, search, category, vendorFilter]);
 
   // Initial load and when filters change
   useEffect(() => {
@@ -1823,19 +1939,21 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
     return () => obs.disconnect();
   }, [hasMore, catalogLoading, nextCursor, fetchCatalog]);
 
-  // ── Vendor list state (live from /vendors) ───────────────────────────────
+  // ── Vendor list state (live from /vendors — used for browse pills + vendors tab) ──
   const [vendors, setVendors] = useState<Array<{ id: string; name: string; slug: string; status: string; commission_rate: number }>>([]);
   const [vendorsLoading, setVendorsLoading] = useState(false);
 
   useEffect(() => {
-    if (activeTab !== 'vendors') return;
+    // Load vendors for the browse vendor filter pills and the vendors tab
+    if (activeTab !== 'vendors' && activeTab !== 'browse') return;
+    if (vendors.length > 0) return; // already loaded
     setVendorsLoading(true);
     fetch('/api/multi-vendor/vendors', { headers: { 'x-tenant-id': tenantId } })
       .then(r => r.ok ? r.json() as Promise<{ success: boolean; data: typeof vendors }> : Promise.reject(r.status))
       .then(j => setVendors(j.data ?? []))
       .catch(() => setVendors([]))
       .finally(() => setVendorsLoading(false));
-  }, [activeTab, tenantId]);
+  }, [activeTab, tenantId, vendors.length]);
 
   const tabs: Array<{ id: typeof activeTab; label: string }> = [
     { id: 'browse', label: t.marketplace_products },
@@ -1865,9 +1983,15 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             <div style={{ fontSize: '48px', marginBottom: '16px' }}>🎉</div>
             <div style={{ fontSize: '20px', fontWeight: 700, marginBottom: '8px', color: '#111827' }}>Order Placed!</div>
             <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '16px' }}>Your order has been received and vendors have been notified.</div>
-            <div style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '8px', padding: '12px', marginBottom: '20px' }}>
+            <div style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
               <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>Order Reference</div>
               <div style={{ fontSize: '14px', fontWeight: 700, color: '#15803d', wordBreak: 'break-all' }}>{orderSuccess.marketplace_order_id}</div>
+            </div>
+            <div style={{ backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: '8px', padding: '10px 12px', marginBottom: '20px', textAlign: 'left' }}>
+              <div style={{ fontSize: '12px', color: '#1d4ed8', fontWeight: 600, marginBottom: '4px' }}>📦 Track your order</div>
+              <div style={{ fontSize: '12px', color: '#3b82f6', lineHeight: '1.5' }}>
+                Save your order reference above to track delivery status. You will receive updates at your email address.
+              </div>
             </div>
             <button
               onClick={() => { setOrderSuccess(null); setActiveTab('browse'); }}
@@ -1915,7 +2039,16 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
               <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '4px' }}>{selectedProduct.category}</div>
             )}
             <div style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px', color: '#111827' }}>{selectedProduct.name}</div>
-            <div style={{ fontSize: '22px', fontWeight: 800, color: '#16a34a', marginBottom: '12px' }}>{formatKoboToNaira(selectedProduct.price)}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+              <span style={{ fontSize: '22px', fontWeight: 800, color: '#16a34a' }}>
+                {formatKoboToNaira(selectedProduct.price + (mvSelectedVariant?.price_delta ?? 0))}
+              </span>
+              {mvSelectedVariant?.price_delta ? (
+                <span style={{ fontSize: '12px', color: mvSelectedVariant.price_delta > 0 ? '#dc2626' : '#16a34a' }}>
+                  {mvSelectedVariant.price_delta > 0 ? '+' : ''}{formatKoboToNaira(mvSelectedVariant.price_delta)}
+                </span>
+              ) : null}
+            </div>
 
             {selectedProduct.rating_avg != null && (
               <div style={{ fontSize: '12px', color: '#f59e0b', marginBottom: '10px' }}>
@@ -1928,42 +2061,78 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
               <div style={{ fontSize: '13px', color: '#4b5563', lineHeight: '1.6', marginBottom: '16px' }}>{selectedProduct.description}</div>
             )}
 
-            <div style={{ fontSize: '12px', color: selectedProduct.quantity > 0 ? '#16a34a' : '#dc2626', marginBottom: '16px', fontWeight: 600 }}>
-              {selectedProduct.quantity > 0 ? `${selectedProduct.quantity} in stock` : 'Out of stock'}
+            {/* Variant picker */}
+            {mvVariantsLoading && <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '12px' }}>Loading options…</div>}
+            {Object.entries(mvVariantGroups).map(([optionName, variants]) => (
+              <div key={optionName} style={{ marginBottom: '14px' }}>
+                <div style={{ fontSize: '12px', fontWeight: 700, color: '#374151', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{optionName}</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {variants.map(v => (
+                    <button
+                      key={v.id}
+                      onClick={() => setMvSelectedVariant(prev => prev?.id === v.id ? null : v)}
+                      disabled={v.quantity === 0}
+                      style={{
+                        padding: '6px 14px', borderRadius: '20px', fontSize: '13px', fontWeight: 600, cursor: v.quantity === 0 ? 'not-allowed' : 'pointer',
+                        border: `2px solid ${mvSelectedVariant?.id === v.id ? '#16a34a' : '#e5e7eb'}`,
+                        backgroundColor: mvSelectedVariant?.id === v.id ? '#f0fdf4' : v.quantity === 0 ? '#f9fafb' : '#fff',
+                        color: v.quantity === 0 ? '#9ca3af' : mvSelectedVariant?.id === v.id ? '#15803d' : '#374151',
+                        textDecoration: v.quantity === 0 ? 'line-through' : 'none',
+                      }}
+                    >
+                      {v.option_value}{v.price_delta !== 0 ? ` (${v.price_delta > 0 ? '+' : ''}${formatKoboToNaira(v.price_delta)})` : ''}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+
+            <div style={{ fontSize: '12px', color: (mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity) > 0 ? '#16a34a' : '#dc2626', marginBottom: '16px', fontWeight: 600 }}>
+              {(mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity) > 0
+                ? `${mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity} in stock`
+                : 'Out of stock'}
             </div>
 
             {/* Quantity stepper */}
-            {selectedProduct.quantity > 0 && (
+            {(mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity) > 0 && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
                 <span style={{ fontSize: '13px', color: '#374151', fontWeight: 600 }}>Quantity:</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0', border: '1px solid #e5e7eb', borderRadius: '8px', overflow: 'hidden' }}>
                   <button onClick={() => setModalQty(q => Math.max(1, q - 1))} style={{ padding: '8px 14px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '16px', fontWeight: 700 }}>−</button>
                   <span style={{ padding: '8px 16px', fontSize: '15px', fontWeight: 700, minWidth: '40px', textAlign: 'center' }}>{modalQty}</span>
-                  <button onClick={() => setModalQty(q => Math.min(selectedProduct.quantity, q + 1))} style={{ padding: '8px 14px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '16px', fontWeight: 700 }}>+</button>
+                  <button onClick={() => setModalQty(q => Math.min(mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity, q + 1))} style={{ padding: '8px 14px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '16px', fontWeight: 700 }}>+</button>
                 </div>
               </div>
             )}
 
             {/* Action buttons */}
-            <div style={{ display: 'flex', gap: '10px', marginBottom: '12px' }}>
-              <button
-                onClick={handleAddFromModal}
-                disabled={selectedProduct.quantity === 0}
-                style={{ flex: 1, padding: '13px', backgroundColor: selectedProduct.quantity === 0 ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: selectedProduct.quantity === 0 ? 'not-allowed' : 'pointer' }}
-              >
-                {selectedProduct.quantity === 0 ? 'Out of Stock' : 'Add to Cart'}
-              </button>
-              {/* WhatsApp share */}
-              <a
-                href={`https://wa.me/?text=${encodeURIComponent(`Check out ${selectedProduct.name} for ${formatKoboToNaira(selectedProduct.price)} on WebWaka Marketplace! ${window.location.origin}`)}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '13px 16px', backgroundColor: '#25d366', color: '#fff', borderRadius: '10px', textDecoration: 'none', fontSize: '20px' }}
-                title="Share on WhatsApp"
-              >
-                💬
-              </a>
-            </div>
+            {(() => {
+              const needsVariant = !!selectedProduct.has_variants && mvVariants.length > 0 && !mvSelectedVariant;
+              const stockQty = mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity;
+              const isDisabled = stockQty === 0 || needsVariant;
+              const effectivePrice = selectedProduct.price + (mvSelectedVariant?.price_delta ?? 0);
+              return (
+                <div style={{ display: 'flex', gap: '10px', marginBottom: '12px' }}>
+                  <button
+                    onClick={handleAddFromModal}
+                    disabled={isDisabled}
+                    style={{ flex: 1, padding: '13px', backgroundColor: isDisabled ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: isDisabled ? 'not-allowed' : 'pointer' }}
+                  >
+                    {stockQty === 0 ? 'Out of Stock' : needsVariant ? 'Select an option' : `Add ${modalQty > 1 ? `${modalQty}x ` : ''}to Cart — ${formatKoboToNaira(effectivePrice * modalQty)}`}
+                  </button>
+                  {/* WhatsApp share */}
+                  <a
+                    href={`https://wa.me/?text=${encodeURIComponent(`Check out "${selectedProduct.name}" for ${formatKoboToNaira(effectivePrice)} on WebWaka Marketplace!\n${window.location.origin}/?product=${encodeURIComponent(selectedProduct.vendor_slug + '_' + selectedProduct.id)}`)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '13px 16px', backgroundColor: '#25d366', color: '#fff', borderRadius: '10px', textDecoration: 'none', fontSize: '20px' }}
+                    title="Share on WhatsApp"
+                  >
+                    💬
+                  </a>
+                </div>
+              );
+            })()}
 
             <button
               onClick={closeProductModal}
@@ -2201,9 +2370,9 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
                 onClick={() => { setCategory(cat); setProducts([]); }}
                 style={{
                   padding: '4px 10px', borderRadius: '20px',
-                  border: `1px solid ${category === cat ? '#16a34a' : '#e5e7eb'}`,
-                  backgroundColor: category === cat ? '#dcfce7' : '#fff',
-                  color: category === cat ? '#15803d' : '#6b7280',
+                  border: `1px solid ${category === cat && !vendorFilter ? '#16a34a' : '#e5e7eb'}`,
+                  backgroundColor: category === cat && !vendorFilter ? '#dcfce7' : '#fff',
+                  color: category === cat && !vendorFilter ? '#15803d' : '#6b7280',
                   fontSize: '11px', cursor: 'pointer',
                 }}
               >
@@ -2211,6 +2380,32 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
               </button>
             ))}
           </div>
+
+          {/* Vendor filter pills */}
+          {vendors.length > 0 && (
+            <div style={{ padding: '6px 12px 0', display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
+              <span style={{ fontSize: '10px', color: '#9ca3af', fontWeight: 600, marginRight: '2px' }}>Vendor:</span>
+              <button
+                onClick={() => { setVendorFilter(''); setProducts([]); }}
+                style={{ padding: '3px 8px', borderRadius: '20px', border: `1px solid ${!vendorFilter ? '#6d28d9' : '#e5e7eb'}`, backgroundColor: !vendorFilter ? '#ede9fe' : '#fff', color: !vendorFilter ? '#6d28d9' : '#6b7280', fontSize: '10px', cursor: 'pointer' }}
+              >
+                All Vendors
+              </button>
+              {vendors.map(v => {
+                const badge = vendorBadgeColor(v.slug);
+                const isActive = vendorFilter === v.id;
+                return (
+                  <button
+                    key={v.id}
+                    onClick={() => { setVendorFilter(isActive ? '' : v.id); setCategory(''); setProducts([]); }}
+                    style={{ padding: '3px 8px', borderRadius: '20px', border: `1px solid ${isActive ? badge.text : '#e5e7eb'}`, backgroundColor: isActive ? badge.bg : '#fff', color: isActive ? badge.text : '#6b7280', fontSize: '10px', cursor: 'pointer', fontWeight: isActive ? 600 : 400 }}
+                  >
+                    @{v.slug}
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
           {/* Product grid */}
           {catalogError && (
@@ -2364,7 +2559,19 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   const [vendorName, setVendorName] = useState<string | null>(() =>
     sessionStorage.getItem(`ww_vname_${tenantId}`)
   );
-  const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'kyc' | 'payouts'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'kyc' | 'payouts'>('overview');
+
+  // ── Vendor product management state ─────────────────────────────────────
+  const [vendorProducts, setVendorProducts] = useState<Array<{
+    id: string; sku: string; name: string; description: string | null; category: string | null;
+    price: number; quantity: number; image_url: string | null;
+  }>>([]);
+  const [vpLoading, setVpLoading] = useState(false);
+  const [showAddProduct, setShowAddProduct] = useState(false);
+  const [addProdForm, setAddProdForm] = useState({ sku: '', name: '', price: '', quantity: '', category: '', description: '', image_url: '' });
+  const [addProdSubmitting, setAddProdSubmitting] = useState(false);
+  const [addProdError, setAddProdError] = useState('');
+  const [addProdSuccess, setAddProdSuccess] = useState('');
 
   const [otpStep, setOtpStep] = useState<'phone' | 'code'>('phone');
   const [otpPhone, setOtpPhone] = useState('');
@@ -2450,6 +2657,50 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
     sessionStorage.removeItem(`ww_vid_${tenantId}`);
     sessionStorage.removeItem(`ww_vname_${tenantId}`);
     setOverview(null); setOrders([]); setSettlements([]); setPayoutsMeta(null);
+  };
+
+  useEffect(() => {
+    if (!authToken || !vendorId || activeTab !== 'products') return;
+    setVpLoading(true);
+    fetch(`/api/multi-vendor/vendors/${vendorId}/products`, { headers: apiHeaders() })
+      .then(r => r.json() as Promise<{ success: boolean; data: typeof vendorProducts }>)
+      .then(d => { if (d.success) setVendorProducts(d.data ?? []); })
+      .catch(() => {})
+      .finally(() => setVpLoading(false));
+  }, [authToken, vendorId, activeTab, apiHeaders]);
+
+  const handleAddProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!vendorId || !authToken) return;
+    const priceKobo = Math.round(parseFloat(addProdForm.price) * 100);
+    const qty = parseInt(addProdForm.quantity, 10);
+    if (!addProdForm.sku.trim() || !addProdForm.name.trim()) { setAddProdError('SKU and Name are required'); return; }
+    if (!Number.isFinite(priceKobo) || priceKobo <= 0) { setAddProdError('Price must be a positive number'); return; }
+    if (!Number.isInteger(qty) || qty < 0) { setAddProdError('Quantity must be a non-negative whole number'); return; }
+    setAddProdSubmitting(true); setAddProdError(''); setAddProdSuccess('');
+    try {
+      const body: Record<string, unknown> = {
+        sku: addProdForm.sku.trim(), name: addProdForm.name.trim(),
+        price: priceKobo, quantity: qty,
+      };
+      if (addProdForm.category.trim()) body.category = addProdForm.category.trim();
+      if (addProdForm.description.trim()) body.description = addProdForm.description.trim();
+      if (addProdForm.image_url.trim()) body.image_url = addProdForm.image_url.trim();
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/products`, {
+        method: 'POST', headers: apiHeaders(), body: JSON.stringify(body),
+      });
+      const d = await res.json() as { success: boolean; data?: { id: string; name: string }; error?: string };
+      if (d.success && d.data) {
+        setAddProdSuccess(`"${d.data.name}" added successfully!`);
+        setAddProdForm({ sku: '', name: '', price: '', quantity: '', category: '', description: '', image_url: '' });
+        setShowAddProduct(false);
+        // Refresh product list
+        const refetch = await fetch(`/api/multi-vendor/vendors/${vendorId}/products`, { headers: apiHeaders() });
+        const rd = await refetch.json() as { success: boolean; data: typeof vendorProducts };
+        if (rd.success) setVendorProducts(rd.data ?? []);
+      } else setAddProdError(d.error ?? 'Failed to add product');
+    } catch { setAddProdError('Network error. Try again.'); }
+    finally { setAddProdSubmitting(false); }
   };
 
   useEffect(() => {
@@ -2612,8 +2863,9 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
         </button>
       </div>
 
-      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb' }}>
+      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', overflowX: 'auto' }}>
         <button style={S.tab(activeTab === 'overview')} onClick={() => setActiveTab('overview')}>📊 Overview</button>
+        <button style={S.tab(activeTab === 'products')} onClick={() => setActiveTab('products')}>🛒 Products</button>
         <button style={S.tab(activeTab === 'orders')} onClick={() => setActiveTab('orders')}>📦 Orders</button>
         <button style={S.tab(activeTab === 'kyc')} onClick={() => setActiveTab('kyc')}>🔖 KYC</button>
         <button style={S.tab(activeTab === 'payouts')} onClick={() => setActiveTab('payouts')}>💸 Payouts</button>
@@ -2642,6 +2894,75 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
           ) : (
             <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>Loading overview…</div>
           )
+        )}
+
+        {activeTab === 'products' && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <div style={{ fontWeight: 700, fontSize: '15px' }}>My Products</div>
+              <button
+                onClick={() => { setShowAddProduct(true); setAddProdError(''); setAddProdSuccess(''); }}
+                style={{ padding: '8px 14px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}
+              >
+                + Add Product
+              </button>
+            </div>
+            {addProdSuccess && <div style={{ padding: '10px 12px', backgroundColor: '#dcfce7', border: '1px solid #bbf7d0', borderRadius: '8px', color: '#15803d', fontSize: '13px', marginBottom: '12px' }}>{addProdSuccess}</div>}
+            {showAddProduct && (
+              <div style={{ backgroundColor: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: '10px', padding: '16px', marginBottom: '16px' }}>
+                <div style={{ fontWeight: 700, fontSize: '14px', marginBottom: '12px' }}>Add New Product</div>
+                <form onSubmit={handleAddProduct}>
+                  <label style={S.label}>SKU <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="text" placeholder="e.g. FAB-001" value={addProdForm.sku} onChange={e => setAddProdForm(f => ({ ...f, sku: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Product Name <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="text" placeholder="e.g. Ankara Fabric" value={addProdForm.name} onChange={e => setAddProdForm(f => ({ ...f, name: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Price (₦) <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="number" placeholder="e.g. 5000" min="0.01" step="0.01" value={addProdForm.price} onChange={e => setAddProdForm(f => ({ ...f, price: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Quantity <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="number" placeholder="e.g. 50" min="0" step="1" value={addProdForm.quantity} onChange={e => setAddProdForm(f => ({ ...f, quantity: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Category</label>
+                  <input type="text" placeholder="e.g. fashion" value={addProdForm.category} onChange={e => setAddProdForm(f => ({ ...f, category: e.target.value }))} style={S.input} />
+                  <label style={S.label}>Description</label>
+                  <input type="text" placeholder="Short description" value={addProdForm.description} onChange={e => setAddProdForm(f => ({ ...f, description: e.target.value }))} style={S.input} />
+                  <label style={S.label}>Image URL (optional)</label>
+                  <input type="url" placeholder="https://..." value={addProdForm.image_url} onChange={e => setAddProdForm(f => ({ ...f, image_url: e.target.value }))} style={S.input} />
+                  {addProdError && <div style={{ padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '10px' }}>{addProdError}</div>}
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button type="submit" disabled={addProdSubmitting} style={{ flex: 1, padding: '11px', backgroundColor: addProdSubmitting ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: addProdSubmitting ? 'wait' : 'pointer', fontSize: '14px' }}>
+                      {addProdSubmitting ? 'Adding…' : 'Add Product'}
+                    </button>
+                    <button type="button" onClick={() => setShowAddProduct(false)} style={{ padding: '11px 16px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}>Cancel</button>
+                  </div>
+                </form>
+              </div>
+            )}
+            {vpLoading ? (
+              <div style={{ textAlign: 'center', padding: '24px', color: '#9ca3af', fontSize: '13px' }}>Loading products…</div>
+            ) : vendorProducts.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280', fontSize: '13px' }}>No products yet. Add your first product above.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {vendorProducts.map(p => (
+                  <div key={p.id} style={{ ...S.card, display: 'flex', gap: '12px', alignItems: 'flex-start', marginBottom: 0 }}>
+                    {p.image_url ? (
+                      <img src={p.image_url} alt={p.name} style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+                    ) : (
+                      <div style={{ width: '52px', height: '52px', backgroundColor: '#fef9c3', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', flexShrink: 0 }}>🛍️</div>
+                    )}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: '14px', fontWeight: 700, marginBottom: '2px' }}>{p.name}</div>
+                      <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>SKU: {p.sku}{p.category ? ` · ${p.category}` : ''}</div>
+                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                        <span style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a' }}>{formatKoboToNaira(p.price)}</span>
+                        <span style={{ fontSize: '12px', color: p.quantity > 0 ? '#16a34a' : '#dc2626', fontWeight: 600 }}>{p.quantity} in stock</span>
+                      </div>
+                      {p.description && <div style={{ fontSize: '12px', color: '#4b5563', marginTop: '4px', lineHeight: 1.4 }}>{p.description}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         )}
 
         {activeTab === 'orders' && (
