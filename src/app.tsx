@@ -376,6 +376,23 @@ const NIGERIAN_STATES = [
   'Sokoto','Taraba','Yobe','Zamfara',
 ];
 
+// ── LGAs per state (curated list for major states; others fall back to free text) ─
+const STATE_LGAS: Record<string, string[]> = {
+  'Abia': ['Aba North','Aba South','Arochukwu','Bende','Ikwuano','Isiala Ngwa North','Isiala Ngwa South','Isuikwuato','Obi Ngwa','Ohafia','Osisioma','Ugwunagbo','Ukwa East','Ukwa West','Umuahia North','Umuahia South','Umu Nneochi'],
+  'Anambra': ['Aguata','Awka North','Awka South','Anambra East','Anambra West','Anaocha','Ayamelum','Dunukofia','Ekwusigo','Idemili North','Idemili South','Ihiala','Njikoka','Nnewi North','Nnewi South','Ogbaru','Onitsha North','Onitsha South','Orumba North','Orumba South'],
+  'FCT (Abuja)': ['Abaji','Abuja Municipal (AMAC)','Bwari','Gwagwalada','Kuje','Kwali'],
+  'Edo': ['Akoko-Edo','Egor','Esan Central','Esan North-East','Esan South-East','Esan West','Etsako Central','Etsako East','Etsako West','Igueben','Ikpoba-Okha','Orhionmwon','Oredo','Ovia North-East','Ovia South-West','Owan East','Owan West','Uhunmwonde'],
+  'Enugu': ['Aninri','Awgu','Enugu East','Enugu North','Enugu South','Ezeagu','Igbo Etiti','Igbo Eze North','Igbo Eze South','Isi Uzo','Nkanu East','Nkanu West','Nsukka','Oji River','Udenu','Udi','Uzo Uwani'],
+  'Imo': ['Aboh Mbaise','Ahiazu Mbaise','Ehime Mbano','Ezinihitte','Ideato North','Ideato South','Ihitte/Uboma','Ikeduru','Isiala Mbano','Isu','Mbaitoli','Ngor Okpala','Njaba','Nkwerre','Nwangele','Obowo','Oguta','Ohaji/Egbema','Okigwe','Orlu','Orsu','Oru East','Oru West','Owerri Municipal','Owerri North','Owerri West','Unuimo'],
+  'Kaduna': ['Birnin Gwari','Chikun','Giwa','Igabi','Ikara','Jaba','Jema\'a','Kachia','Kaduna North','Kaduna South','Kagarko','Kajuru','Kaura','Kauru','Kubau','Kudan','Lere','Makarfi','Sabon Gari','Sanga','Soba','Zangon Kataf','Zaria'],
+  'Kano': ['Ajingi','Albasu','Bagwai','Bebeji','Bichi','Bunkure','Dala','Dambatta','Dawakin Kudu','Dawakin Tofa','Doguwa','Fagge','Gabasawa','Garko','Garun Mallam','Gaya','Gezawa','Gwale','Gwarzo','Kabo','Kano Municipal','Karaye','Kibiya','Kiru','Kumbotso','Kunchi','Kura','Madobi','Makoda','Minjibir','Nasarawa','Rano','Rimin Gado','Rogo','Shanono','Sumaila','Takai','Tarauni','Tofa','Tsanyawa','Tudun Wada','Ungogo','Warawa','Wudil'],
+  'Lagos': ['Agege','Ajeromi-Ifelodun','Alimosho','Amuwo-Odofin','Apapa','Badagry','Epe','Eti-Osa','Ibeju-Lekki','Ifako-Ijaiye','Ikeja','Ikorodu','Kosofe','Lagos Island','Lagos Mainland','Mushin','Ojo','Oshodi-Isolo','Shomolu','Surulere'],
+  'Ogun': ['Abeokuta North','Abeokuta South','Ado-Odo/Ota','Egbado North','Egbado South','Ewekoro','Ifo','Ijebu East','Ijebu North','Ijebu North East','Ijebu Ode','Ikenne','Imeko Afon','Ipokia','Obafemi Owode','Odeda','Odogbolu','Ogun Waterside','Remo North','Shagamu'],
+  'Oyo': ['Afijio','Akinyele','Atiba','Atisbo','Egbeda','Ibadan North','Ibadan North-East','Ibadan North-West','Ibadan South-East','Ibadan South-West','Ibarapa Central','Ibarapa East','Ibarapa North','Ido','Irepo','Iseyin','Itesiwaju','Iwajowa','Kajola','Lagelu','Ogbomosho North','Ogbomosho South','Ogo Oluwa','Olorunsogo','Oluyole','Ona Ara','Orelope','Ori Ire','Oyo East','Oyo West','Saki East','Saki West','Surulere'],
+  'Rivers': ['Abua/Odual','Ahoada East','Ahoada West','Akuku-Toru','Andoni','Asari-Toru','Bonny','Degema','Eleme','Emohua','Etche','Gokana','Ikwerre','Khana','Obio/Akpor','Ogba/Egbema/Ndoni','Ogu/Bolo','Okrika','Omuma','Opobo/Nkoro','Oyigbo','Port Harcourt','Tai'],
+  'Delta': ['Aniocha North','Aniocha South','Bomadi','Burutu','Ethiope East','Ethiope West','Ika North East','Ika South','Isoko North','Isoko South','Ndokwa East','Ndokwa West','Okpe','Oshimili North','Oshimili South','Patani','Sapele','Udu','Ughelli North','Ughelli South','Ukwuani','Uvwie','Warri North','Warri South','Warri South West'],
+};
+
 const VAT_RATE = 0.075; // FIRS 7.5%
 
 declare global {
@@ -1886,8 +1903,19 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState('');
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const mvGridRef = useRef<HTMLDivElement | null>(null);
   // Derive unique categories from all loaded products (updated on every fetch)
   const [allCategories, setAllCategories] = useState<string[]>([]);
+
+  // ── Virtualizer: 2-column MV browse grid ────────────────────────────────
+  const MV_GRID_COLS = 2;
+  const mvProductRows = useMemo(() => Math.ceil(products.length / MV_GRID_COLS), [products.length]);
+  const mvRowVirtualizer = useVirtualizer({
+    count: mvProductRows,
+    getScrollElement: () => mvGridRef.current,
+    estimateSize: () => 230,
+    overscan: 3,
+  });
 
   const fetchCatalog = useCallback(async (cursor = '', reset = false) => {
     setCatalogLoading(true);
@@ -2265,12 +2293,19 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             <div style={{ backgroundColor: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
               <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Delivery Address <span style={{ color: '#6b7280', fontWeight: 400 }}>(optional)</span></div>
               <label style={lbl}>State</label>
-              <select value={ckState} onChange={e => setCkState(e.target.value)} style={{ ...inp, backgroundColor: '#fff' }}>
+              <select value={ckState} onChange={e => { setCkState(e.target.value); setCkLga(''); }} style={{ ...inp, backgroundColor: '#fff' }}>
                 <option value="">— Select State —</option>
                 {NIGERIAN_STATES.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
               <label style={lbl}>LGA / Area</label>
-              <input type="text" placeholder="e.g. Ikeja" value={ckLga} onChange={e => setCkLga(e.target.value)} style={inp} />
+              {ckState && STATE_LGAS[ckState] ? (
+                <select value={ckLga} onChange={e => setCkLga(e.target.value)} style={{ ...inp, backgroundColor: '#fff' }}>
+                  <option value="">— Select LGA —</option>
+                  {STATE_LGAS[ckState].map(l => <option key={l} value={l}>{l}</option>)}
+                </select>
+              ) : (
+                <input type="text" placeholder="e.g. Ikeja" value={ckLga} onChange={e => setCkLga(e.target.value)} style={inp} />
+              )}
               <label style={lbl}>Street Address</label>
               <input type="text" placeholder="e.g. 12 Allen Avenue" value={ckStreet} onChange={e => setCkStreet(e.target.value)} style={inp} />
             </div>
@@ -2295,11 +2330,14 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             )}
 
             <button
-              onClick={handleCheckout}
-              disabled={ckLoading || !isOnline}
-              style={{ width: '100%', padding: '13px', backgroundColor: (!isOnline || ckLoading) ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: (!isOnline || ckLoading) ? 'not-allowed' : 'pointer', marginBottom: '10px' }}
+              onClick={() => {
+                if (!isOnline) { setCkError('You are offline. Please reconnect to the internet to place your order.'); return; }
+                handleCheckout();
+              }}
+              disabled={ckLoading}
+              style={{ width: '100%', padding: '13px', backgroundColor: (!isOnline || ckLoading) ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: ckLoading ? 'not-allowed' : 'pointer', marginBottom: '10px' }}
             >
-              {!isOnline ? 'Offline — Cannot Checkout' : ckLoading ? 'Placing Order…' : `Place Order · ${formatKoboToNaira(mvCartTotal)}`}
+              {!isOnline ? '📶 Offline — Tap for details' : ckLoading ? 'Placing Order…' : `Place Order · ${formatKoboToNaira(mvCartTotal)}`}
             </button>
             <button
               onClick={() => { setShowCheckout(false); setShowCart(true); }}
@@ -2486,85 +2524,80 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             </div>
           )}
 
-          <div style={{ padding: '12px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(155px, 1fr))', gap: '12px' }}>
-            {products.map(p => {
-              const badge = vendorBadgeColor(p.vendor_slug);
-              const cartItem = mvCart.find(i => i.product_id === p.id);
-              return (
-                <div
-                  key={p.id}
-                  onClick={() => openProductModal(p)}
-                  style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', display: 'flex', flexDirection: 'column', cursor: 'pointer', position: 'relative' }}
-                >
-                  {/* Cart badge */}
-                  {cartItem && (
-                    <div style={{ position: 'absolute', top: '6px', right: '6px', backgroundColor: '#16a34a', color: '#fff', borderRadius: '50%', width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', fontWeight: 700, zIndex: 1 }}>
-                      {cartItem.quantity}
-                    </div>
-                  )}
-                  {/* Product image or placeholder */}
-                  {p.image_url ? (
-                    <img
-                      src={p.image_url}
-                      alt={p.name}
-                      style={{ height: '80px', objectFit: 'cover', width: '100%' }}
-                    />
-                  ) : (
-                    <div style={{ backgroundColor: '#fef9c3', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px' }}>
-                      🛍️
-                    </div>
-                  )}
-
-                  <div style={{ padding: '8px 10px', flex: 1, display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                    {/* Vendor badge */}
-                    <span style={{
-                      display: 'inline-block', fontSize: '10px', fontWeight: 600,
-                      backgroundColor: badge.bg, color: badge.text,
-                      borderRadius: '4px', padding: '1px 5px',
-                      maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    }}>
-                      @{p.vendor_slug}
-                    </span>
-                    {p.category && (
-                      <span style={{ fontSize: '10px', color: '#9ca3af' }}>{p.category}</span>
-                    )}
-                    <div style={{ fontSize: '13px', fontWeight: 600, lineHeight: 1.3 }}>{p.name}</div>
-                    <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginTop: 'auto' }}>
-                      {formatKoboToNaira(p.price)}
-                    </div>
-                    {p.rating_avg != null && (
-                      <div style={{ fontSize: '10px', color: '#f59e0b' }}>
-                        {'★'.repeat(Math.round(p.rating_avg))}{'☆'.repeat(5 - Math.round(p.rating_avg))}
-                        <span style={{ color: '#9ca3af', marginLeft: '3px' }}>({p.rating_count})</span>
-                      </div>
-                    )}
-                    {/* Quick add button */}
-                    <button
-                      onClick={e => { e.stopPropagation(); addToMvCart(p); }}
-                      disabled={p.quantity === 0}
-                      style={{ marginTop: '6px', padding: '5px', borderRadius: '6px', border: 'none', backgroundColor: p.quantity === 0 ? '#d1d5db' : '#16a34a', color: '#fff', fontSize: '11px', cursor: p.quantity === 0 ? 'not-allowed' : 'pointer', fontWeight: 600 }}
-                    >
-                      {p.quantity === 0 ? 'Out of Stock' : '+ Add'}
-                    </button>
+          {/* Virtualized 2-column grid */}
+          <div
+            ref={mvGridRef}
+            style={{ overflowY: 'auto', height: 'calc(100vh - 240px)', position: 'relative' }}
+          >
+            <div style={{ height: `${mvRowVirtualizer.getTotalSize()}px`, position: 'relative' }}>
+              {mvRowVirtualizer.getVirtualItems().map(vRow => {
+                const rowStart = vRow.index * MV_GRID_COLS;
+                const rowProducts = products.slice(rowStart, rowStart + MV_GRID_COLS);
+                return (
+                  <div
+                    key={vRow.key}
+                    style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${vRow.start}px)`, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', padding: '0 12px 12px' }}
+                  >
+                    {rowProducts.map(p => {
+                      const badge = vendorBadgeColor(p.vendor_slug);
+                      const cartItem = mvCart.find(i => i.product_id === p.id);
+                      return (
+                        <div
+                          key={p.id}
+                          onClick={() => openProductModal(p)}
+                          style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', display: 'flex', flexDirection: 'column', cursor: 'pointer', position: 'relative' }}
+                        >
+                          {/* Cart badge */}
+                          {cartItem && (
+                            <div style={{ position: 'absolute', top: '6px', right: '6px', backgroundColor: '#16a34a', color: '#fff', borderRadius: '50%', width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', fontWeight: 700, zIndex: 1 }}>
+                              {cartItem.quantity}
+                            </div>
+                          )}
+                          {/* Product image or placeholder */}
+                          {p.image_url ? (
+                            <img src={p.image_url} alt={p.name} style={{ height: '80px', objectFit: 'cover', width: '100%' }} />
+                          ) : (
+                            <div style={{ backgroundColor: '#fef9c3', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px' }}>🛍️</div>
+                          )}
+                          <div style={{ padding: '8px 10px', flex: 1, display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                            <span style={{ display: 'inline-block', fontSize: '10px', fontWeight: 600, backgroundColor: badge.bg, color: badge.text, borderRadius: '4px', padding: '1px 5px', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              @{p.vendor_slug}
+                            </span>
+                            {p.category && <span style={{ fontSize: '10px', color: '#9ca3af' }}>{p.category}</span>}
+                            <div style={{ fontSize: '13px', fontWeight: 600, lineHeight: 1.3 }}>{p.name}</div>
+                            <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginTop: 'auto' }}>{formatKoboToNaira(p.price)}</div>
+                            {p.rating_avg != null && (
+                              <div style={{ fontSize: '10px', color: '#f59e0b' }}>
+                                {'★'.repeat(Math.round(p.rating_avg))}{'☆'.repeat(5 - Math.round(p.rating_avg))}
+                                <span style={{ color: '#9ca3af', marginLeft: '3px' }}>({p.rating_count})</span>
+                              </div>
+                            )}
+                            <button
+                              onClick={e => { e.stopPropagation(); addToMvCart(p); }}
+                              disabled={p.quantity === 0}
+                              style={{ marginTop: '6px', padding: '5px', borderRadius: '6px', border: 'none', backgroundColor: p.quantity === 0 ? '#d1d5db' : '#16a34a', color: '#fff', fontSize: '11px', cursor: p.quantity === 0 ? 'not-allowed' : 'pointer', fontWeight: 600 }}
+                            >
+                              {p.quantity === 0 ? 'Out of Stock' : '+ Add'}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+
+            {/* Infinite scroll sentinel */}
+            <div ref={loadMoreRef} style={{ height: '1px' }} />
+
+            {catalogLoading && (
+              <div style={{ padding: '12px', textAlign: 'center', color: '#9ca3af', fontSize: '13px' }}>Loading…</div>
+            )}
+            {!hasMore && products.length > 0 && (
+              <div style={{ padding: '8px', textAlign: 'center', color: '#d1d5db', fontSize: '11px' }}>— End of catalog —</div>
+            )}
           </div>
-
-          {/* Infinite scroll sentinel */}
-          <div ref={loadMoreRef} style={{ height: '1px' }} />
-
-          {catalogLoading && (
-            <div style={{ padding: '12px', textAlign: 'center', color: '#9ca3af', fontSize: '13px' }}>
-              Loading…
-            </div>
-          )}
-          {!hasMore && products.length > 0 && (
-            <div style={{ padding: '8px', textAlign: 'center', color: '#d1d5db', fontSize: '11px' }}>
-              — End of catalog —
-            </div>
-          )}
         </div>
       )}
 
