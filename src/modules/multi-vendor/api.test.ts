@@ -7,7 +7,7 @@
  * Test count: MV-1 (40) + MV-2 (28) + MV-3 (50+) = 118+ total
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { multiVendorRouter } from './api';
+import { multiVendorRouter, _resetOtpRateLimitStore } from './api';
 
 // ── Mock DB ───────────────────────────────────────────────────────────────────
 const mockDb = {
@@ -120,6 +120,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     mockDb.run.mockResolvedValue({ success: true });
     mockCatalogCache.get.mockResolvedValue(null);
     mockCatalogCache.put.mockResolvedValue(undefined);
+    _resetOtpRateLimitStore();
   });
 
   // ───────────────────────────────────────────────────────────────────────────

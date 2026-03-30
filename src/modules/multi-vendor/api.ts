@@ -25,9 +25,14 @@
 import { Hono } from 'hono';
 import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms } from '@webwaka/core';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
+import { getJwtSecret } from '../../utils/jwt-secret';
+import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
+
+// ── OTP rate-limit store (5 requests per phone per 15 min) ────────────────────
+const otpRateLimitStore = _createRateLimitStore();
 
 // ── Crypto helpers (same pattern as COM-2 Single-Vendor) ──────────────────────
 
@@ -55,7 +60,7 @@ async function authenticateVendor(
   const auth = c.req.header('Authorization');
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return null;
-  const claims = await verifyJwt(token, c.env.JWT_SECRET ?? 'dev-secret-change-me');
+  const claims = await verifyJwt(token, getJwtSecret(c.env));
   if (!claims || claims.role !== 'vendor') return null;
   return {
     vendorId: String(claims.vendor_id),
@@ -94,6 +99,12 @@ app.post('/auth/vendor-request-otp', async (c) => {
   }
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+
+  // Rate limit: 5 OTP requests per phone per 15 minutes
+  const rlKey = `${tenantId}:otp:${e164}`;
+  if (!checkRateLimit(otpRateLimitStore, rlKey, 5, 15 * 60 * 1000)) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  }
 
   try {
     // Verify vendor exists and is active for this marketplace
@@ -191,7 +202,7 @@ app.post('/auth/vendor-verify-otp', async (c) => {
         iat: Math.floor(now / 1000),
         exp: Math.floor(now / 1000) + 7 * 86400,
       },
-      c.env.JWT_SECRET ?? 'dev-secret-change-me',
+      getJwtSecret(c.env),
     );
 
     c.header(
@@ -897,6 +908,12 @@ app.post('/vendor-auth/request-otp', async (c) => {
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
 
+  // Rate limit: 5 OTP requests per phone per 15 minutes
+  const rlKey = `${tenantId}:otp:${e164}`;
+  if (!checkRateLimit(otpRateLimitStore, rlKey, 5, 15 * 60 * 1000)) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  }
+
   try {
     const vendor = await c.env.DB.prepare(
       "SELECT id, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
@@ -982,7 +999,7 @@ app.post('/vendor-auth/verify-otp', async (c) => {
         tenant: tenantId, phone: e164,
         iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400,
       },
-      c.env.JWT_SECRET ?? 'dev-secret-change-me',
+      getJwtSecret(c.env),
     );
 
     c.header(
@@ -2006,4 +2023,12 @@ app.post('/vendors/:id/payout-request', async (c) => {
 });
 
 export { app as multiVendorRouter };
+
+/**
+ * Reset the OTP rate limit store — for use in tests only.
+ * Clears all rate limit counters so test suites don't bleed into each other.
+ */
+export function _resetOtpRateLimitStore(): void {
+  otpRateLimitStore.clear();
+}
 

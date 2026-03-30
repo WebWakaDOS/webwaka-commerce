@@ -21,8 +21,14 @@ export interface SyncPayload {
   }[];
 }
 
+// Minimal binding interface so the sync router can access D1 without
+// importing the full Env from worker.ts (avoids circular dependency).
+interface SyncBindings {
+  DB?: D1Database;
+}
+
 // The Sync API Router
-export const syncRouter = new Hono();
+export const syncRouter = new Hono<{ Bindings: SyncBindings }>();
 
 syncRouter.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'CASHIER']), async (c) => {
   const tenantId = getTenantId(c);
@@ -55,10 +61,24 @@ syncRouter.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'CASHIER'])
         continue;
       }
 
-      // Mock conflict resolution: last_write_wins
-      // In reality, we would check the DB version against mutation.version
-      const dbVersion = 1; // Mock DB version
-      
+      // Real conflict resolution: query D1 for the entity's current version.
+      // Falls back to 0 (entity is new) when no row exists or DB is unavailable.
+      let dbVersion = 0;
+      if (c.env?.DB) {
+        try {
+          const row = await c.env.DB.prepare(
+            `SELECT version FROM sync_versions
+             WHERE tenant_id = ? AND entity_type = ? AND entity_id = ?
+             LIMIT 1`,
+          )
+            .bind(mutation.tenantId, mutation.entityType, mutation.entityId)
+            .first<{ version: number }>();
+          if (row) dbVersion = row.version;
+        } catch {
+          // DB unavailable or table missing — treat as new entity (version 0)
+        }
+      }
+
       if (mutation.version < dbVersion) {
         // Conflict detected
         results.conflicts.push({
@@ -69,11 +89,30 @@ syncRouter.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'CASHIER'])
           clientVersion: mutation.version
         });
       } else {
-        // Apply mutation
+        // Apply mutation — upsert the version in sync_versions so subsequent
+        // syncs see the updated version and detect future conflicts correctly.
         results.applied.push(mutation.id);
-        
-        // TODO: Publish event to Event Bus
-        // eventBus.publish(`${mutation.entityType}.${mutation.action.toLowerCase()}`, mutation.payload);
+
+        if (c.env?.DB) {
+          try {
+            await c.env.DB.prepare(
+              `INSERT INTO sync_versions (tenant_id, entity_type, entity_id, version, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (tenant_id, entity_type, entity_id)
+               DO UPDATE SET version = excluded.version, updated_at = excluded.updated_at`,
+            )
+              .bind(
+                mutation.tenantId,
+                mutation.entityType,
+                mutation.entityId,
+                mutation.version,
+                Date.now(),
+              )
+              .run();
+          } catch {
+            // Version tracking failure must not block the sync response
+          }
+        }
       }
     }
 

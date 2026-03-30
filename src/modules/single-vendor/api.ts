@@ -14,6 +14,8 @@
 import { Hono } from 'hono';
 import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms } from '@webwaka/core';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
+import { getJwtSecret } from '../../utils/jwt-secret';
+import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
 
 const VAT_RATE = 0.075;
@@ -22,6 +24,9 @@ const DEFAULT_PAGE_SIZE = 24;
 const MAX_PAGE_SIZE = 100;
 
 const app = new Hono<{ Bindings: Env }>();
+
+// ── OTP rate-limit store (5 requests per phone per 15 min) ────────────────────
+const otpRateLimitStore = _createRateLimitStore();
 
 // ── Tenant middleware ─────────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
@@ -522,6 +527,13 @@ app.post('/auth/request-otp', async (c) => {
   }
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+
+  // Rate limit: 5 OTP requests per phone per 15 minutes
+  const rlKey = `${tenantId}:otp:${e164}`;
+  if (!checkRateLimit(otpRateLimitStore, rlKey, 5, 15 * 60 * 1000)) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  }
+
   const otpCode = String(Math.floor(Math.random() * 900000) + 100000);
   const otpHash = await hashOtp(otpCode);
   const now = Date.now();
@@ -598,7 +610,7 @@ app.post('/auth/verify-otp', async (c) => {
 
     const token = await signJwt(
       { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
-      c.env.JWT_SECRET ?? 'dev-secret-change-me'
+      getJwtSecret(c.env)
     );
 
     c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
@@ -1006,9 +1018,17 @@ async function authenticateCustomer(c: { req: { header: (h: string) => string | 
   }
 
   if (!token) return null;
-  const claims = await verifyJwt(token, c.env.JWT_SECRET ?? 'dev-secret-change-me');
+  const claims = await verifyJwt(token, getJwtSecret(c.env));
   if (!claims || claims.tenant !== tenantId) return null;
   return { customerId: String(claims.sub), phone: String(claims.phone) };
 }
 
 export { app as singleVendorRouter };
+
+/**
+ * Reset the OTP rate limit store — for use in tests only.
+ * Clears all rate limit counters so test suites don't bleed into each other.
+ */
+export function _resetOtpRateLimitStore(): void {
+  otpRateLimitStore.clear();
+}

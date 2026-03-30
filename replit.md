@@ -67,7 +67,7 @@ See `.env.example` for reference:
 | COM-2 SV Phase 3 | Variants, FTS5 search, virtual scroll, category pills | ✅ Complete | #12 |
 | COM-2 SV Phase 4 | Customer OTP auth, wishlists, order history, abandoned-cart cron | ✅ Complete | #13 |
 
-**Test count:** 370 passing (Vitest)
+**Test count:** 801 passing (Vitest) — after COM-3 MV overhaul + Production Hardening
 
 ## Notes
 - The `@webwaka/core` package is a local file dependency (`../webwaka-core`) used only in worker/backend files, not the frontend React app
@@ -180,3 +180,32 @@ See `.env.example` for reference:
 
 ### P2-T09: PWA Offline Catalog (SV)
 - **`app.tsx`**: `isOnline` state via `window.addEventListener('online'/'offline')`. Offline banner rendered in catalog view. Cart bar checkout button grayed + blocked with alert when offline.
+
+---
+
+## Production Hardening (session March 30 2026)
+
+### H001: JWT Secret Hardening — all 6 insecure fallbacks eliminated
+- **`src/utils/jwt-secret.ts`** (new): `getJwtSecret(env)` — throws an explicit error if `JWT_SECRET` is not configured, preventing silent use of `dev-secret-change-me` in production.
+- **`src/modules/single-vendor/api.ts`** (×2), **`src/modules/multi-vendor/api.ts`** (×3), **`src/middleware/auth.ts`** (×1): All `?? 'dev-secret-change-me'` replaced with `getJwtSecret(c.env)`.
+- **`src/modules/single-vendor/api.test.ts`**: Added `JWT_SECRET: 'test-secret-32-chars-minimum!!!'` to `mockEnv` so tests pass after the removal of the fallback.
+- **Set in production via**: `wrangler secret put JWT_SECRET --env production`
+
+### H002: OTP Rate Limiting — prevents SMS quota exhaustion
+- **`src/modules/multi-vendor/api.ts`**: Rate limiting applied to `/auth/vendor-request-otp` AND `/vendor-auth/request-otp` (5 requests per phone per 15 min). Returns 429 on breach.
+- **`src/modules/single-vendor/api.ts`**: Rate limiting applied to `/auth/request-otp` (same policy).
+- Uses existing `checkRateLimit` / `_createRateLimitStore` from `src/utils/rate-limit.ts`.
+- `_resetOtpRateLimitStore()` exported from both modules for test isolation; called in `beforeEach` of both test files.
+
+### H003: Public Route Allowlist — 20+ missing routes added
+- **`src/middleware/auth.ts`**: `jwtAuthMiddleware` `publicRoutes` expanded from 8 to 37 entries.
+- Added all buyer-facing routes: catalog, search, by-slug, product details, variants, reviews, cart (POST + GET), promo validate, checkout, order tracking, shipping estimate, delivery zones, OTP auth, and both Paystack webhook paths.
+- Also added both MV vendor-auth path aliases (`/auth/vendor-*` and `/vendor-auth/*`).
+- **Impact**: Anonymous buyers can now browse, add to cart, and checkout in production without a JWT.
+
+### H004: Sync Server — Real D1 Version Lookup
+- **`src/core/sync/server.ts`**: Added typed `SyncBindings` interface; router typed as `new Hono<{ Bindings: SyncBindings }>()`.
+- Replaced hardcoded `const dbVersion = 1` with a real D1 query against the new `sync_versions` table (`SELECT version WHERE tenant_id=? AND entity_type=? AND entity_id=?`). Falls back to 0 if DB unavailable or entity is new.
+- On accepted mutation: upserts the new version into `sync_versions` (INSERT … ON CONFLICT DO UPDATE) so subsequent syncs detect real conflicts.
+- **`migrations/012_sync_versions.sql`** (new): `sync_versions` table with `(tenant_id, entity_type, entity_id)` composite PK + index.
+- **`src/core/sync/server.test.ts`**: Updated to pass `mockEnv` with a mock D1 that returns version 1 for `item_2` (enabling real conflict detection test).

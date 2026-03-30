@@ -15,7 +15,7 @@
  *   ADDR-1: Nigerian delivery address stored in order
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { singleVendorRouter, computeDiscount } from './api';
+import { singleVendorRouter, computeDiscount, _resetOtpRateLimitStore } from './api';
 
 // ── Mock D1 database ──────────────────────────────────────────────────────────
 let mockFirstImpl: () => Promise<unknown> = () => Promise.resolve(null);
@@ -33,7 +33,7 @@ const mockDb = {
   ]),
 };
 
-const mockEnv = { DB: mockDb, TENANT_CONFIG: {}, EVENTS: {}, PAYSTACK_SECRET: 'sk_test_mock', ADMIN_API_KEY: 'admin-secret' };
+const mockEnv = { DB: mockDb, TENANT_CONFIG: {}, EVENTS: {}, PAYSTACK_SECRET: 'sk_test_mock', ADMIN_API_KEY: 'admin-secret', JWT_SECRET: 'test-secret-32-chars-minimum!!!' };
 
 // ── Mock fetch (Paystack API) ─────────────────────────────────────────────────
 const PAYSTACK_SUCCESS_RESPONSE = {
@@ -125,6 +125,7 @@ describe('COM-2: Single-Vendor Storefront API', () => {
       { meta: { changes: 1 } },
       { meta: { changes: 1 } },
     ]);
+    _resetOtpRateLimitStore();
   });
 
   afterEach(() => {
