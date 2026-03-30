@@ -7,6 +7,7 @@
  */
 import { Hono } from 'hono';
 import { getTenantId, requireRole } from '@webwaka/core';
+import { checkRateLimit, _createRateLimitStore, generatePayRef } from '../../utils';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -14,29 +15,14 @@ const app = new Hono<{ Bindings: Env }>();
 // ─── Rate limiter ────────────────────────────────────────────────────────────
 // In-memory per Cloudflare isolate. Keyed by `tenantId:sessionId` (10 req/min).
 // Exported for test teardown only — do NOT use in production code.
-const _rateLimitStore = new Map<string, { count: number; windowStart: number }>();
+const _rateLimitStore = _createRateLimitStore();
 export const _resetRateLimitStore = () => _rateLimitStore.clear();
 const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
-function checkRateLimit(key: string): boolean {
-  const now = Date.now();
-  const entry = _rateLimitStore.get(key);
-  if (!entry || now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
-    _rateLimitStore.set(key, { count: 1, windowStart: now });
-    return true;
-  }
-  if (entry.count >= RATE_LIMIT_MAX) return false;
-  entry.count++;
-  return true;
-}
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 const VALID_PAYMENT_METHODS = ['cash', 'card', 'transfer', 'cod', 'split', 'agency_banking'] as const;
 type PaymentMethod = (typeof VALID_PAYMENT_METHODS)[number];
-
-const generatePayRef = () =>
-  `PAY_${crypto.randomUUID().replace(/-/g, '').toUpperCase().slice(0, 12)}`;
 
 // ─── Tenant middleware ─────────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
@@ -390,7 +376,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   // Rate limit: 10 checkouts/min per session_id (PCI hardening)
   if (body.session_id) {
     const rateLimitKey = `${tenantId}:${body.session_id}`;
-    if (!checkRateLimit(rateLimitKey)) {
+    if (!checkRateLimit(_rateLimitStore, rateLimitKey, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS)) {
       return c.json({ success: false, error: 'Too many requests. Please wait before retrying.' }, 429);
     }
   }

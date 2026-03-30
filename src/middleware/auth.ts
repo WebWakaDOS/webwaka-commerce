@@ -5,9 +5,8 @@
  * MV-1 addition: vendorAuthMiddleware — verifies vendor JWT (role='vendor')
  * and injects vendor_id + tenant_id into the Hono context.
  */
-import { jwtAuthMiddleware as coreJwtAuthMiddleware, requireRole as coreRequireRole } from '@webwaka/core';
+import { jwtAuthMiddleware as coreJwtAuthMiddleware, requireRole as coreRequireRole, verifyJwt } from '@webwaka/core';
 import type { Context, Next } from 'hono';
-import { verifyJwt } from '../modules/multi-vendor/api';
 
 export const jwtAuthMiddleware = coreJwtAuthMiddleware({
   publicRoutes: [

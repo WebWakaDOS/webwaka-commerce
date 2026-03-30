@@ -23,7 +23,8 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole } from '@webwaka/core';
+import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms } from '@webwaka/core';
+import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -36,44 +37,7 @@ async function hashOtp(otp: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Minimal HS256 JWT sign using Web Crypto — mirrors COM-2 signJwt */
-async function signJwt(payload: Record<string, unknown>, secret: string): Promise<string> {
-  const enc = (obj: object) =>
-    btoa(JSON.stringify(obj)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const header = enc({ alg: 'HS256', typ: 'JWT' });
-  const body = enc(payload);
-  const data = `${header}.${body}`;
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
-  );
-  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  return `${data}.${sig}`;
-}
-
-/** Verify HS256 JWT and return claims, or null if invalid/expired — mirrors COM-2 verifyJwt */
-export async function verifyJwt(token: string, secret: string): Promise<Record<string, unknown> | null> {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [header, payloadB64, sigB64] = parts as [string, string, string];
-  try {
-    const data = `${header}.${payloadB64}`;
-    const key = await crypto.subtle.importKey(
-      'raw', new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'],
-    );
-    const sigBuf = Uint8Array.from(
-      atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0),
-    );
-    const valid = await crypto.subtle.verify('HMAC', key, sigBuf, new TextEncoder().encode(data));
-    if (!valid) return null;
-    const claims = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
-    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null;
-    return claims;
-  } catch { return null; }
-}
+// signJwt and verifyJwt are imported from @webwaka/core (P0-T03)
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -155,20 +119,12 @@ app.post('/auth/vendor-request-otp', async (c) => {
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    if (c.env.TERMII_API_KEY) {
-      await fetch('https://api.ng.termii.com/api/sms/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: c.env.TERMII_API_KEY,
-          to: e164,
-          from: 'WebWaka',
-          sms: `Your WebWaka Vendor verification code is: ${otpCode}. Valid for 10 minutes. Do not share.`,
-          type: 'plain',
-          channel: 'dnd',
-        }),
-      });
-    }
+    await sendTermiiSms({
+      to: e164,
+      message: `Your WebWaka Vendor verification code is: ${otpCode}. Valid for 10 minutes. Do not share.`,
+      apiKey: c.env.TERMII_API_KEY ?? '',
+      channel: 'dnd',
+    });
 
     return c.json({
       success: true,
@@ -579,7 +535,7 @@ app.get('/ledger', async (c) => {
  *   - Per-vendor settlement records in `settlements` table (T+7 escrow default)
  *   - Vendor settlement_hold_days respected per vendor
  */
-app.post('/checkout', async (c) => {
+app.post('/checkout', ndprConsentMiddleware, async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; vendor_id: string; quantity: number; price: number; name: string }>;
@@ -590,9 +546,6 @@ app.post('/checkout', async (c) => {
     ndpr_consent: boolean;
   }>();
 
-  if (!body.ndpr_consent) {
-    return c.json({ success: false, error: 'NDPR consent required' }, 400);
-  }
   if (!body.items?.length) {
     return c.json({ success: false, error: 'items array is required and must not be empty' }, 400);
   }
@@ -805,17 +758,12 @@ app.post('/vendor-auth/request-otp', async (c) => {
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    if (c.env.TERMII_API_KEY) {
-      await fetch('https://api.ng.termii.com/api/sms/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: c.env.TERMII_API_KEY, to: e164, from: 'WebWaka',
-          sms: `Your WebWaka Vendor code is: ${otpCode}. Valid 10 minutes. Do not share.`,
-          type: 'plain', channel: 'dnd',
-        }),
-      });
-    }
+    await sendTermiiSms({
+      to: e164,
+      message: `Your WebWaka Vendor code is: ${otpCode}. Valid 10 minutes. Do not share.`,
+      apiKey: c.env.TERMII_API_KEY ?? '',
+      channel: 'dnd',
+    });
 
     return c.json({
       success: true,
@@ -1229,7 +1177,7 @@ function computeVendorBreakdown(
  * - ndpr_consent: must be true (NDPR requirement).
  * Returns: { token, items, vendor_breakdown, total_amount, expires_at, vendor_count }
  */
-app.post('/cart', async (c) => {
+app.post('/cart', ndprConsentMiddleware, async (c) => {
   const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
 
@@ -1249,9 +1197,6 @@ app.post('/cart', async (c) => {
     token?: string;
   }>();
 
-  if (!body.ndpr_consent) {
-    return c.json({ success: false, error: 'NDPR consent required to store cart data' }, 400);
-  }
   if (!body.items?.length) {
     return c.json({ success: false, error: 'items array is required and must not be empty' }, 400);
   }

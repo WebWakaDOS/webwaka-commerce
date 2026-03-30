@@ -1,4 +1,5 @@
-import { Context, Next } from 'hono';
+import { Context, Next, MiddlewareHandler } from 'hono';
+import { getTenantId } from '@webwaka/core';
 
 // 1. Tenant Configuration Schema
 export interface InventorySyncPreferences {
@@ -70,8 +71,31 @@ moduleRegistry.register({
   dependencies: ['core_event_bus']
 });
 
-// 3. Edge Worker Router (Tenant Resolver Middleware)
-// In a real implementation, this would fetch from Cloudflare KV
+// 3. Real KV-backed tenant resolver middleware (P0-T07)
+/**
+ * Returns a Hono middleware that resolves the tenant from the TENANT_CONFIG KV
+ * namespace using the `x-tenant-id` (or `X-Tenant-ID`) request header.
+ *
+ * KV key format: `tenant:<tenantId>` → JSON-encoded TenantConfig
+ * Sets the resolved config in Hono context under the key "tenantConfig".
+ */
+export function createTenantResolverMiddleware(kv: KVNamespace): MiddlewareHandler {
+  return async (c, next) => {
+    const tenantId = getTenantId(c);
+    if (!tenantId) {
+      return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+    }
+    const config = await kv.get(`tenant:${tenantId}`, 'json') as TenantConfig | null;
+    if (!config) {
+      return c.json({ success: false, error: 'Tenant not found' }, 404);
+    }
+    c.set('tenantConfig' as never, config);
+    await next();
+  };
+}
+
+// 4. Edge Worker Router (Legacy Tenant Resolver Middleware — mock KV, kept for tests)
+// In production use createTenantResolverMiddleware(env.TENANT_CONFIG) instead.
 const mockKVStore: Record<string, TenantConfig> = {
   'shop.example.com': {
     tenantId: 'tnt_123',

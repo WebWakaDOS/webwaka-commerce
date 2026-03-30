@@ -52,7 +52,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T01 — Replace In-Memory Event Bus with Cloudflare Queues
 **Priority:** 🔴  
 **Principles:** `[EVT]` `[CFD]` `[BOUI]` `[MRA]` `[CIC]`  
-**Status:** 🔨 — `EventBusRegistry` exists in `src/core/event-bus/index.ts` but is in-memory singleton (fatal in CF Workers isolate model: handlers registered in one invocation are gone in the next)  
+**Status:** ✅ — Complete. `publishEvent(queue, event)` sends to CF Queues; `EventBusRegistry` kept for browser/test contexts; `registerAllHandlers(env)` consumer dispatcher added; `wrangler.toml` queue bindings added for staging + production; 17 tests pass.  
 
 **Problem:** CF Workers creates a new isolate per request. Any handler registered via `eventBus.subscribe()` in request A is not available in request B. The current in-memory bus silently drops all events in production.  
 
@@ -113,7 +113,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T02 — Consolidate Dexie Databases (Eliminate Orphaned Sync DB)
 **Priority:** 🔴  
 **Principles:** `[MPO]` `[TOS]` `[ZSP]`  
-**Status:** 🔨 — `src/core/sync/client.ts` creates a separate `WebWakaDB_{tenantId}` (Dexie v1 schema) that conflicts with the primary `WebWakaCommerce_{tenantId}` (Dexie v6 schema in `core/offline/db.ts`)  
+**Status:** ✅ — Complete. `WebWakaOfflineDB` deleted; `SyncClient` (DI) + `SyncManager` (backward-compat) written; `syncConflicts` table added to `CommerceOfflineDB` v7; `handleSyncErrors` implemented; all TS errors fixed; 15 sync+tenant tests pass.  
 
 **Problem:** Two Dexie databases per tenant. The sync client writes mutations to the orphaned v1 DB; the main app reads from the v6 DB. Mutations queue up in the orphaned DB and are never synced. Data loss risk.  
 
@@ -171,7 +171,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T03 — Extract `verifyJwt` / `signJwt` to `@webwaka/core`
 **Priority:** 🔴  
 **Principles:** `[BOUI]` `[CIC]` `[GDE]`  
-**Status:** 🔨 — Identical `signJwt` and `verifyJwt` HMAC-SHA256 implementations duplicated in `single-vendor/api.ts:770` and `multi-vendor/api.ts:39`  
+**Status:** ✅ — Complete. `@webwaka/core` package created at `../webwaka-core/src/auth/jwt.ts`; exported from barrel; local duplicates deleted from SV + MV api.ts; `middleware/auth.ts` updated; Vitest mock updated with signature-skip verifyJwt; 725/752 tests pass (27 pre-existing failures unchanged).  
 
 **Problem:** Security-critical code duplicated. Any divergence (e.g., a bug fix in one file) creates inconsistent auth behaviour across modules. JWT utilities are platform primitives — they belong in `@webwaka/core`.  
 
@@ -206,7 +206,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T04 — Extract Termii SMS Helper to `@webwaka/core`
 **Priority:** 🔴  
 **Principles:** `[BOUI]` `[NFA]` `[CFD]`  
-**Status:** ⬜ — Termii `fetch` call inline in both `single-vendor/api.ts:477` and `multi-vendor/api.ts:159` (identical implementation)  
+**Status:** ✅ — Complete. `sendTermiiSms` created in `@webwaka/core/sms/termii.ts`; exported from barrel; all 4 inline Termii fetch calls replaced (SV, MV×2, worker cron); Vitest mock updated; 11 unit tests pass.  
 
 **Problem:** Termii is the primary SMS/OTP provider for Nigeria (Termii covers 160+ African networks). The inline implementation is duplicated and has no retry logic, no error type, and no testability.  
 
@@ -237,7 +237,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T05 — Extract NDPR Consent Gate to Shared Hono Middleware
 **Priority:** 🔴  
 **Principles:** `[BOUI]` `[NFA]` `[GDE]` `[CFD]`  
-**Status:** ⬜ — NDPR consent check (`if (!body.ndpr_consent)`) copy-pasted into checkout handlers in `pos/api.ts:254`, `single-vendor/api.ts:248`, `multi-vendor/api.ts:593`  
+**Status:** ✅ — Complete. `src/middleware/ndpr.ts` created; applied to SV checkout, MV checkout, MV cart; 3 inline checks removed; 6 unit tests pass.  
 
 **Problem:** NDPR (Nigeria Data Protection Regulation) consent is a legal requirement. Inline duplication risks one module missing the check or implementing it differently after a future refactor.  
 
@@ -277,7 +277,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T06 — Extract `checkRateLimit` and `generatePayRef` to Shared Utilities
 **Priority:** 🟠  
 **Principles:** `[BOUI]` `[CFD]` `[TOS]`  
-**Status:** ⬜ — `checkRateLimit` defined only in `pos/api.ts:17`; `generatePayRef` defined only in `pos/api.ts:41`; both needed by SV and MV checkout handlers  
+**Status:** ✅ — Complete. `src/utils/rate-limit.ts` + `src/utils/pay-ref.ts` + `src/utils/index.ts` created; `pos/api.ts` updated to use shared utils; 11 utility tests pass (7 rate-limit, 4 pay-ref).  
 
 **Steps:**
 1. Create `src/utils/rate-limit.ts`:
@@ -305,7 +305,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T07 — Wire Real Tenant Resolver + Mount syncRouter in `worker.ts`
 **Priority:** 🔴  
 **Principles:** `[MTT]` `[CFD]` `[GDE]`  
-**Status:** ⬜ — `tenantResolver` middleware in `src/core/tenant/index.ts` uses a hardcoded mock KV (`mockTenantKV`) and is never mounted in `worker.ts`; `syncRouter` from `core/sync/server.ts` is also never mounted  
+**Status:** ✅ — Complete. `createTenantResolverMiddleware(kv)` added; mounted in worker.ts after JWT; `syncRouter` mounted at `/api/sync`; sync server uses `getTenantId(c)` + requireRole; 4 new KV-based tenant tests pass.  
 
 **Steps:**
 1. Open `src/core/tenant/index.ts`. Replace the `mockTenantKV` with a real KV lookup:
@@ -353,7 +353,7 @@ Every task is tagged with one or more of the twelve governing principles it dire
 ### P0-T08 — Harden CORS: Replace `origin: '*'` with Tenant Domain Allowlist
 **Priority:** 🔴  
 **Principles:** `[CFD]` `[GDE]` `[CIC]`  
-**Status:** ⬜ — `src/worker.ts:38` has `origin: '*'` which allows any origin to call the API (unacceptable for a production multi-tenant platform)  
+**Status:** ✅ — Complete. `ALLOWED_ORIGINS` env var in Env interface; dynamic CORS origin function implemented; dev fallback to `*`; wrangler.toml documented; CORS test in `src/worker.test.ts`.  
 
 **Steps:**
 1. Add `ALLOWED_ORIGINS` to the `Env` interface in `worker.ts` as `string` (a comma-separated list stored as a Worker secret).

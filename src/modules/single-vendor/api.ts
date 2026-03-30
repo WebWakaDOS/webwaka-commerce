@@ -12,7 +12,8 @@
  *   VAR-1:    GET /products/:id/variants → variant list
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole } from '@webwaka/core';
+import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms } from '@webwaka/core';
+import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import type { Env } from '../../worker';
 
 const VAT_RATE = 0.075;
@@ -237,7 +238,7 @@ app.post('/promo/validate', async (c) => {
 });
 
 // ── POST /checkout — SV Phase 2 hardened (PAY-1, PROMO-1, VAT-1, ADDR-1) ─────
-app.post('/checkout', async (c) => {
+app.post('/checkout', ndprConsentMiddleware, async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; quantity: number; price: number; name: string; variant_id?: string }>;
@@ -251,7 +252,6 @@ app.post('/checkout', async (c) => {
     session_token?: string;
   }>();
 
-  if (!body.ndpr_consent) return c.json({ success: false, error: 'NDPR consent required for checkout' }, 400);
   if (!body.items || body.items.length === 0) return c.json({ success: false, error: 'Cart is empty' }, 400);
   if (!body.customer_email && !body.customer_phone) return c.json({ success: false, error: 'customer_email or customer_phone required' }, 400);
   if (!body.paystack_reference || body.paystack_reference.trim() === '') return c.json({ success: false, error: 'paystack_reference is required' }, 400);
@@ -474,21 +474,12 @@ app.post('/auth/request-otp', async (c) => {
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    const termiiApiKey = c.env.TERMII_API_KEY ?? '';
-    if (termiiApiKey) {
-      await fetch('https://api.ng.termii.com/api/sms/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: termiiApiKey,
-          to: e164,
-          from: 'WebWaka',
-          sms: `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
-          type: 'plain',
-          channel: 'dnd',
-        }),
-      });
-    }
+    await sendTermiiSms({
+      to: e164,
+      message: `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
+      apiKey: c.env.TERMII_API_KEY ?? '',
+      channel: 'dnd',
+    });
 
     return c.json({ success: true, data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 } });
   } catch (e) {
@@ -766,42 +757,7 @@ async function hashOtp(otp: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Minimal HS256 JWT sign using Web Crypto */
-async function signJwt(payload: Record<string, unknown>, secret: string): Promise<string> {
-  const enc = (obj: object) =>
-    btoa(JSON.stringify(obj)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const header = enc({ alg: 'HS256', typ: 'JWT' });
-  const body = enc(payload);
-  const data = `${header}.${body}`;
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  return `${data}.${sig}`;
-}
-
-/** Verify HS256 JWT and return claims, or null if invalid/expired */
-export async function verifyJwt(token: string, secret: string): Promise<Record<string, unknown> | null> {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [header, payloadB64, sigB64] = parts as [string, string, string];
-  try {
-    const data = `${header}.${payloadB64}`;
-    const key = await crypto.subtle.importKey(
-      'raw', new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
-    );
-    const sigBuf = Uint8Array.from(atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    const valid = await crypto.subtle.verify('HMAC', key, sigBuf, new TextEncoder().encode(data));
-    if (!valid) return null;
-    const claims = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
-    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null;
-    return claims;
-  } catch { return null; }
-}
+// signJwt and verifyJwt imported from @webwaka/core (P0-T03)
 
 /** Extract and verify customer from Authorization Bearer or sv_auth cookie */
 async function authenticateCustomer(c: { req: { header: (h: string) => string | undefined }; env: { JWT_SECRET?: string } }): Promise<{ customerId: string; phone: string } | null> {

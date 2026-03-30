@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { getTenantId, requireRole } from '@webwaka/core';
 
 // Define the standard API response format (Invariant 9.2)
 export interface ApiResponse<T = any> {
@@ -23,9 +24,9 @@ export interface SyncPayload {
 // The Sync API Router
 export const syncRouter = new Hono();
 
-syncRouter.post('/sync', async (c) => {
-  const tenantId = c.req.header('X-Tenant-ID');
-  
+syncRouter.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'CASHIER']), async (c) => {
+  const tenantId = getTenantId(c);
+
   if (!tenantId) {
     return c.json<ApiResponse>({ success: false, errors: ['Missing X-Tenant-ID header'] }, 400);
   }

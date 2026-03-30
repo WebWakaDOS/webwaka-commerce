@@ -2,36 +2,89 @@ name = "webwaka-commerce-api"
 main = "src/worker.ts"
 compatibility_date = "2024-03-14"
 
-# Cron Triggers — Abandoned Cart WhatsApp Nudge (hourly)
+# ─── Cron Triggers ────────────────────────────────────────────────────────────
+# Abandoned cart nudge (hourly) + daily payout settlement cycle (8am WAT = 7am UTC)
 [triggers]
-crons = ["0 * * * *"]
+crons = ["0 * * * *", "0 7 * * *"]
 
-# Staging Environment
+# ─── Staging Environment ──────────────────────────────────────────────────────
 [env.staging]
 name = "webwaka-commerce-api-staging"
 workers_dev = true
+
 kv_namespaces = [
-  { binding = "TENANT_CONFIG", id = "018ac3a580104b8b8868712919be71bd" },
-  { binding = "EVENTS", id = "ee8c49024b2d43a98c54962dba43f15b" },
-  { binding = "SESSIONS_KV", id = "bde8befc71da40c5a5979ee35830022a" },
-  { binding = "CATALOG_CACHE", id = "cc3f9d1e4a7b41e0891f2c3d5e6f7a8b" }
+  { binding = "TENANT_CONFIG",  id = "018ac3a580104b8b8868712919be71bd" },
+  { binding = "EVENTS",         id = "ee8c49024b2d43a98c54962dba43f15b" },
+  { binding = "SESSIONS_KV",    id = "bde8befc71da40c5a5979ee35830022a" },
+  { binding = "CATALOG_CACHE",  id = "cc3f9d1e4a7b41e0891f2c3d5e6f7a8b" }
 ]
+
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "webwaka-commerce-db-staging"
-database_id = "f39bc175-4485-482a-ae87-b1195ead0ef3"
+database_id   = "f39bc175-4485-482a-ae87-b1195ead0ef3"
 
-# Production Environment
+# CF Queues — event bus (P0-T01)
+# Create before deploy: wrangler queues create webwaka-commerce-events-staging
+# Staging queue producer
+[[env.staging.queues.producers]]
+binding = "COMMERCE_EVENTS"
+queue   = "webwaka-commerce-events-staging"
+
+# Staging queue consumer
+[[env.staging.queues.consumers]]
+queue               = "webwaka-commerce-events-staging"
+max_batch_size      = 10
+max_batch_timeout   = 5
+max_retries         = 3
+dead_letter_queue   = "webwaka-commerce-events-dlq-staging"
+
+# Staging secrets (set via: wrangler secret put <NAME> --env staging)
+# PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET, ALLOWED_ORIGINS,
+# OPENROUTER_API_KEY, KYCSALT
+
+# ─── Production Environment ───────────────────────────────────────────────────
 [env.production]
 name = "webwaka-commerce-api-prod"
 workers_dev = true
+
 kv_namespaces = [
-  { binding = "TENANT_CONFIG", id = "e9a8b3178cf245a7815f4e5bf7e67299" },
-  { binding = "EVENTS", id = "4e0bd5d5233f47dbaff75f8b10b89a8d" },
-  { binding = "SESSIONS_KV", id = "f176cebbdf8445838c72d9fde0173628" },
-  { binding = "CATALOG_CACHE", id = "dd4a0e2f5b8c52f19a2031e4f7a8b9c0" }
+  { binding = "TENANT_CONFIG",  id = "e9a8b3178cf245a7815f4e5bf7e67299" },
+  { binding = "EVENTS",         id = "4e0bd5d5233f47dbaff75f8b10b89a8d" },
+  { binding = "SESSIONS_KV",    id = "f176cebbdf8445838c72d9fde0173628" },
+  { binding = "CATALOG_CACHE",  id = "dd4a0e2f5b8c52f19a2031e4f7a8b9c0" }
 ]
+
 [[env.production.d1_databases]]
 binding = "DB"
 database_name = "webwaka-commerce-db-prod"
-database_id = "1cc45df9-36e5-44d4-8a3b-e8377881c00b"
+database_id   = "1cc45df9-36e5-44d4-8a3b-e8377881c00b"
+
+# CF Queues — event bus (P0-T01)
+# Create before deploy: wrangler queues create webwaka-commerce-events-prod
+# Production queue producer
+[[env.production.queues.producers]]
+binding = "COMMERCE_EVENTS"
+queue   = "webwaka-commerce-events-prod"
+
+# Production queue consumer
+[[env.production.queues.consumers]]
+queue               = "webwaka-commerce-events-prod"
+max_batch_size      = 25
+max_batch_timeout   = 5
+max_retries         = 5
+dead_letter_queue   = "webwaka-commerce-events-dlq-prod"
+
+# Production secrets (set via: wrangler secret put <NAME> --env production)
+# PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET,
+# ALLOWED_ORIGINS (e.g. "https://app.webwaka.com,https://pos.webwaka.com"),
+# OPENROUTER_API_KEY, KYCSALT
+
+# ─── Local Dev KV Seed (P0-T07) ───────────────────────────────────────────────
+# After `wrangler dev`, seed the demo tenant into TENANT_CONFIG KV:
+#
+#   wrangler kv:key put --binding=TENANT_CONFIG "tenant:tnt_demo" \
+#     '{"tenantId":"tnt_demo","domain":"localhost","enabledModules":["retail_pos","single_vendor_storefront","multi_vendor_marketplace"],"branding":{"primaryColor":"#1A56DB","logoUrl":"/logo.png"},"permissions":{"admin":["*"],"cashier":["pos.*"]},"featureFlags":{"ai_recommendations":false}}'
+#
+# The real worker resolves tenants via: kv.get(`tenant:${tenantId}`, 'json')
+# (see src/core/tenant/index.ts → createTenantResolverMiddleware)
