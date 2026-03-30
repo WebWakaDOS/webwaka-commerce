@@ -1785,17 +1785,29 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   const [shippingEst, setShippingEst] = useState<{ fee: number; min_days: number; max_days: number } | null>(null);
   const [shippingLoading, setShippingLoading] = useState(false);
 
-  // Fetch shipping estimate when state changes (one call per unique vendor)
+  // Fetch shipping estimates aggregated across all unique vendors in cart
   useEffect(() => {
     if (!ckState || mvCart.length === 0) { setShippingEst(null); return; }
-    const vendorId = mvCart[0]?.vendor_id ?? '';
+    // Extract unique vendor IDs (cart key may include variant suffix; vendor_id is always a clean ID)
+    const uniqueVendorIds = [...new Set(mvCart.map(i => i.vendor_id))];
     setShippingLoading(true);
-    const params = new URLSearchParams({ vendor_id: vendorId, state: ckState });
-    if (ckLga.trim()) params.set('lga', ckLga.trim());
-    fetch(`/api/multi-vendor/shipping/estimate?${params}`, { headers: { 'x-tenant-id': tenantId } })
-      .then(r => r.json() as Promise<{ success: boolean; data?: { fee: number; min_days: number; max_days: number } }>)
-      .then(d => { if (d.success && d.data) setShippingEst(d.data); })
-      .catch(() => {})
+    Promise.all(uniqueVendorIds.map(vendorId => {
+      const params = new URLSearchParams({ vendor_id: vendorId, state: ckState });
+      if (ckLga.trim()) params.set('lga', ckLga.trim());
+      return fetch(`/api/multi-vendor/shipping/estimate?${params}`, { headers: { 'x-tenant-id': tenantId } })
+        .then(r => r.json() as Promise<{ success: boolean; data?: { fee: number; min_days: number; max_days: number } }>)
+        .then(d => d.success && d.data ? d.data : null)
+        .catch(() => null);
+    }))
+      .then(results => {
+        const valid = results.filter((r): r is { fee: number; min_days: number; max_days: number } => r !== null);
+        if (valid.length === 0) { setShippingEst(null); return; }
+        setShippingEst({
+          fee: valid.reduce((s, r) => s + r.fee, 0),
+          min_days: Math.max(...valid.map(r => r.min_days)),
+          max_days: Math.max(...valid.map(r => r.max_days)),
+        });
+      })
       .finally(() => setShippingLoading(false));
   }, [ckState, ckLga, tenantId, mvCart]);
 
@@ -1869,6 +1881,8 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState('');
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  // Derive unique categories from all loaded products (updated on every fetch)
+  const [allCategories, setAllCategories] = useState<string[]>([]);
 
   const fetchCatalog = useCallback(async (cursor = '', reset = false) => {
     setCatalogLoading(true);
@@ -1910,7 +1924,16 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
         fetchedNextCursor = json.meta.next_cursor;
       }
 
-      setProducts(prev => reset ? fetchedProducts : [...prev, ...fetchedProducts]);
+      setProducts(prev => {
+        const next = reset ? fetchedProducts : [...prev, ...fetchedProducts];
+        // Update category list from all loaded products
+        setAllCategories(cats => {
+          const seen = new Set(reset ? [] : cats);
+          for (const p of fetchedProducts) { if (p.category) seen.add(p.category); }
+          return Array.from(seen).sort();
+        });
+        return next;
+      });
       setHasMore(fetchedHasMore);
       setNextCursor(fetchedNextCursor);
     } catch (e) {
@@ -1986,19 +2009,33 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             <div style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
               <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>Order Reference</div>
               <div style={{ fontSize: '14px', fontWeight: 700, color: '#15803d', wordBreak: 'break-all' }}>{orderSuccess.marketplace_order_id}</div>
+              <button
+                onClick={() => { navigator.clipboard?.writeText(orderSuccess.marketplace_order_id).catch(() => {}); }}
+                style={{ marginTop: '8px', padding: '5px 14px', backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px', fontSize: '12px', color: '#15803d', cursor: 'pointer', fontWeight: 600 }}
+              >
+                📋 Copy Reference
+              </button>
             </div>
-            <div style={{ backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: '8px', padding: '10px 12px', marginBottom: '20px', textAlign: 'left' }}>
+            <div style={{ backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', textAlign: 'left' }}>
               <div style={{ fontSize: '12px', color: '#1d4ed8', fontWeight: 600, marginBottom: '4px' }}>📦 Track your order</div>
-              <div style={{ fontSize: '12px', color: '#3b82f6', lineHeight: '1.5' }}>
-                Save your order reference above to track delivery status. You will receive updates at your email address.
+              <div style={{ fontSize: '12px', color: '#374151', lineHeight: '1.5' }}>
+                Use your order reference to track delivery status with each vendor. Updates will be sent to your email.
               </div>
             </div>
-            <button
-              onClick={() => { setOrderSuccess(null); setActiveTab('browse'); }}
-              style={{ width: '100%', padding: '12px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '15px' }}
-            >
-              Continue Shopping
-            </button>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                onClick={() => { setOrderSuccess(null); setActiveTab('vendor-dashboard'); }}
+                style={{ flex: 1, padding: '11px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '8px', fontWeight: 600, cursor: 'pointer', fontSize: '13px' }}
+              >
+                View Orders
+              </button>
+              <button
+                onClick={() => { setOrderSuccess(null); setActiveTab('browse'); }}
+                style={{ flex: 1, padding: '11px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '13px' }}
+              >
+                Shop More
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -2362,12 +2399,12 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             )}
           </div>
 
-          {/* Category filter pills */}
+          {/* Category filter pills — derived from loaded catalog data */}
           <div style={{ padding: '8px 12px 0', display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-            {['', 'fashion', 'electronics', 'food', 'beauty', 'home'].map(cat => (
+            {(['', ...allCategories] as string[]).map(cat => (
               <button
                 key={cat}
-                onClick={() => { setCategory(cat); setProducts([]); }}
+                onClick={() => { setCategory(cat); setProducts([]); setAllCategories([]); }}
                 style={{
                   padding: '4px 10px', borderRadius: '20px',
                   border: `1px solid ${category === cat && !vendorFilter ? '#16a34a' : '#e5e7eb'}`,
@@ -2572,6 +2609,14 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   const [addProdSubmitting, setAddProdSubmitting] = useState(false);
   const [addProdError, setAddProdError] = useState('');
   const [addProdSuccess, setAddProdSuccess] = useState('');
+  // Edit product state
+  const [editingProductId, setEditingProductId] = useState<string | null>(null);
+  const [editProdForm, setEditProdForm] = useState({ name: '', price: '', quantity: '', category: '', description: '', image_url: '' });
+  const [editProdSubmitting, setEditProdSubmitting] = useState(false);
+  const [editProdError, setEditProdError] = useState('');
+  // Delete product state
+  const [deletingProductId, setDeletingProductId] = useState<string | null>(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
   const [otpStep, setOtpStep] = useState<'phone' | 'code'>('phone');
   const [otpPhone, setOtpPhone] = useState('');
@@ -2701,6 +2746,59 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
       } else setAddProdError(d.error ?? 'Failed to add product');
     } catch { setAddProdError('Network error. Try again.'); }
     finally { setAddProdSubmitting(false); }
+  };
+
+  const refreshVendorProducts = async () => {
+    if (!vendorId) return;
+    const refetch = await fetch(`/api/multi-vendor/vendors/${vendorId}/products`, { headers: apiHeaders() });
+    const rd = await refetch.json() as { success: boolean; data: typeof vendorProducts };
+    if (rd.success) setVendorProducts(rd.data ?? []);
+  };
+
+  const handleEditProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!vendorId || !authToken || !editingProductId) return;
+    const priceKobo = Math.round(parseFloat(editProdForm.price) * 100);
+    const qty = parseInt(editProdForm.quantity, 10);
+    if (!editProdForm.name.trim()) { setEditProdError('Name is required'); return; }
+    if (!Number.isFinite(priceKobo) || priceKobo <= 0) { setEditProdError('Price must be a positive number'); return; }
+    if (!Number.isInteger(qty) || qty < 0) { setEditProdError('Quantity must be a non-negative whole number'); return; }
+    setEditProdSubmitting(true); setEditProdError('');
+    try {
+      const body: Record<string, unknown> = {
+        name: editProdForm.name.trim(), price: priceKobo, quantity: qty,
+        category: editProdForm.category.trim() || null,
+        description: editProdForm.description.trim() || null,
+        image_url: editProdForm.image_url.trim() || null,
+      };
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/products/${editingProductId}`, {
+        method: 'PATCH', headers: apiHeaders(), body: JSON.stringify(body),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) {
+        setAddProdSuccess('Product updated successfully!');
+        setEditingProductId(null);
+        await refreshVendorProducts();
+      } else setEditProdError(d.error ?? 'Failed to update product');
+    } catch { setEditProdError('Network error. Try again.'); }
+    finally { setEditProdSubmitting(false); }
+  };
+
+  const handleDeleteProduct = async (productId: string) => {
+    if (!vendorId || !authToken) return;
+    setDeletingProductId(productId);
+    try {
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/products/${productId}`, {
+        method: 'DELETE', headers: apiHeaders(),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) {
+        setAddProdSuccess('Product removed successfully.');
+        setDeleteConfirmId(null);
+        await refreshVendorProducts();
+      } else setAddProdError(d.error ?? 'Failed to delete product');
+    } catch { setAddProdError('Network error. Try again.'); }
+    finally { setDeletingProductId(null); }
   };
 
   useEffect(() => {
@@ -2943,21 +3041,83 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 {vendorProducts.map(p => (
-                  <div key={p.id} style={{ ...S.card, display: 'flex', gap: '12px', alignItems: 'flex-start', marginBottom: 0 }}>
-                    {p.image_url ? (
-                      <img src={p.image_url} alt={p.name} style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
-                    ) : (
-                      <div style={{ width: '52px', height: '52px', backgroundColor: '#fef9c3', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', flexShrink: 0 }}>🛍️</div>
-                    )}
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: '14px', fontWeight: 700, marginBottom: '2px' }}>{p.name}</div>
-                      <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>SKU: {p.sku}{p.category ? ` · ${p.category}` : ''}</div>
-                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-                        <span style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a' }}>{formatKoboToNaira(p.price)}</span>
-                        <span style={{ fontSize: '12px', color: p.quantity > 0 ? '#16a34a' : '#dc2626', fontWeight: 600 }}>{p.quantity} in stock</span>
+                  <div key={p.id} style={{ ...S.card, marginBottom: 0 }}>
+                    {/* Product summary row */}
+                    <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                      {p.image_url ? (
+                        <img src={p.image_url} alt={p.name} style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+                      ) : (
+                        <div style={{ width: '52px', height: '52px', backgroundColor: '#fef9c3', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', flexShrink: 0 }}>🛍️</div>
+                      )}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '14px', fontWeight: 700, marginBottom: '2px' }}>{p.name}</div>
+                        <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>SKU: {p.sku}{p.category ? ` · ${p.category}` : ''}</div>
+                        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                          <span style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a' }}>{formatKoboToNaira(p.price)}</span>
+                          <span style={{ fontSize: '12px', color: p.quantity > 0 ? '#16a34a' : '#dc2626', fontWeight: 600 }}>{p.quantity} in stock</span>
+                        </div>
+                        {p.description && <div style={{ fontSize: '12px', color: '#4b5563', marginTop: '4px', lineHeight: 1.4 }}>{p.description}</div>}
                       </div>
-                      {p.description && <div style={{ fontSize: '12px', color: '#4b5563', marginTop: '4px', lineHeight: 1.4 }}>{p.description}</div>}
                     </div>
+                    {/* Action buttons */}
+                    {editingProductId !== p.id && (
+                      <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                        <button
+                          onClick={() => {
+                            setEditingProductId(p.id);
+                            setEditProdForm({ name: p.name, price: String(p.price / 100), quantity: String(p.quantity), category: p.category ?? '', description: p.description ?? '', image_url: p.image_url ?? '' });
+                            setEditProdError(''); setAddProdSuccess('');
+                          }}
+                          style={{ flex: 1, padding: '7px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+                        >
+                          Edit
+                        </button>
+                        {deleteConfirmId === p.id ? (
+                          <>
+                            <button
+                              onClick={() => handleDeleteProduct(p.id)}
+                              disabled={deletingProductId === p.id}
+                              style={{ flex: 1, padding: '7px', backgroundColor: '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', fontSize: '12px', fontWeight: 700, cursor: deletingProductId === p.id ? 'wait' : 'pointer' }}
+                            >
+                              {deletingProductId === p.id ? '…' : 'Confirm Delete'}
+                            </button>
+                            <button onClick={() => setDeleteConfirmId(null)} style={{ padding: '7px 10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '6px', fontSize: '12px', cursor: 'pointer' }}>Cancel</button>
+                          </>
+                        ) : (
+                          <button
+                            onClick={() => setDeleteConfirmId(p.id)}
+                            style={{ padding: '7px 12px', backgroundColor: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {/* Inline edit form */}
+                    {editingProductId === p.id && (
+                      <form onSubmit={handleEditProduct} style={{ marginTop: '12px', borderTop: '1px solid #e5e7eb', paddingTop: '12px' }}>
+                        <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Edit Product</div>
+                        <label style={S.label}>Name <span style={{ color: '#dc2626' }}>*</span></label>
+                        <input type="text" value={editProdForm.name} onChange={e => setEditProdForm(f => ({ ...f, name: e.target.value }))} style={S.input} required />
+                        <label style={S.label}>Price (₦) <span style={{ color: '#dc2626' }}>*</span></label>
+                        <input type="number" min="0.01" step="0.01" value={editProdForm.price} onChange={e => setEditProdForm(f => ({ ...f, price: e.target.value }))} style={S.input} required />
+                        <label style={S.label}>Quantity <span style={{ color: '#dc2626' }}>*</span></label>
+                        <input type="number" min="0" step="1" value={editProdForm.quantity} onChange={e => setEditProdForm(f => ({ ...f, quantity: e.target.value }))} style={S.input} required />
+                        <label style={S.label}>Category</label>
+                        <input type="text" value={editProdForm.category} onChange={e => setEditProdForm(f => ({ ...f, category: e.target.value }))} style={S.input} />
+                        <label style={S.label}>Description</label>
+                        <input type="text" value={editProdForm.description} onChange={e => setEditProdForm(f => ({ ...f, description: e.target.value }))} style={S.input} />
+                        <label style={S.label}>Image URL</label>
+                        <input type="url" value={editProdForm.image_url} onChange={e => setEditProdForm(f => ({ ...f, image_url: e.target.value }))} style={S.input} />
+                        {editProdError && <div style={{ padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '10px' }}>{editProdError}</div>}
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <button type="submit" disabled={editProdSubmitting} style={{ flex: 1, padding: '10px', backgroundColor: editProdSubmitting ? '#d1d5db' : '#1d4ed8', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: editProdSubmitting ? 'wait' : 'pointer', fontSize: '13px' }}>
+                            {editProdSubmitting ? 'Saving…' : 'Save Changes'}
+                          </button>
+                          <button type="button" onClick={() => setEditingProductId(null)} style={{ padding: '10px 14px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '12px' }}>Cancel</button>
+                        </div>
+                      </form>
+                    )}
                   </div>
                 ))}
               </div>

@@ -353,6 +353,108 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
+  describe('PATCH /vendors/:id/products/:productId — vendor product update', () => {
+    it('returns 401 without JWT', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('PATCH', '/vendors/vnd_1/products/prod_1', { name: 'Updated Name', price: 40000, quantity: 10 }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 403 when vendor tries to edit another vendor\'s product', async () => {
+      const token = await makeVendorToken('vnd_A', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('PATCH', '/vendors/vnd_B/products/prod_1', token, { name: 'Hack', price: 1000, quantity: 1 }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(403);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/own vendor catalog/i);
+    });
+
+    it('returns 404 when product not found', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      mockDb.first.mockResolvedValueOnce(null); // product lookup returns null
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('PATCH', '/vendors/vnd_1/products/prod_nonexistent', token, { name: 'X', price: 1000, quantity: 1 }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('updates product when vendor owns the catalog', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      mockDb.first.mockResolvedValueOnce({ id: 'prod_1' }); // existing product
+      mockDb.run.mockResolvedValueOnce({ success: true });
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('PATCH', '/vendors/vnd_1/products/prod_1', token, { name: 'Updated Fabric', price: 42000, quantity: 45 }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.id).toBe('prod_1');
+    });
+
+    it('returns 400 when non-integer price provided', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      mockDb.first.mockResolvedValueOnce({ id: 'prod_1' }); // product exists check
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('PATCH', '/vendors/vnd_1/products/prod_1', token, { name: 'X', price: 42.5, quantity: 1 }),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(400);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/positive integer/i);
+    });
+  });
+
+  describe('DELETE /vendors/:id/products/:productId — vendor product delete', () => {
+    it('returns 401 without JWT', async () => {
+      const res = await multiVendorRouter.fetch(
+        makeRequest('DELETE', '/vendors/vnd_1/products/prod_1'),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 403 when vendor tries to delete another vendor\'s product', async () => {
+      const token = await makeVendorToken('vnd_A', 'tnt_test');
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('DELETE', '/vendors/vnd_B/products/prod_1', token, {}),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(403);
+      const data = await res.json() as any;
+      expect(data.error).toMatch(/own vendor catalog/i);
+    });
+
+    it('returns 404 when product not found', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      mockDb.first.mockResolvedValueOnce(null);
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('DELETE', '/vendors/vnd_1/products/prod_nonexistent', token, {}),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('soft-deletes product when vendor owns it', async () => {
+      const token = await makeVendorToken('vnd_1', 'tnt_test');
+      mockDb.first.mockResolvedValueOnce({ id: 'prod_1' });
+      mockDb.run.mockResolvedValueOnce({ success: true });
+      const res = await multiVendorRouter.fetch(
+        makeVendorRequest('DELETE', '/vendors/vnd_1/products/prod_1', token, {}),
+        mockEnv as any,
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.success).toBe(true);
+      expect(data.data.id).toBe('prod_1');
+    });
+  });
+
   describe('GET /vendors/:id/products/:productId/variants — public product variants', () => {
     it('returns 404 when product not found', async () => {
       mockDb.first.mockResolvedValueOnce(null);

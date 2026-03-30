@@ -318,8 +318,9 @@ app.get('/vendors/:id/products/:productId/variants', async (c) => {
     ).bind(productId).all();
 
     return c.json({ success: true, data: { variants: results } });
-  } catch {
-    return c.json({ success: true, data: { variants: [] } });
+  } catch (err) {
+    console.error('GET /vendors/:id/products/:productId/variants error:', err);
+    return c.json({ success: false, error: 'Failed to load product variants' }, 500);
   }
 });
 
@@ -493,6 +494,103 @@ app.post('/vendors/:id/products', async (c) => {
       success: true,
       data: { id, vendor_id: vendorId, tenant_id: tenantId, ...body },
     }, 201);
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+/**
+ * PATCH /vendors/:id/products/:productId — Update a vendor product (vendor JWT required)
+ * Vendor can only edit products in their own catalog.
+ */
+app.patch('/vendors/:id/products/:productId', async (c) => {
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('productId');
+  const tenantId = getTenantId(c);
+
+  if (vendor.vendorId !== vendorId) {
+    return c.json({ success: false, error: 'You may only edit products in your own vendor catalog' }, 403);
+  }
+  if (vendor.tenantId !== tenantId) {
+    return c.json({ success: false, error: 'Tenant mismatch' }, 403);
+  }
+
+  // Confirm product belongs to this vendor
+  const existing = await c.env.DB.prepare(
+    "SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
+  ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+  if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const body = await c.req.json<{
+    name?: string; price?: number; quantity?: number;
+    category?: string; description?: string; image_url?: string;
+  }>();
+
+  if (body.price !== undefined && (!Number.isInteger(body.price) || body.price <= 0)) {
+    return c.json({ success: false, error: 'price must be a positive integer (kobo)' }, 400);
+  }
+  if (body.quantity !== undefined && (!Number.isInteger(body.quantity) || body.quantity < 0)) {
+    return c.json({ success: false, error: 'quantity must be a non-negative integer' }, 400);
+  }
+
+  const fields: string[] = [];
+  const values: (string | number | null)[] = [];
+
+  if (body.name !== undefined) { fields.push('name = ?'); values.push(body.name.trim()); }
+  if (body.price !== undefined) { fields.push('price = ?'); values.push(body.price); }
+  if (body.quantity !== undefined) { fields.push('quantity = ?'); values.push(body.quantity); }
+  if (body.category !== undefined) { fields.push('category = ?'); values.push(body.category || null); }
+  if (body.description !== undefined) { fields.push('description = ?'); values.push(body.description || null); }
+  if (body.image_url !== undefined) { fields.push('image_url = ?'); values.push(body.image_url || null); }
+
+  if (fields.length === 0) return c.json({ success: false, error: 'No fields to update' }, 400);
+
+  fields.push('updated_at = ?');
+  values.push(Date.now());
+  values.push(productId, vendorId, tenantId);
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE products SET ${fields.join(', ')} WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    ).bind(...values).run();
+    return c.json({ success: true, data: { id: productId } });
+  } catch (e) {
+    return c.json({ success: false, error: String(e) }, 500);
+  }
+});
+
+/**
+ * DELETE /vendors/:id/products/:productId — Soft-delete a vendor product (vendor JWT required)
+ * Vendor can only delete products in their own catalog.
+ */
+app.delete('/vendors/:id/products/:productId', async (c) => {
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('productId');
+  const tenantId = getTenantId(c);
+
+  if (vendor.vendorId !== vendorId) {
+    return c.json({ success: false, error: 'You may only delete products from your own vendor catalog' }, 403);
+  }
+  if (vendor.tenantId !== tenantId) {
+    return c.json({ success: false, error: 'Tenant mismatch' }, 403);
+  }
+
+  const existing = await c.env.DB.prepare(
+    "SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
+  ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+  if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  try {
+    await c.env.DB.prepare(
+      "UPDATE products SET deleted_at = ?, is_active = 0 WHERE id = ? AND vendor_id = ? AND tenant_id = ?"
+    ).bind(Date.now(), productId, vendorId, tenantId).run();
+    return c.json({ success: true, data: { id: productId } });
   } catch (e) {
     return c.json({ success: false, error: String(e) }, 500);
   }
