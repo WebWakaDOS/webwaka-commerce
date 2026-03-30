@@ -6,7 +6,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { MarketplaceCore, MarketplaceCartItem } from './core';
 import {
-  getCommerceDB,
   getMvProducts,
   cacheMvProducts,
   decrementMvProductQuantity,
@@ -49,7 +48,7 @@ export const MarketplaceInterface: React.FC<{
     try {
       const vendorRes = await fetch('/api/multi-vendor/vendors', {
         headers: { 'x-tenant-id': tenantId },
-        signal,
+        signal: signal ?? null,
       });
       if (!vendorRes.ok || signal?.aborted) return;
 
@@ -66,7 +65,7 @@ export const MarketplaceInterface: React.FC<{
         if (signal?.aborted) return;
         const pRes = await fetch(`/api/multi-vendor/vendors/${vendor.id}/products`, {
           headers: { 'x-tenant-id': tenantId },
-          signal,
+          signal: signal ?? null,
         });
         if (!pRes.ok || signal?.aborted) continue;
 
@@ -94,9 +93,9 @@ export const MarketplaceInterface: React.FC<{
             name: p.name,
             price: p.price,       // kobo — strict integer from server
             quantity: p.quantity,
-            category: p.category ?? undefined,
-            imageUrl: p.image_url ?? undefined,
             cachedAt: now,
+            ...(p.category != null ? { category: p.category } : {}),
+            ...(p.image_url != null ? { imageUrl: p.image_url } : {}),
           });
         }
       }
@@ -174,11 +173,18 @@ export const MarketplaceInterface: React.FC<{
         },
       );
 
-      // Attempt live checkout via MarketplaceCore
+      // Attempt live checkout via MarketplaceCore.
+      // MarketplaceCartItem extends InventoryItem which requires version/timestamps;
+      // supply safe defaults since MvProduct is a cache record, not a full InventoryItem.
+      const now = Date.now();
       const apiCart: MarketplaceCartItem[] = cart.map(i => ({
         ...i,
         cartQuantity: i.cartQuantity,
         vendorId: i.vendorId,
+        version: 0,
+        createdAt: i.cachedAt,
+        updatedAt: now,
+        deletedAt: null,
       }));
       const order = await marketplaceCore.checkout(apiCart, email.trim());
 

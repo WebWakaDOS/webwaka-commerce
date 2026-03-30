@@ -824,4 +824,3 @@ async function authenticateCustomer(c: { req: { header: (h: string) => string | 
 }
 
 export { app as singleVendorRouter };
-export { computeDiscount };

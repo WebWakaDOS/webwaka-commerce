@@ -7,7 +7,7 @@
  * Auth model:
  *   Public  : GET /vendors (active only), GET /vendors/:id/products, GET /catalog,
  *             GET /cart/:token, POST /cart, POST /checkout
- *   Admin   : POST /vendors, PATCH /vendors/:id  (x-admin-key header)
+ *   Admin   : POST /vendors, PATCH /vendors/:id  (requireRole SUPER_ADMIN | TENANT_ADMIN)
  *   Vendor  : POST /vendors/:id/products, GET /orders, GET /ledger,
  *             POST /vendors/:id/kyc  (Bearer JWT, role='vendor')
  *
@@ -338,7 +338,7 @@ app.get('/vendors/:id/products', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ADMIN ENDPOINTS — require x-admin-key header
+// ADMIN ENDPOINTS — requireRole(['SUPER_ADMIN', 'TENANT_ADMIN'])
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
