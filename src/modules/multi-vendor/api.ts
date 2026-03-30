@@ -23,6 +23,7 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
+import { getTenantId, requireRole } from '@webwaka/core';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -99,22 +100,13 @@ async function authenticateVendor(
   };
 }
 
-/**
- * Check x-admin-key header.  Returns true when present (non-empty).
- * In production the key is validated against an env var / KV secret.
- * MV-1 uses presence-only check; MV-2 will add HMAC validation.
- */
-function isAdminRequest(c: { req: { header: (h: string) => string | undefined } }): boolean {
-  const key = c.req.header('x-admin-key');
-  return typeof key === 'string' && key.length > 0;
-}
-
 // ── Tenant guard middleware ────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (!tenantId) {
     return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   }
+  c.set('tenantId' as never, tenantId);
   await next();
 });
 
@@ -128,7 +120,7 @@ app.use('*', async (c, next) => {
  * Vendor must already be registered in the `vendors` table for this marketplace.
  */
 app.post('/auth/vendor-request-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string }>();
 
   const phone = body.phone?.trim();
@@ -194,7 +186,7 @@ app.post('/auth/vendor-request-otp', async (c) => {
  * Token is valid for 7 days. Same HMAC-SHA256/JWT_SECRET as COM-2.
  */
 app.post('/auth/vendor-verify-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string; otp: string }>();
 
   const phone = body.phone?.trim();
@@ -269,7 +261,7 @@ app.post('/auth/vendor-verify-otp', async (c) => {
  * Returns count of ACTIVE vendors and all live products for this marketplace.
  */
 app.get('/', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const vendorCount = await c.env.DB.prepare(
       "SELECT COUNT(*) as count FROM vendors WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL"
@@ -298,7 +290,7 @@ app.get('/', async (c) => {
  * Returns safe fields only: no bank_account, no internal commission details.
  */
 app.get('/vendors', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, name, slug, email, phone, address, status, created_at, updated_at
@@ -319,7 +311,7 @@ app.get('/vendors', async (c) => {
  * MV-3 will add cursor pagination and KV cache.
  */
 app.get('/vendors/:id/products', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const vendorId = c.req.param('id');
 
   try {
@@ -354,12 +346,8 @@ app.get('/vendors/:id/products', async (c) => {
  * Sets status = 'pending' awaiting KYC review and admin activation.
  * bank_account stored as Paystack subaccount code in MV-2 (see MULTI_VENDOR_REVIEW_AND_ENHANCEMENTS.md §7.2).
  */
-app.post('/vendors', async (c) => {
-  if (!isAdminRequest(c)) {
-    return c.json({ success: false, error: 'Admin authentication required' }, 401);
-  }
-
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     name: string;
     slug: string;
@@ -411,12 +399,8 @@ app.post('/vendors', async (c) => {
  * Valid status values: pending, active, suspended.
  * Suspended vendors immediately disappear from public GET /vendors.
  */
-app.patch('/vendors/:id', async (c) => {
-  if (!isAdminRequest(c)) {
-    return c.json({ success: false, error: 'Admin authentication required' }, 401);
-  }
-
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
   const id = c.req.param('id');
   const body = await c.req.json<{ status?: string; commission_rate?: number }>();
 
@@ -461,7 +445,7 @@ app.post('/vendors/:id/products', async (c) => {
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
   const vendorId = c.req.param('id');
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
 
   // SEC-8: Vendor can only add products to their own catalog
   if (vendor.vendorId !== vendorId) {
@@ -528,7 +512,7 @@ app.get('/orders', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (vendor.tenantId !== tenantId) {
     return c.json({ success: false, error: 'Tenant mismatch' }, 403);
   }
@@ -563,7 +547,7 @@ app.get('/ledger', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (vendor.tenantId !== tenantId) {
     return c.json({ success: false, error: 'Tenant mismatch' }, 403);
   }
@@ -596,7 +580,7 @@ app.get('/ledger', async (c) => {
  *   - Vendor settlement_hold_days respected per vendor
  */
 app.post('/checkout', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; vendor_id: string; quantity: number; price: number; name: string }>;
     customer_email: string;
@@ -791,7 +775,7 @@ app.post('/checkout', async (c) => {
  * Sends a 6-digit OTP to the vendor's registered phone (same Termii flow).
  */
 app.post('/vendor-auth/request-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string }>();
   const phone = body.phone?.trim();
 
@@ -847,7 +831,7 @@ app.post('/vendor-auth/request-otp', async (c) => {
  * Verifies the OTP and returns a vendor JWT cookie.
  */
 app.post('/vendor-auth/verify-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string; otp: string }>();
   const phone = body.phone?.trim();
   const otp = body.otp?.trim();
@@ -934,7 +918,7 @@ app.post('/vendors/:id/kyc', async (c) => {
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
   const vendorId = c.req.param('id');
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
 
   if (vendor.vendorId !== vendorId) {
     return c.json({ success: false, error: 'You may only submit KYC for your own vendor account' }, 403);

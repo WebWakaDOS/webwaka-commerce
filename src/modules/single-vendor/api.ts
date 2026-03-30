@@ -12,6 +12,7 @@
  *   VAR-1:    GET /products/:id/variants → variant list
  */
 import { Hono } from 'hono';
+import { getTenantId, requireRole } from '@webwaka/core';
 import type { Env } from '../../worker';
 
 const VAT_RATE = 0.075;
@@ -23,14 +24,15 @@ const app = new Hono<{ Bindings: Env }>();
 
 // ── Tenant middleware ─────────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+  c.set('tenantId' as never, tenantId);
   await next();
 });
 
 // ── GET / — Storefront root catalog (legacy, no pagination) ──────────────────
 app.get('/', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       'SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
@@ -44,7 +46,7 @@ app.get('/', async (c) => {
 // ── GET /catalog/search — FTS5 full-text search (SEARCH-1) ────────────────────
 // Must be declared BEFORE /catalog to avoid :param match
 app.get('/catalog/search', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const q = c.req.query('q')?.trim();
   const perPage = Math.min(Number(c.req.query('per_page') ?? DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
 
@@ -85,7 +87,7 @@ app.get('/catalog/search', async (c) => {
 
 // ── GET /catalog — Paginated public product catalog (PAGE-1 + KV cache 60s) ──
 app.get('/catalog', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const category = c.req.query('category') ?? '';
   const after = c.req.query('after') ?? '';
   const perPage = Math.min(Number(c.req.query('per_page') ?? DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
@@ -150,7 +152,7 @@ app.get('/catalog', async (c) => {
 
 // ── GET /products/:id/variants — Product variants (VAR-1) ────────────────────
 app.get('/products/:id/variants', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   try {
     const { results } = await c.env.DB.prepare(
@@ -167,7 +169,7 @@ app.get('/products/:id/variants', async (c) => {
 
 // ── POST /cart — Create or update cart session ────────────────────────────────
 app.post('/cart', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     session_token?: string;
     items: Array<{ product_id: string; quantity: number; variant_id?: string }>;
@@ -190,7 +192,7 @@ app.post('/cart', async (c) => {
 
 // ── GET /cart/:token ──────────────────────────────────────────────────────────
 app.get('/cart/:token', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const token = c.req.param('token');
   try {
     const cart = await c.env.DB.prepare(
@@ -205,7 +207,7 @@ app.get('/cart/:token', async (c) => {
 
 // ── POST /promo/validate ──────────────────────────────────────────────────────
 app.post('/promo/validate', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ code: string; subtotal_kobo: number }>();
   if (!body.code || body.code.trim() === '') return c.json({ success: false, error: 'Promo code is required' }, 400);
 
@@ -236,7 +238,7 @@ app.post('/promo/validate', async (c) => {
 
 // ── POST /checkout — SV Phase 2 hardened (PAY-1, PROMO-1, VAT-1, ADDR-1) ─────
 app.post('/checkout', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; quantity: number; price: number; name: string; variant_id?: string }>;
     customer_email?: string;
@@ -384,7 +386,7 @@ app.post('/checkout', async (c) => {
 
 // ── GET /orders/:id — Full order detail (ORDER-1) ─────────────────────────────
 app.get('/orders/:id', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const orderId = c.req.param('id');
   try {
     interface OrderRow {
@@ -423,8 +425,8 @@ app.get('/orders/:id', async (c) => {
 });
 
 // ── GET /orders — List storefront orders ──────────────────────────────────────
-app.get('/orders', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
@@ -436,8 +438,8 @@ app.get('/orders', async (c) => {
 });
 
 // ── GET /customers ────────────────────────────────────────────────────────────
-app.get('/customers', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.get('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       'SELECT id, name, email, phone, loyalty_points, total_spend, ndpr_consent, created_at FROM customers WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
@@ -450,7 +452,7 @@ app.get('/customers', async (c) => {
 
 // ── POST /auth/request-otp — Send 6-digit OTP via Termii (NDPR: phone only) ──
 app.post('/auth/request-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string }>();
 
   const phone = body.phone?.trim();
@@ -496,7 +498,7 @@ app.post('/auth/request-otp', async (c) => {
 
 // ── POST /auth/verify-otp — Verify OTP → JWT cookie (SV-AUTH) ────────────────
 app.post('/auth/verify-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string; otp: string; cart_token?: string }>();
 
   const phone = body.phone?.trim();
@@ -561,7 +563,7 @@ app.post('/auth/verify-otp', async (c) => {
 
 // ── GET /wishlist — Customer's wishlist (auth required) ───────────────────────
 app.get('/wishlist', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -582,7 +584,7 @@ app.get('/wishlist', async (c) => {
 
 // ── POST /wishlist — Add or remove product (toggles) ─────────────────────────
 app.post('/wishlist', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -612,7 +614,7 @@ app.post('/wishlist', async (c) => {
 
 // ── GET /account/orders — Customer's own orders, paginated ───────────────────
 app.get('/account/orders', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -659,7 +661,7 @@ app.get('/account/orders', async (c) => {
 
 // ── GET /account/profile — Customer loyalty points + profile ─────────────────
 app.get('/account/profile', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -677,12 +679,8 @@ app.get('/account/profile', async (c) => {
 });
 
 // ── GET /analytics — Today/week revenue, conversion %, top products (ANLT-1) ─
-app.get('/analytics', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
-
-  // Require admin token (x-admin-key header or staff JWT)
-  const adminKey = c.req.header('x-admin-key');
-  if (!adminKey) return c.json({ success: false, error: 'Admin authentication required' }, 401);
+app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
 
   const now = Date.now();
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
@@ -807,7 +805,7 @@ export async function verifyJwt(token: string, secret: string): Promise<Record<s
 
 /** Extract and verify customer from Authorization Bearer or sv_auth cookie */
 async function authenticateCustomer(c: { req: { header: (h: string) => string | undefined }; env: { JWT_SECRET?: string } }): Promise<{ customerId: string; phone: string } | null> {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = c.req.header('x-tenant-id') ?? c.req.header('X-Tenant-ID') ?? '';
   const auth = c.req.header('Authorization');
   let token: string | null = null;
 

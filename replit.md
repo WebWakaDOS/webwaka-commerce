@@ -73,3 +73,15 @@ See `.env.example` for reference:
 - The `@webwaka/core` package is a local file dependency (`../webwaka-core`) used only in worker/backend files, not the frontend React app
 - Vite configured with `host: '0.0.0.0'` and `allowedHosts: true` for Replit proxy compatibility
 - SV Phase 4 adds: `migrations/005_sv_auth.sql` (customer_otps, wishlists, abandoned_carts), JWT helper (`signJwt`/`verifyJwt`), Termii SMS OTP, Dexie v5 wishlists, hourly abandoned-cart cron, `AccountPage` component
+
+## RBAC & Offline-First Refactor (session March 30 2026)
+
+### Backend API hardening
+- **`single-vendor/api.ts`**: `requireRole(["SUPER_ADMIN","TENANT_ADMIN"])` added to `GET /orders`, `GET /customers`, `GET /analytics`; removed old x-admin-key manual check. Fixed `authenticateCustomer` helper — restored inline header read overwritten by bulk `getTenantId` replacement.
+- **`multi-vendor/api.ts`**: Removed `isAdminRequest` function; replaced both usages (`POST /vendors`, `PATCH /vendors/:id`) with `requireRole(["SUPER_ADMIN","TENANT_ADMIN"])` route-level middleware.
+
+### Dexie offline-first storage (v6 schema)
+- **`core/offline/db.ts`**: Added `MvProduct` interface, `mvProducts` table (indexes: `id, tenantId, vendorId, cachedAt`), helpers: `getMvProducts`, `cacheMvProducts`, `decrementMvProductQuantity`.
+
+### Multi-Vendor marketplace UI rewrite
+- **`multi-vendor/ui.tsx`**: Replaced mock `useState` inventory with Dexie offline-first — loads `mvProducts` from IndexedDB immediately (offline-safe), background-fetches API and writes to cache, queues checkout via `queueMutation`, optimistically decrements Dexie quantities on success.

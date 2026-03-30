@@ -6,6 +6,7 @@
  * v3: Added heldCarts for park/hold sale (POS Phase 4)
  * v4: Added storefrontCarts for single-vendor cart persistence (SV Phase 1)
  * v5: Added wishlists for customer offline wishlist (SV Phase 4)
+ * v6: Added mvProducts for multi-vendor marketplace offline product cache (MV Offline-First)
  */
 import Dexie, { type Table } from 'dexie';
 
@@ -120,6 +121,21 @@ export interface OfflineWishlistItem {
   syncStatus: 'PENDING' | 'SYNCED' | 'REMOVED';
 }
 
+// ─── Multi-Vendor marketplace product cache (MV Offline-First) ───────────────
+export interface MvProduct {
+  id: string;
+  tenantId: string;
+  vendorId: string;
+  vendorName: string;
+  sku: string;
+  name: string;
+  price: number;     // kobo — strict integer
+  quantity: number;
+  category?: string;
+  imageUrl?: string;
+  cachedAt: number;
+}
+
 // ─── Storefront cart session (Single-Vendor, SV Phase 1) ──────────────────────
 export interface StorefrontCartItem {
   productId: string;
@@ -148,6 +164,7 @@ export class CommerceOfflineDB extends Dexie {
   heldCarts!: Table<HeldCart, string>;
   storefrontCarts!: Table<StorefrontCartSession, string>;
   wishlists!: Table<OfflineWishlistItem, string>;
+  mvProducts!: Table<MvProduct, string>;
 
   constructor(tenantId: string) {
     super(`WebWakaCommerce_${tenantId}`);
@@ -204,6 +221,20 @@ export class CommerceOfflineDB extends Dexie {
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
       wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+    });
+
+    // v6 — adds mvProducts for multi-vendor marketplace offline product cache
+    this.version(6).stores({
+      mutations: '++id, tenantId, entityType, entityId, status, timestamp',
+      cartItems: '++id, tenantId, sessionToken, productId',
+      offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
+      products: 'id, tenantId, sku, category, cachedAt',
+      posReceipts: 'id, orderId, tenantId, createdAt',
+      posSessions: 'id, tenantId, status, openedAt',
+      heldCarts: 'id, tenantId, heldAt',
+      storefrontCarts: 'id, tenantId, updatedAt',
+      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      mvProducts: 'id, tenantId, vendorId, cachedAt',
     });
   }
 }
@@ -411,4 +442,33 @@ export async function isWishlisted(tenantId: string, customerId: string, product
   const id = `wl_${tenantId}_${customerId}_${productId}`;
   const item = await db.wishlists.get(id);
   return !!(item && item.syncStatus !== 'REMOVED');
+}
+
+// ─── Multi-Vendor marketplace product helpers (MV Offline-First) ─────────────
+
+/** Load all cached marketplace products for a tenant from IndexedDB. */
+export async function getMvProducts(tenantId: string): Promise<MvProduct[]> {
+  const db = getCommerceDB(tenantId);
+  return db.mvProducts.where('tenantId').equals(tenantId).toArray();
+}
+
+/** Bulk-write marketplace products to the IndexedDB cache (upsert). */
+export async function cacheMvProducts(tenantId: string, products: MvProduct[]): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  await db.mvProducts.bulkPut(products);
+}
+
+/** Optimistically decrement a cached product's quantity after checkout. */
+export async function decrementMvProductQuantity(
+  tenantId: string,
+  productId: string,
+  qty: number,
+): Promise<void> {
+  const db = getCommerceDB(tenantId);
+  const cached = await db.mvProducts.get(productId);
+  if (cached) {
+    await db.mvProducts.update(productId, {
+      quantity: Math.max(0, cached.quantity - qty),
+    });
+  }
 }
