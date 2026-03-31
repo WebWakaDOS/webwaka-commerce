@@ -345,3 +345,30 @@ See `.env.example` for reference:
 - **`VendorLedger`** component: Takes `marketplaceId` + `vendorToken` props. Loads balance + paginated ledger on mount. Colour-coded entry types (SALE=green, COMMISSION=red, PAYOUT=blue). Request Payout button (disabled below ₦5,000 minimum). Pagination controls.
 
 **Test count: 801/801 passing, TypeScript clean**
+
+---
+
+## Phase 8 — @webwaka/core KYC Provider Concrete Implementations (session March 31 2026)
+
+### T001 — packages/webwaka-core/src/kyc.ts
+- **`SmileIdentityProvider`** class implementing `IKycProvider`:
+  - `verifyBvn(bvnHash, firstName, lastName, dob)` — POST to Smile Identity v1 `/id_verification` with `id_type: 'BVN'`; ResultCode `'1012'` = verified; ConfidenceValue parsed as matchScore.
+  - `verifyNin(ninHash, firstName, lastName)` — same endpoint with `id_type: 'NIN'`; no dob field.
+  - `verifyCac(rcNumber, businessName)` — POST to Prembly IdentityPass `/identitypass/verification/cac`; matches by `company_name` substring (case-insensitive); `x-api-key` + `app-id` headers.
+  - `sandbox` environment uses `testapi.smileidentity.com`; `production` uses `api.smileidentity.com`.
+  - All network errors caught → returns `{ verified: false, reason: 'provider_error' }` (never throws).
+  - `exactOptionalPropertyTypes` compliance: `matchScore` and `reason` set conditionally, never explicitly `undefined`.
+- **`createKycProvider(smilePartnerId, smileApiKey, premblyApiKey, premblyAppId, environment?)`** factory exported — returns `SmileIdentityProvider`; defaults to `'sandbox'`.
+
+### T002 — packages/webwaka-core/package.json
+- Version bumped from `1.2.0` → `1.3.0`.
+
+### T003 — src/core/kyc/kyc.test.ts (16 new tests)
+- Direct import from `packages/webwaka-core/src/kyc` (bypasses Vitest mock alias).
+- `vi.stubGlobal('fetch', …)` per test; `vi.unstubAllGlobals()` in `afterEach`.
+- **BVN suite (5 tests):** verified:true on ResultCode 1012, verified:false on other ResultCode, graceful fetch throw, graceful HTTP 401, correct request body (id_type, country, dob, testapi URL).
+- **NIN suite (3 tests):** sandbox round-trip verified:true, no dob field in request body, graceful fetch throw.
+- **CAC suite (5 tests):** provider_error on HTTP 401, verified:true on substring match, verified:false with mismatch reason, graceful fetch throw, correct Prembly headers + rc_number body.
+- **Factory suite (3 tests):** all three methods present, defaults to sandbox endpoint, uses production endpoint when specified.
+
+**Test count: 817/817 passing (16 new), TypeScript clean**
