@@ -21,9 +21,9 @@ import { multiVendorRouter } from './modules/multi-vendor/api';
 import { jwtAuthMiddleware } from './middleware/auth';
 import { createTenantResolverMiddleware } from './core/tenant/index';
 import { syncRouter } from './core/sync/server';
-import { dispatchEvent, type WebWakaEvent } from './core/event-bus/index';
+import { dispatchEvent, type WebWakaEvent, publishEvent } from './core/event-bus/index';
 import { registerAllHandlers } from './core/event-bus/handlers/index';
-import { sendTermiiSms } from '@webwaka/core';
+import { CommerceEvents, createSmsProvider } from '@webwaka/core';
 
 export interface Env {
   DB: D1Database;
@@ -280,9 +280,8 @@ export default {
       console.error('[cron] Auto payout-request error:', err);
     }
 
-    // ── Abandoned cart nudge ─────────────────────────────────────────────────
-    const nudgeAfterMs = 60 * 60 * 1000; // 1 hour
-    const cutoff = now - nudgeAfterMs;
+    // ── Abandoned cart nudge — first nudge (> 60 min, nudgedAt IS NULL) ────────
+    const cutoffFirst = now - 60 * 60 * 1000; // 1 hour ago
 
     try {
       interface CartSession {
@@ -294,10 +293,11 @@ export default {
         created_at: number;
       }
 
-      const { results } = await env.DB.prepare(
+      const { results: firstNudgeCarts } = await env.DB.prepare(
         `SELECT cs.id, cs.tenant_id, cs.session_token, cs.items_json, cs.customer_phone, cs.created_at
          FROM cart_sessions cs
          WHERE cs.created_at < ? AND cs.customer_phone IS NOT NULL
+           AND cs.status != 'COMPLETED'
            AND NOT EXISTS (
              SELECT 1 FROM abandoned_carts ac
              WHERE ac.cart_token = cs.session_token AND ac.nudge_sent_at IS NOT NULL
@@ -309,58 +309,238 @@ export default {
                AND o.channel = 'storefront'
            )
          LIMIT 50`,
-      )
-        .bind(cutoff)
-        .all<CartSession>();
+      ).bind(cutoffFirst).all<CartSession>();
 
-      for (const cart of results) {
+      for (const cart of firstNudgeCarts) {
         let items: Array<{ name: string; price: number; quantity: number }> = [];
-        try {
-          items = JSON.parse(cart.items_json ?? '[]');
-        } catch {
-          continue;
-        }
+        try { items = JSON.parse(cart.items_json ?? '[]'); } catch { continue; }
         if (!items.length) continue;
 
-        const totalKobo = items.reduce((s, i) => s + i.price * i.quantity, 0);
-        const totalNaira = (totalKobo / 100).toLocaleString('en-NG', {
-          style: 'currency',
-          currency: 'NGN',
-        });
-        const itemSummary = items
-          .slice(0, 3)
-          .map((i) => i.name)
-          .join(', ');
-        const message = `Hi! You left items in your WebWaka cart: ${itemSummary}... worth ${totalNaira}. Complete your order: https://webwaka.shop/${cart.tenant_id}/checkout`;
+        const cartUrl = `https://webwaka.shop/${cart.tenant_id}/checkout?cart=${cart.session_token}`;
 
-        await sendTermiiSms({
-          to: cart.customer_phone ?? '',
-          message,
-          apiKey: env.TERMII_API_KEY ?? '',
-          channel: 'whatsapp',
-        });
-
-        const acId = `ac_${now}_${cart.id}`;
-        await env.DB.prepare(
-          `INSERT OR IGNORE INTO abandoned_carts
-             (id, tenant_id, customer_phone, cart_json, total_kobo, nudge_sent_at, cart_token, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-          .bind(
-            acId,
-            cart.tenant_id,
-            cart.customer_phone ?? null,
-            cart.items_json,
-            totalKobo,
-            now,
-            cart.session_token,
-            now,
-            now,
-          )
-          .run();
+        await publishEvent(env.COMMERCE_EVENTS, {
+          id: `evt_cart_abandoned_${now}_${cart.id}`,
+          tenantId: cart.tenant_id,
+          type: CommerceEvents.CART_ABANDONED,
+          sourceModule: 'worker_cron',
+          timestamp: now,
+          payload: {
+            customerPhone: cart.customer_phone,
+            items,
+            tenantId: cart.tenant_id,
+            cartId: cart.id,
+            cartUrl,
+            isSecondNudge: false,
+          },
+        }).catch(() => {});
       }
     } catch (err) {
-      console.error('Abandoned cart cron error:', err);
+      console.error('[cron] First abandoned cart nudge error:', err);
+    }
+
+    // ── Abandoned cart nudge — second nudge (> 24 h, already nudged once) ────
+    const cutoffSecond = now - 24 * 60 * 60 * 1000; // 24 hours ago
+
+    try {
+      interface CartSessionWithAc {
+        id: string;
+        tenant_id: string;
+        session_token: string;
+        items_json: string;
+        customer_phone?: string;
+        created_at: number;
+      }
+
+      const { results: secondNudgeCarts } = await env.DB.prepare(
+        `SELECT cs.id, cs.tenant_id, cs.session_token, cs.items_json, cs.customer_phone, cs.created_at
+         FROM cart_sessions cs
+         WHERE cs.created_at < ? AND cs.customer_phone IS NOT NULL
+           AND cs.status != 'COMPLETED'
+           AND EXISTS (
+             SELECT 1 FROM abandoned_carts ac
+             WHERE ac.cart_token = cs.session_token AND ac.nudge_sent_at IS NOT NULL
+               AND ac.second_nudge_sent_at IS NULL
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM orders o
+             WHERE o.customer_phone = cs.customer_phone
+               AND o.created_at > cs.created_at
+               AND o.channel = 'storefront'
+           )
+         LIMIT 50`,
+      ).bind(cutoffSecond).all<CartSessionWithAc>();
+
+      for (const cart of secondNudgeCarts) {
+        let items: Array<{ name: string; price: number; quantity: number }> = [];
+        try { items = JSON.parse(cart.items_json ?? '[]'); } catch { continue; }
+        if (!items.length) continue;
+
+        const cartUrl = `https://webwaka.shop/${cart.tenant_id}/checkout?cart=${cart.session_token}`;
+
+        let promoCode: string | null = null;
+        try {
+          const existingPromo = await env.DB.prepare(
+            `SELECT code FROM promo_codes
+             WHERE tenant_id = ? AND discount_type = 'pct' AND discount_value = 10
+               AND is_active = 1 AND (expires_at IS NULL OR expires_at > ?)
+               AND deleted_at IS NULL
+             ORDER BY created_at DESC LIMIT 1`,
+          ).bind(cart.tenant_id, now).first<{ code: string }>();
+
+          if (existingPromo) {
+            promoCode = existingPromo.code;
+          } else {
+            promoCode = `COMEBACK10_${cart.tenant_id.slice(-6).toUpperCase()}`;
+            const promoId = `promo_auto_${now}_${Math.random().toString(36).slice(2, 8)}`;
+            await env.DB.prepare(
+              `INSERT OR IGNORE INTO promo_codes
+                 (id, tenant_id, code, discount_type, discount_value, min_order_kobo,
+                  max_uses, current_uses, is_active, created_at, updated_at)
+               VALUES (?, ?, ?, 'pct', 10, 0, 1000, 0, 1, ?, ?)`,
+            ).bind(promoId, cart.tenant_id, promoCode, now, now).run();
+          }
+        } catch {
+          promoCode = null;
+        }
+
+        await publishEvent(env.COMMERCE_EVENTS, {
+          id: `evt_cart_abandoned2_${now}_${cart.id}`,
+          tenantId: cart.tenant_id,
+          type: CommerceEvents.CART_ABANDONED,
+          sourceModule: 'worker_cron',
+          timestamp: now,
+          payload: {
+            customerPhone: cart.customer_phone,
+            items,
+            tenantId: cart.tenant_id,
+            cartId: cart.id,
+            cartUrl,
+            promoCode,
+            isSecondNudge: true,
+          },
+        }).catch(() => {});
+      }
+    } catch (err) {
+      console.error('[cron] Second abandoned cart nudge error:', err);
+    }
+
+    // ── Review invites: send WhatsApp 3 days after delivery ──────────────────
+    try {
+      interface ReviewInvite {
+        id: string;
+        tenant_id: string;
+        customer_phone: string;
+        order_id: string;
+      }
+
+      const { results: invites } = await env.DB.prepare(
+        `SELECT id, tenant_id, customer_phone, order_id
+         FROM review_invites
+         WHERE send_at <= ? AND sent = 0
+         LIMIT 100`,
+      ).bind(now).all<ReviewInvite>();
+
+      for (const invite of invites) {
+        try {
+          if (env.TERMII_API_KEY) {
+            const sms = createSmsProvider(env.TERMII_API_KEY);
+            await sms.sendOtp(
+              invite.customer_phone,
+              `How was your order? Leave a review and help other shoppers: https://webwaka.shop/${invite.tenant_id}/orders/${invite.order_id}/review`,
+              'whatsapp',
+            );
+          }
+          await env.DB.prepare(
+            `UPDATE review_invites SET sent = 1, sent_at = ? WHERE id = ?`,
+          ).bind(now, invite.id).run();
+        } catch {
+          // Non-fatal — will retry on next cron run
+        }
+      }
+    } catch (err) {
+      console.error('[cron] Review invites error:', err);
+    }
+
+    // ── Weekly vendor performance scoring ────────────────────────────────────
+    // Runs every invocation but uses a lightweight 7-day lookback window.
+    // Configure wrangler.toml cron trigger to run on Sundays: "0 0 * * 0"
+    try {
+      const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+
+      interface ActiveVendor { id: string; marketplace_tenant_id: string; phone: string | null }
+      const { results: vendors } = await env.DB.prepare(
+        `SELECT id, marketplace_tenant_id, phone
+         FROM vendors
+         WHERE status = 'active' AND deleted_at IS NULL
+         LIMIT 200`,
+      ).bind().all<ActiveVendor>();
+
+      for (const vendor of vendors) {
+        try {
+          const tenantId = vendor.marketplace_tenant_id;
+
+          const orderStats = await env.DB.prepare(
+            `SELECT
+               COUNT(*) AS total_orders,
+               SUM(CASE WHEN order_status = 'DELIVERED' THEN 1 ELSE 0 END) AS delivered_orders
+             FROM orders
+             WHERE vendor_id = ? AND tenant_id = ? AND created_at >= ?`,
+          ).bind(vendor.id, tenantId, thirtyDaysAgo).first<{ total_orders: number; delivered_orders: number }>();
+
+          const ratingRow = await env.DB.prepare(
+            `SELECT AVG(pr.rating) AS avg_rating
+             FROM product_reviews pr
+             JOIN products p ON p.id = pr.product_id
+             WHERE p.vendor_id = ? AND pr.tenant_id = ? AND pr.created_at >= ?
+               AND pr.status = 'APPROVED'`,
+          ).bind(vendor.id, tenantId, thirtyDaysAgo).first<{ avg_rating: number | null }>();
+
+          const disputeRow = await env.DB.prepare(
+            `SELECT COUNT(*) AS dispute_count
+             FROM disputes
+             WHERE tenant_id = ? AND order_id IN (
+               SELECT id FROM orders WHERE vendor_id = ? AND tenant_id = ? AND created_at >= ?
+             )`,
+          ).bind(tenantId, vendor.id, tenantId, thirtyDaysAgo).first<{ dispute_count: number }>();
+
+          const totalOrders = orderStats?.total_orders ?? 0;
+          const deliveredOrders = orderStats?.delivered_orders ?? 0;
+          const fulfillmentRate = totalOrders > 0 ? deliveredOrders / totalOrders : 0;
+          const avgRating = ratingRow?.avg_rating ?? 4.0;
+          const disputeCount = disputeRow?.dispute_count ?? 0;
+          const disputeRate = totalOrders > 0 ? disputeCount / totalOrders : 0;
+
+          const score = Math.round(
+            fulfillmentRate * 40 +
+            (avgRating / 5) * 20 +
+            (1 - disputeRate) * 30 +
+            10,
+          );
+
+          let badge: string | null = null;
+          if (score >= 90) badge = 'TOP_SELLER';
+          else if (score >= 75) badge = 'VERIFIED';
+          else if (score >= 60) badge = 'TRUSTED';
+
+          await env.DB.prepare(
+            `UPDATE vendors SET performanceScore = ?, badge = ?, scoreUpdatedAt = ? WHERE id = ?`,
+          ).bind(score, badge, new Date(now).toISOString(), vendor.id).run();
+
+          if (score < 40 && vendor.phone && env.TERMII_API_KEY) {
+            const sms = createSmsProvider(env.TERMII_API_KEY);
+            await sms.sendOtp(
+              vendor.phone,
+              `Your WebWaka store performance score is ${score}/100. To improve: fulfil orders faster (${Math.round(fulfillmentRate * 100)}% rate), resolve disputes promptly, and encourage customer reviews. Contact support for help.`,
+              'whatsapp',
+            ).catch(() => {});
+          }
+        } catch {
+          // Non-fatal per vendor — skip and continue
+        }
+      }
+      console.log(`[cron] Vendor scoring complete for ${vendors.length} vendors`);
+    } catch (err) {
+      console.error('[cron] Vendor scoring error:', err);
     }
   },
 };

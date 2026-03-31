@@ -359,7 +359,7 @@ export async function handleVendorKycSubmitted(
         await sms.sendOtp(
           env.ADMIN_PHONE,
           `[WebWaka KYC] Vendor ${vendorId} (${vendor.name}) requires MANUAL REVIEW. Reason: ${reason}. Tenant: ${tenantId}`,
-          'generic',
+          'sms',
         );
       } catch { /* non-fatal */ }
     }
@@ -423,6 +423,62 @@ export async function handleDeliveryQuote(
       { expirationTtl: 3600 },
     );
   }
+}
+
+// ─── Handler: cart.abandoned → send WhatsApp nudge via Termii ────────────────
+
+export async function handleCartAbandoned(
+  event: WebWakaEvent<{
+    customerPhone?: string;
+    items?: Array<{ name: string }>;
+    cartId?: string;
+    cartUrl?: string;
+    promoCode?: string;
+    isSecondNudge?: boolean;
+    tenantId?: string;
+  }>,
+  env: Env,
+): Promise<void> {
+  const { customerPhone, items, cartId, cartUrl, promoCode, isSecondNudge } = event.payload;
+  if (!customerPhone || !cartId) return;
+
+  const itemList = items ?? [];
+  const first3 = itemList.slice(0, 3).map((i) => i.name);
+  const remainder = itemList.length - 3;
+  const itemSummary = remainder > 0
+    ? `${first3.join(', ')} +${remainder} more`
+    : first3.join(', ');
+
+  const message = isSecondNudge
+    ? `Still thinking? Here's 10% off your order: ${promoCode ?? ''}. Shop now: ${cartUrl ?? ''}`
+    : `You left ${itemSummary} in your cart. Complete your order: ${cartUrl ?? ''}`;
+
+  if (env.TERMII_API_KEY) {
+    try {
+      const sms = createSmsProvider(env.TERMII_API_KEY);
+      await sms.sendOtp(customerPhone, message, 'whatsapp');
+    } catch { /* Non-fatal — SMS failure must not block event processing */ }
+  }
+
+  const now = Date.now();
+  const acId = `ac_${now}_${cartId}`;
+
+  try {
+    if (isSecondNudge) {
+      await env.DB.prepare(
+        `UPDATE abandoned_carts SET second_nudge_sent_at = ? WHERE cart_token = (
+           SELECT session_token FROM cart_sessions WHERE id = ? LIMIT 1
+         )`,
+      ).bind(now, cartId).run();
+    } else {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO abandoned_carts
+           (id, tenant_id, customer_phone, cart_json, total_kobo, nudge_sent_at, cart_token, created_at, updated_at)
+         SELECT ?, ?, ?, items_json, 0, ?, session_token, ?, ?
+         FROM cart_sessions WHERE id = ?`,
+      ).bind(acId, event.tenantId, customerPhone, now, now, now, cartId).run();
+    }
+  } catch { /* Non-fatal */ }
 }
 
 // ─── Handler: delivery.status_changed → update order status + notify (P05-T4) ─
@@ -495,7 +551,26 @@ export async function handleDeliveryStatusUpdated(
     }
   }
 
-  // 4. Invalidate order KV cache
+  // 4. Queue review invite 3 days after delivery (SV-E07)
+  if (mappedStatus === 'DELIVERED') {
+    try {
+      const existing = await env.DB.prepare(
+        `SELECT id FROM review_invites WHERE order_id = ? AND customer_phone = ?`,
+      ).bind(orderId, customerPhone ?? '').first();
+
+      if (!existing && customerPhone) {
+        const inviteId = `ri_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const sendAt = Date.now() + 3 * 24 * 60 * 60 * 1000; // 3 days later
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO review_invites
+             (id, tenant_id, order_id, customer_phone, send_at, sent, created_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?)`,
+        ).bind(inviteId, tenantId, orderId, customerPhone, sendAt, Date.now()).run();
+      }
+    } catch { /* Non-fatal */ }
+  }
+
+  // 5. Invalidate order KV cache
   if (env.CATALOG_CACHE) {
     try {
       await env.CATALOG_CACHE.delete(`order:${orderId}`);
@@ -516,6 +591,17 @@ export async function handleDeliveryStatusUpdated(
 export function registerAllHandlers(env: Env): void {
   clearHandlers();
 
+  registerHandler(CommerceEvents.CART_ABANDONED, (event) =>
+    handleCartAbandoned(event as WebWakaEvent<{
+      customerPhone?: string;
+      items?: Array<{ name: string }>;
+      cartId?: string;
+      cartUrl?: string;
+      promoCode?: string;
+      isSecondNudge?: boolean;
+      tenantId?: string;
+    }>, env),
+  );
   registerHandler(CommerceEvents.INVENTORY_UPDATED, (event) =>
     handleInventoryUpdated(event as WebWakaEvent<{ productId?: string; tenantId?: string }>, env),
   );

@@ -1203,44 +1203,104 @@ app.get('/shipping/estimate', async (c) => {
   }
 });
 
-// ── GET /products/:id/reviews — Public product reviews ────────────────────────
+// ── GET /products/:id/reviews — Public product reviews (APPROVED only, paginated) ─
 app.get('/products/:id/reviews', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
+  const page = Math.max(1, Number(c.req.query('page') ?? 1));
+  const limit = Math.min(Number(c.req.query('limit') ?? 20), 100);
+  const offset = (page - 1) * limit;
   try {
-    const { results } = await c.env.DB.prepare(
-      `SELECT id, rating, review_text, verified_purchase, customer_phone, created_at
+    const statsRow = await c.env.DB.prepare(
+      `SELECT AVG(rating) AS avgRating, COUNT(*) AS totalReviews
        FROM product_reviews
-       WHERE product_id = ? AND tenant_id = ? AND deleted_at IS NULL
-       ORDER BY created_at DESC LIMIT 50`,
-    ).bind(productId, tenantId).all<{
-      id: string; rating: number; review_text: string | null;
+       WHERE product_id = ? AND tenant_id = ? AND status = 'APPROVED' AND deleted_at IS NULL`,
+    ).bind(productId, tenantId).first<{ avgRating: number | null; totalReviews: number }>();
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, rating, body, review_text, verified_purchase, customer_phone, created_at
+       FROM product_reviews
+       WHERE product_id = ? AND tenant_id = ? AND status = 'APPROVED' AND deleted_at IS NULL
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`,
+    ).bind(productId, tenantId, limit, offset).all<{
+      id: string; rating: number; body: string | null; review_text: string | null;
       verified_purchase: number; customer_phone: string | null; created_at: number;
     }>();
-    const avgRating = results.length > 0
-      ? Math.round((results.reduce((s, r) => s + r.rating, 0) / results.length) * 10) / 10
-      : 0;
+
     return c.json({
       success: true,
       data: {
         reviews: results.map(r => ({
           ...r,
-          // Privacy: mask phone — show first 4 + last 3 digits
           customer_phone: r.customer_phone
             ? r.customer_phone.slice(0, 4) + '****' + r.customer_phone.slice(-3)
             : null,
         })),
-        count: results.length,
-        avg_rating: avgRating,
+        avgRating: statsRow?.avgRating != null ? Math.round(statsRow.avgRating * 10) / 10 : 0,
+        totalReviews: statsRow?.totalReviews ?? 0,
+        page,
+        limit,
       },
     });
   } catch (err) {
     console.error('[SV] route error:', err);
-    return c.json({ success: true, data: { reviews: [], count: 0, avg_rating: 0 } });
+    return c.json({ success: true, data: { reviews: [], avgRating: 0, totalReviews: 0, page, limit } });
   }
 });
 
-// ── POST /products/:id/reviews — Authenticated customer submits review ─────────
+// ── POST /reviews — Authenticated customer submits review (SV-E07) ─────────────
+app.post('/reviews', async (c) => {
+  const tenantId = getTenantId(c);
+  const customer = await authenticateCustomer(c as Parameters<typeof authenticateCustomer>[0]);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const body = await c.req.json<{ orderId: string; productId: string; rating: number; body?: string }>();
+  if (!body.orderId) return c.json({ success: false, error: 'orderId is required' }, 400);
+  if (!body.productId) return c.json({ success: false, error: 'productId is required' }, 400);
+  if (!body.rating || body.rating < 1 || body.rating > 5) {
+    return c.json({ success: false, error: 'rating must be an integer between 1 and 5' }, 400);
+  }
+
+  const now = Date.now();
+  const id = `rev_${now}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id, order_status FROM orders
+       WHERE id = ? AND tenant_id = ? AND customer_phone = ?`,
+    ).bind(body.orderId, tenantId, customer.phone).first<{ id: string; order_status: string }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found or does not belong to you' }, 404);
+    if (order.order_status !== 'DELIVERED') {
+      return c.json({ success: false, error: 'Reviews can only be submitted for delivered orders' }, 422);
+    }
+
+    const existingReview = await c.env.DB.prepare(
+      `SELECT id FROM product_reviews WHERE order_id = ? AND product_id = ? AND tenant_id = ?`,
+    ).bind(body.orderId, body.productId, tenantId).first();
+    if (existingReview) {
+      return c.json({ success: false, error: 'You have already reviewed this product for this order' }, 409);
+    }
+
+    await c.env.DB.prepare(
+      `INSERT INTO product_reviews
+         (id, tenant_id, product_id, customer_id, customer_phone, order_id, rating, body, review_text, verified_purchase, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING', ?, ?)`,
+    ).bind(
+      id, tenantId, body.productId, customer.customerId, customer.phone,
+      body.orderId, body.rating, body.body?.trim() ?? null, body.body?.trim() ?? null,
+      now, now,
+    ).run();
+
+    return c.json({ success: true, data: { reviewId: id, status: 'PENDING' } }, 201);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── POST /products/:id/reviews — Legacy per-product review (existing customers) ─
 app.post('/products/:id/reviews', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
@@ -1255,7 +1315,6 @@ app.post('/products/:id/reviews', async (c) => {
   const now = Date.now();
   const id = `rev_${now}_${Math.random().toString(36).slice(2, 8)}`;
   try {
-    // Check if this customer made a verified purchase of this product
     const purchaseCheck = await c.env.DB.prepare(
       `SELECT id FROM orders
        WHERE tenant_id = ? AND customer_phone = ? AND channel = 'storefront'
@@ -1263,20 +1322,69 @@ app.post('/products/:id/reviews', async (c) => {
     ).bind(tenantId, customer.phone, `%"${productId}"%`).first();
 
     await c.env.DB.prepare(
-      `INSERT INTO product_reviews (id, tenant_id, product_id, customer_id, customer_phone, rating, review_text, verified_purchase, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO product_reviews
+         (id, tenant_id, product_id, customer_id, customer_phone, rating, review_text, body, verified_purchase, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`,
     ).bind(
       id, tenantId, productId, customer.customerId, customer.phone,
-      body.rating, body.review_text?.trim() ?? null,
+      body.rating, body.review_text?.trim() ?? null, body.review_text?.trim() ?? null,
       purchaseCheck ? 1 : 0, now, now,
     ).run();
 
     return c.json({
       success: true,
-      data: { id, rating: body.rating, verified_purchase: !!purchaseCheck },
+      data: { reviewId: id, status: 'PENDING' },
     }, 201);
   } catch (err) {
     console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /admin/reviews — Admin: list reviews by status (SV-E07) ──────────────
+app.get('/admin/reviews', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const status = c.req.query('status') ?? 'PENDING';
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, product_id, order_id, customer_phone, rating, body, review_text, status, created_at
+       FROM product_reviews
+       WHERE tenant_id = ? AND status = ? AND deleted_at IS NULL
+       ORDER BY created_at DESC LIMIT 100`,
+    ).bind(tenantId, status).all();
+    return c.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[SV] admin/reviews GET error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── PATCH /admin/reviews/:id — Admin: approve or reject a review (SV-E07) ──────
+app.patch('/admin/reviews/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const reviewId = c.req.param('id');
+  const body = await c.req.json<{ status: 'APPROVED' | 'REJECTED' }>();
+  if (!body.status || !['APPROVED', 'REJECTED'].includes(body.status)) {
+    return c.json({ success: false, error: 'status must be APPROVED or REJECTED' }, 400);
+  }
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE product_reviews SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.status, Date.now(), reviewId, tenantId).run();
+    if (result.meta.changes === 0) return c.json({ success: false, error: 'Review not found' }, 404);
+    return c.json({ success: true, data: { id: reviewId, status: body.status } });
+  } catch (err) {
+    console.error('[SV] admin/reviews error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });

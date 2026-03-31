@@ -232,9 +232,233 @@ const CommissionManagement: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   );
 };
 
-export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantConfig; tenantId?: string }> = ({ user, config, tenantId = 'default' }) => {
+// ── Review Moderation (SV-E07) ───────────────────────────────────────────────
+
+interface PendingReview {
+  id: string;
+  product_id: string;
+  rating: number;
+  body: string | null;
+  review_text: string | null;
+  customer_phone: string | null;
+  created_at: number;
+}
+
+const ReviewModeration: React.FC<{ tenantId: string; adminKey: string }> = ({ tenantId, adminKey }) => {
+  const [reviews, setReviews] = useState<PendingReview[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const loadReviews = () => {
+    setLoading(true);
+    fetch('/api/single-vendor/admin/reviews?status=PENDING', {
+      headers: { 'x-tenant-id': tenantId, 'x-admin-key': adminKey },
+    })
+      .then((r) => r.json() as Promise<{ success: boolean; data?: PendingReview[] }>)
+      .then((j) => { if (j.success) setReviews(j.data ?? []); })
+      .catch(() => setMsg('Failed to load reviews.'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { loadReviews(); }, []);
+
+  const moderate = (id: string, status: 'APPROVED' | 'REJECTED') => {
+    fetch(`/api/single-vendor/admin/reviews/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId, 'x-admin-key': adminKey },
+      body: JSON.stringify({ status }),
+    })
+      .then((r) => r.json() as Promise<{ success: boolean; error?: string }>)
+      .then((j) => {
+        if (j.success) { setMsg(`Review ${status.toLowerCase()}.`); loadReviews(); }
+        else setMsg(`Error: ${j.error ?? 'Unknown'}`);
+      })
+      .catch(() => setMsg('Network error.'));
+  };
+
+  const stars = (rating: number) => '★'.repeat(rating) + '☆'.repeat(5 - rating);
+
   return (
-    <div style={{ padding: '20px', maxWidth: '800px', margin: '0 auto', fontFamily: 'system-ui, sans-serif' }}>
+    <div>
+      {msg && (
+        <div style={{ padding: '6px 10px', borderRadius: '4px', marginBottom: '10px', fontSize: '13px', background: msg.startsWith('Review') ? '#d1fae5' : '#fee2e2', color: msg.startsWith('Review') ? '#065f46' : '#dc2626' }}>
+          {msg}
+        </div>
+      )}
+      {loading ? <p style={{ color: '#64748b', fontSize: '13px' }}>Loading pending reviews…</p> : reviews.length === 0 ? (
+        <p style={{ color: '#94a3b8', fontSize: '13px', textAlign: 'center' }}>No pending reviews.</p>
+      ) : (
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+          <thead>
+            <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
+              {['Product', 'Rating', 'Review', 'Customer', 'Actions'].map((h) => (
+                <th key={h} style={{ padding: '6px 8px', textAlign: 'left' }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {reviews.map((r) => (
+              <tr key={r.id} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: '11px' }}>{r.product_id.slice(-8)}</td>
+                <td style={{ padding: '6px 8px', color: '#f59e0b', fontSize: '14px' }}>{stars(r.rating)}</td>
+                <td style={{ padding: '6px 8px', maxWidth: '250px' }}>{r.body ?? r.review_text ?? <span style={{ color: '#94a3b8' }}>No text</span>}</td>
+                <td style={{ padding: '6px 8px', color: '#64748b', fontSize: '12px' }}>{r.customer_phone ?? '—'}</td>
+                <td style={{ padding: '6px 8px', display: 'flex', gap: '6px' }}>
+                  <button onClick={() => moderate(r.id, 'APPROVED')} style={{ padding: '4px 10px', background: '#16a34a', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}>Approve</button>
+                  <button onClick={() => moderate(r.id, 'REJECTED')} style={{ padding: '4px 10px', background: '#dc2626', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}>Reject</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+};
+
+// ── Dispute Management (MV-E08) ───────────────────────────────────────────────
+
+interface Dispute {
+  id: string;
+  order_id: string;
+  reporter_id: string;
+  reporter_role: string;
+  category: string;
+  description: string;
+  evidence_urls_json: string | null;
+  status: string;
+  resolution: string | null;
+  created_at: number;
+}
+
+const DisputeManagement: React.FC<{ tenantId: string; adminKey: string }> = ({ tenantId, adminKey }) => {
+  const [tab, setTab] = useState<'OPEN' | 'UNDER_REVIEW' | 'RESOLVED'>('OPEN');
+  const [disputes, setDisputes] = useState<Dispute[]>([]);
+  const [selected, setSelected] = useState<Dispute | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [partialAmount, setPartialAmount] = useState('');
+
+  const loadDisputes = () => {
+    setLoading(true);
+    fetch(`/api/multi-vendor/admin/disputes?status=${tab}`, {
+      headers: { 'x-tenant-id': tenantId, 'x-admin-key': adminKey },
+    })
+      .then((r) => r.json() as Promise<{ success: boolean; data?: Dispute[] }>)
+      .then((j) => { if (j.success) setDisputes(j.data ?? []); })
+      .catch(() => setMsg('Failed to load disputes.'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { loadDisputes(); setSelected(null); }, [tab]);
+
+  const setUnderReview = (id: string) => {
+    fetch(`/api/multi-vendor/admin/disputes/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId, 'x-admin-key': adminKey },
+      body: JSON.stringify({ status: 'UNDER_REVIEW' }),
+    })
+      .then((r) => r.json() as Promise<{ success: boolean; error?: string }>)
+      .then((j) => { if (j.success) { setMsg('Marked as Under Review.'); loadDisputes(); } else setMsg(`Error: ${j.error}`); })
+      .catch(() => setMsg('Network error.'));
+  };
+
+  const resolve = (id: string, resolution: string, amountKobo?: number) => {
+    fetch(`/api/multi-vendor/admin/disputes/${id}/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId, 'x-admin-key': adminKey },
+      body: JSON.stringify({ resolution, ...(amountKobo ? { amountKobo } : {}) }),
+    })
+      .then((r) => r.json() as Promise<{ success: boolean; error?: string }>)
+      .then((j) => { if (j.success) { setMsg(`Resolved: ${resolution}`); loadDisputes(); setSelected(null); } else setMsg(`Error: ${j.error}`); })
+      .catch(() => setMsg('Network error.'));
+  };
+
+  const tabStyle = (t: string) => ({
+    padding: '8px 16px', borderRadius: '4px 4px 0 0', border: 'none', cursor: 'pointer',
+    background: tab === t ? '#2563eb' : '#f1f5f9', color: tab === t ? 'white' : '#334155',
+    fontWeight: tab === t ? 'bold' as const : 'normal' as const, fontSize: '13px',
+  });
+
+  return (
+    <div>
+      {msg && (
+        <div style={{ padding: '6px 10px', borderRadius: '4px', marginBottom: '10px', fontSize: '13px', background: msg.startsWith('Error') ? '#fee2e2' : '#d1fae5', color: msg.startsWith('Error') ? '#dc2626' : '#065f46' }}>
+          {msg}
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '12px' }}>
+        {(['OPEN', 'UNDER_REVIEW', 'RESOLVED'] as const).map((t) => (
+          <button key={t} style={tabStyle(t)} onClick={() => setTab(t)}>{t.replace('_', ' ')}</button>
+        ))}
+      </div>
+
+      {selected ? (
+        <div style={{ border: '1px solid #e2e8f0', borderRadius: '8px', padding: '16px' }}>
+          <button onClick={() => setSelected(null)} style={{ marginBottom: '12px', background: 'none', border: 'none', color: '#2563eb', cursor: 'pointer', fontSize: '13px' }}>← Back to list</button>
+          <h4 style={{ margin: '0 0 8px' }}>Dispute: {selected.id}</h4>
+          <p style={{ margin: '4px 0', fontSize: '13px' }}><strong>Order:</strong> {selected.order_id}</p>
+          <p style={{ margin: '4px 0', fontSize: '13px' }}><strong>Reporter:</strong> {selected.reporter_role} ({selected.reporter_id.slice(-8)})</p>
+          <p style={{ margin: '4px 0', fontSize: '13px' }}><strong>Category:</strong> {selected.category}</p>
+          <p style={{ margin: '4px 0', fontSize: '13px' }}><strong>Description:</strong> {selected.description}</p>
+          {selected.evidence_urls_json && (
+            <div style={{ marginTop: '8px' }}>
+              <strong style={{ fontSize: '13px' }}>Evidence:</strong>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '4px' }}>
+                {(JSON.parse(selected.evidence_urls_json) as string[]).map((url, i) => (
+                  <a key={i} href={url} target="_blank" rel="noopener noreferrer" style={{ fontSize: '12px', color: '#2563eb' }}>Image {i + 1}</a>
+                ))}
+              </div>
+            </div>
+          )}
+          {selected.status !== 'RESOLVED' && (
+            <div style={{ display: 'flex', gap: '8px', marginTop: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
+              <button onClick={() => setUnderReview(selected.id)} style={{ padding: '6px 12px', background: '#f59e0b', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '13px' }}>Under Review</button>
+              <button onClick={() => resolve(selected.id, 'FULL_REFUND')} style={{ padding: '6px 12px', background: '#16a34a', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '13px' }}>Full Refund</button>
+              <button onClick={() => resolve(selected.id, 'REPLACEMENT')} style={{ padding: '6px 12px', background: '#2563eb', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '13px' }}>Replacement</button>
+              <input
+                type="number"
+                placeholder="Amount (kobo)"
+                value={partialAmount}
+                onChange={(e) => setPartialAmount(e.target.value)}
+                style={{ padding: '6px', border: '1px solid #e2e8f0', borderRadius: '4px', fontSize: '13px', width: '140px' }}
+              />
+              <button onClick={() => resolve(selected.id, 'PARTIAL_REFUND', Number(partialAmount))} style={{ padding: '6px 12px', background: '#7c3aed', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '13px' }}>Partial Refund</button>
+            </div>
+          )}
+        </div>
+      ) : loading ? <p style={{ color: '#64748b', fontSize: '13px' }}>Loading disputes…</p> : disputes.length === 0 ? (
+        <p style={{ color: '#94a3b8', fontSize: '13px', textAlign: 'center' }}>No {tab.toLowerCase().replace('_', ' ')} disputes.</p>
+      ) : (
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+          <thead>
+            <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
+              {['ID', 'Order', 'Category', 'Reporter', 'Created', ''].map((h) => (
+                <th key={h} style={{ padding: '6px 8px', textAlign: 'left' }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {disputes.map((d) => (
+              <tr key={d.id} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: '11px' }}>{d.id.slice(-10)}</td>
+                <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: '11px' }}>{d.order_id.slice(-10)}</td>
+                <td style={{ padding: '6px 8px' }}>{d.category}</td>
+                <td style={{ padding: '6px 8px', fontSize: '12px', color: '#64748b' }}>{d.reporter_role}</td>
+                <td style={{ padding: '6px 8px', fontSize: '12px', color: '#64748b' }}>{new Date(d.created_at).toLocaleDateString()}</td>
+                <td style={{ padding: '6px 8px' }}><button onClick={() => setSelected(d)} style={{ padding: '4px 10px', background: '#f1f5f9', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}>View</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+};
+
+export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantConfig; tenantId?: string; adminKey?: string }> = ({ user, config, tenantId = 'default', adminKey = '' }) => {
+  return (
+    <div style={{ padding: '20px', maxWidth: '900px', margin: '0 auto', fontFamily: 'system-ui, sans-serif' }}>
       <h2>Marketplace Owner Dashboard</h2>
       <p>Welcome, {user.name} ({user.role}) | Tenant: {config.name}</p>
 
@@ -280,6 +504,14 @@ export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantCon
 
       <Card title="Commission Management (MV-E02)">
         <CommissionManagement tenantId={tenantId} />
+      </Card>
+
+      <Card title="Review Moderation (SV-E07)">
+        <ReviewModeration tenantId={tenantId} adminKey={adminKey} />
+      </Card>
+
+      <Card title="Dispute Management (MV-E08)">
+        <DisputeManagement tenantId={tenantId} adminKey={adminKey} />
       </Card>
     </div>
   );

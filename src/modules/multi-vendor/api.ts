@@ -23,7 +23,7 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock } from '@webwaka/core';
+import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider } from '@webwaka/core';
 import { publishEvent } from '../../core/event-bus';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
@@ -334,7 +334,7 @@ app.get('/vendors', async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, name, slug, email, phone, address, status, created_at, updated_at
+      `SELECT id, name, slug, email, phone, address, status, performanceScore, badge, scoreUpdatedAt, created_at, updated_at
        FROM vendors
        WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL
        ORDER BY name ASC`
@@ -2859,6 +2859,253 @@ app.post('/vendor/payout-request', async (c) => {
     }, 201);
   } catch (err) {
     console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPUTE RESOLUTION — MV-E08
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /disputes — Customer or vendor opens a dispute
+ * Auth: customer JWT (role='customer') OR vendor JWT (role='vendor')
+ */
+app.post('/disputes', async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    orderId: string;
+    category: string;
+    description: string;
+    evidenceUrls?: string[];
+  }>();
+
+  if (!body.orderId) return c.json({ success: false, error: 'orderId is required' }, 400);
+  if (!body.category?.trim()) return c.json({ success: false, error: 'category is required' }, 400);
+  if (!body.description?.trim()) return c.json({ success: false, error: 'description is required' }, 400);
+
+  // Authenticate as customer or vendor
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  if (!claims || !['customer', 'vendor'].includes(String(claims.role))) {
+    return c.json({ success: false, error: 'Authentication required' }, 401);
+  }
+
+  const reporterRole = String(claims.role);
+  const reporterId = String(claims.sub);
+
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id, customer_phone, vendor_id, paystack_reference
+       FROM orders WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.orderId, tenantId).first<{
+      id: string; customer_phone: string | null; vendor_id: string | null; paystack_reference: string | null;
+    }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    const now = Date.now();
+    const disputeId = `dsp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+    await c.env.DB.prepare(
+      `INSERT INTO disputes
+         (id, tenant_id, order_id, reporter_id, reporter_role, category, description,
+          evidence_urls_json, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`,
+    ).bind(
+      disputeId, tenantId, body.orderId, reporterId, reporterRole,
+      body.category.trim(), body.description.trim(),
+      body.evidenceUrls ? JSON.stringify(body.evidenceUrls) : null,
+      now, now,
+    ).run();
+
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_dispute_${now}_${disputeId}`,
+      tenantId: tenantId!,
+      type: CommerceEvents.DISPUTE_OPENED,
+      sourceModule: 'multi_vendor_marketplace',
+      timestamp: now,
+      payload: { disputeId, orderId: body.orderId, tenantId: tenantId!, reporterRole },
+    }).catch(() => {});
+
+    // Notify both buyer and vendor via WhatsApp
+    if (c.env.TERMII_API_KEY) {
+      const sms = createSmsProvider(c.env.TERMII_API_KEY);
+      const notifyMsg = `A dispute has been opened for order ${body.orderId}. Category: ${body.category}. Our team will review within 48 hours. Dispute ID: ${disputeId}`;
+      if (order.customer_phone) {
+        await sms.sendOtp(order.customer_phone, notifyMsg, 'whatsapp').catch(() => {});
+      }
+      if (order.vendor_id) {
+        const vendorRow = await c.env.DB.prepare(
+          `SELECT phone FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+        ).bind(order.vendor_id, tenantId).first<{ phone: string | null }>();
+        if (vendorRow?.phone) {
+          await sms.sendOtp(vendorRow.phone, notifyMsg, 'whatsapp').catch(() => {});
+        }
+      }
+    }
+
+    return c.json({ success: true, data: { disputeId, status: 'OPEN' } }, 201);
+  } catch (err) {
+    console.error('[MV] disputes error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /admin/disputes — List disputes by status (admin only)
+ */
+app.get('/admin/disputes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const status = c.req.query('status') ?? 'OPEN';
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, order_id, reporter_id, reporter_role, category, description,
+              evidence_urls_json, status, resolution, created_at, updated_at
+       FROM disputes
+       WHERE tenant_id = ? AND status = ?
+       ORDER BY created_at DESC LIMIT 100`,
+    ).bind(tenantId, status).all();
+    return c.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[MV] admin/disputes GET error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * PATCH /admin/disputes/:id — Update dispute status (admin only)
+ */
+app.patch('/admin/disputes/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const disputeId = c.req.param('id');
+  const body = await c.req.json<{ status: string }>();
+  const validStatuses = ['OPEN', 'UNDER_REVIEW', 'RESOLVED'];
+  if (!body.status || !validStatuses.includes(body.status)) {
+    return c.json({ success: false, error: `status must be one of: ${validStatuses.join(', ')}` }, 400);
+  }
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE disputes SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.status, Date.now(), disputeId, tenantId).run();
+    if (result.meta.changes === 0) return c.json({ success: false, error: 'Dispute not found' }, 404);
+    return c.json({ success: true, data: { id: disputeId, status: body.status } });
+  } catch (err) {
+    console.error('[MV] admin/disputes PATCH error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /admin/disputes/:id/resolve — Resolve a dispute (admin only)
+ * Supports FULL_REFUND, PARTIAL_REFUND, REPLACEMENT
+ */
+app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const disputeId = c.req.param('id');
+  const body = await c.req.json<{ resolution: string; amountKobo?: number }>();
+  const validResolutions = ['FULL_REFUND', 'PARTIAL_REFUND', 'REPLACEMENT'];
+  if (!body.resolution || !validResolutions.includes(body.resolution)) {
+    return c.json({ success: false, error: `resolution must be one of: ${validResolutions.join(', ')}` }, 400);
+  }
+  if (body.resolution === 'PARTIAL_REFUND' && (!body.amountKobo || body.amountKobo <= 0)) {
+    return c.json({ success: false, error: 'amountKobo is required for PARTIAL_REFUND' }, 400);
+  }
+
+  try {
+    const dispute = await c.env.DB.prepare(
+      `SELECT id, order_id, status FROM disputes WHERE id = ? AND tenant_id = ?`,
+    ).bind(disputeId, tenantId).first<{ id: string; order_id: string; status: string }>();
+    if (!dispute) return c.json({ success: false, error: 'Dispute not found' }, 404);
+    if (dispute.status === 'RESOLVED') return c.json({ success: false, error: 'Dispute already resolved' }, 409);
+
+    const order = await c.env.DB.prepare(
+      `SELECT id, customer_phone, vendor_id, paystack_reference, items_json, total_amount
+       FROM orders WHERE id = ? AND tenant_id = ?`,
+    ).bind(dispute.order_id, tenantId).first<{
+      id: string; customer_phone: string | null; vendor_id: string | null;
+      paystack_reference: string | null; items_json: string | null; total_amount: number;
+    }>();
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    const now = Date.now();
+
+    if (body.resolution === 'FULL_REFUND' && order.paystack_reference && c.env.PAYSTACK_SECRET) {
+      const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+      await paymentProvider.initiateRefund(order.paystack_reference).catch(() => {});
+    } else if (body.resolution === 'PARTIAL_REFUND' && order.paystack_reference && c.env.PAYSTACK_SECRET) {
+      const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+      await paymentProvider.initiateRefund(order.paystack_reference, body.amountKobo).catch(() => {});
+    } else if (body.resolution === 'REPLACEMENT') {
+      const replacementId = `ord_rep_${now}_${Math.random().toString(36).slice(2, 9)}`;
+      await c.env.DB.prepare(
+        `INSERT INTO orders
+           (id, tenant_id, vendor_id, customer_phone, items_json, total_amount, payment_status,
+            order_status, channel, payment_reference, paystack_reference, created_at, updated_at)
+         SELECT ?, tenant_id, vendor_id, customer_phone, items_json, total_amount, 'paid',
+                'confirmed', 'replacement', ?, ?, ?, ?
+         FROM orders WHERE id = ?`,
+      ).bind(replacementId, `replacement_${dispute.id}`, `replacement_${dispute.id}`, now, now, order.id).run();
+    }
+
+    await c.env.DB.prepare(
+      `UPDATE disputes SET status = 'RESOLVED', resolution = ?, amount_kobo = ?, resolved_at = ?, updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.resolution, body.amountKobo ?? null, now, now, disputeId, tenantId).run();
+
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_dispute_resolved_${now}_${disputeId}`,
+      tenantId: tenantId!,
+      type: CommerceEvents.DISPUTE_RESOLVED,
+      sourceModule: 'multi_vendor_marketplace',
+      timestamp: now,
+      payload: { disputeId, orderId: dispute.order_id, resolution: body.resolution, tenantId: tenantId! },
+    }).catch(() => {});
+
+    // Notify buyer and vendor with resolution details
+    if (c.env.TERMII_API_KEY) {
+      const sms = createSmsProvider(c.env.TERMII_API_KEY);
+      const resolutionMessages: Record<string, string> = {
+        FULL_REFUND: `Your dispute (${disputeId}) has been resolved. A full refund has been initiated for order ${dispute.order_id}.`,
+        PARTIAL_REFUND: `Your dispute (${disputeId}) has been resolved. A partial refund of ₦${((body.amountKobo ?? 0) / 100).toFixed(2)} has been initiated.`,
+        REPLACEMENT: `Your dispute (${disputeId}) has been resolved. A replacement order has been created for order ${dispute.order_id}.`,
+      };
+      const msg = resolutionMessages[body.resolution] ?? `Your dispute (${disputeId}) has been resolved.`;
+
+      if (order.customer_phone) {
+        await sms.sendOtp(order.customer_phone, msg, 'whatsapp').catch(() => {});
+      }
+      if (order.vendor_id) {
+        const vendorRow = await c.env.DB.prepare(
+          `SELECT phone FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+        ).bind(order.vendor_id, tenantId).first<{ phone: string | null }>();
+        if (vendorRow?.phone) {
+          await sms.sendOtp(vendorRow.phone, `Dispute ${disputeId} for order ${dispute.order_id} has been resolved: ${body.resolution}.`, 'whatsapp').catch(() => {});
+        }
+      }
+    }
+
+    return c.json({ success: true, data: { disputeId, status: 'RESOLVED', resolution: body.resolution } });
+  } catch (err) {
+    console.error('[MV] admin/disputes/resolve error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
