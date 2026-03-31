@@ -252,6 +252,8 @@ export async function handleVendorKycSubmitted(
       : Promise.resolve({ verified: false, reason: 'no_rc_number', provider: 'prembly' }),
   ]);
 
+  // Distinguish provider network error from genuine verification failure
+  const bvnProviderError = bvnSettled.status === 'rejected';
   const bvnResult = bvnSettled.status === 'fulfilled'
     ? bvnSettled.value
     : { verified: false, reason: 'provider_error', provider: 'smile_identity' };
@@ -263,13 +265,17 @@ export async function handleVendorKycSubmitted(
   const cacVerified = cacResult.verified;
 
   // ── 7. Determine outcome ──────────────────────────────────────────────────
+  // CRITICAL: provider network errors → MANUAL_REVIEW (never auto-reject on error)
   let newStatus: KycQueueStatus;
-  if (bvnVerified && cacVerified) {
+  if (bvnProviderError) {
+    // KYC provider unreachable — cannot make automated decision
+    newStatus = 'MANUAL_REVIEW';
+  } else if (bvnVerified && cacVerified) {
     newStatus = 'AUTO_APPROVED';
   } else if (!bvnVerified) {
     newStatus = 'AUTO_REJECTED';
   } else {
-    // bvnVerified && !cacVerified — needs manual review of CAC docs
+    // bvnVerified && !cacVerified — BVN passed, CAC needs manual review
     newStatus = 'MANUAL_REVIEW';
   }
 
@@ -337,12 +343,26 @@ export async function handleVendorKycSubmitted(
     );
 
   } else {
-    // MANUAL_REVIEW — BVN passed but CAC needs review
-    await _sendKycWhatsApp(
-      env,
-      vendor.phone,
-      'Your BVN has been verified. Your CAC business registration is under manual review. We will notify you within 48 hours.',
-    );
+    // MANUAL_REVIEW — BVN passed but CAC needs review, OR provider was unavailable
+    const vendorMsg = bvnProviderError
+      ? 'Your seller application requires manual review. Our team will contact you within 48 hours.'
+      : 'Your BVN has been verified. Your CAC business registration is under manual review. We will notify you within 48 hours.';
+
+    // WhatsApp to vendor
+    await _sendKycWhatsApp(env, vendor.phone, vendorMsg);
+
+    // SMS to marketplace admin (ADMIN_PHONE env binding, non-fatal if not configured)
+    if (env.ADMIN_PHONE && env.TERMII_API_KEY) {
+      try {
+        const sms = createSmsProvider(env.TERMII_API_KEY);
+        const reason = bvnProviderError ? 'KYC provider unavailable' : 'CAC verification requires review';
+        await sms.sendOtp(
+          env.ADMIN_PHONE,
+          `[WebWaka KYC] Vendor ${vendorId} (${vendor.name}) requires MANUAL REVIEW. Reason: ${reason}. Tenant: ${tenantId}`,
+          'generic',
+        );
+      } catch { /* non-fatal */ }
+    }
   }
 }
 

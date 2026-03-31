@@ -44,6 +44,7 @@ export interface Env {
   SMILE_IDENTITY_API_KEY?: string;      // Smile Identity api_key (P09 KYC)
   PREMBLY_API_KEY?: string;             // Prembly x-api-key (P09 CAC)
   PREMBLY_APP_ID?: string;              // Prembly app-id (P09 CAC)
+  ADMIN_PHONE?: string;                 // Marketplace admin WhatsApp/SMS for MANUAL_REVIEW alerts (P09)
 }
 
 const app = new Hono<{ Bindings: Env }>();
