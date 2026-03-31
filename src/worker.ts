@@ -39,6 +39,7 @@ export interface Env {
   OPENROUTER_API_KEY?: string;          // OpenRouter AI API key (P5-T03)
   CF_IMAGES_ACCOUNT_HASH?: string;
   KYCSALT?: string;                     // KYC BVN/NIN hashing salt (P3-T03)
+  ADMIN_API_KEY?: string;               // Internal admin API key for admin endpoints
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -47,7 +48,7 @@ const app = new Hono<{ Bindings: Env }>();
 // P0-T08: dynamic origin allowlist from env (replaced '*' hardcode)
 app.use('*', cors({
   origin: (origin, c) => {
-    const allowed = (c.env?.ALLOWED_ORIGINS ?? '*').split(',').map((s) => s.trim());
+    const allowed = (c.env?.ALLOWED_ORIGINS ?? '*').split(',').map((s: string) => s.trim());
     if (allowed.includes('*')) return origin; // dev mode / unconfigured
     return allowed.includes(origin) ? origin : '';
   },

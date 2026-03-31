@@ -41,5 +41,8 @@
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
     "skipLibCheck": true,
+    "paths": {
+      "@webwaka/core": ["./packages/webwaka-core/src/index.ts"]
+    }
   }
 }

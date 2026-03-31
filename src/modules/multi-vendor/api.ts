@@ -33,6 +33,10 @@ const app = new Hono<{ Bindings: Env }>();
 
 // ── OTP rate-limit store (5 requests per phone per 15 min) ────────────────────
 const otpRateLimitStore = _createRateLimitStore();
+// Checkout: 10 requests per identity per minute
+const checkoutRateLimitStore = _createRateLimitStore();
+// Search: 60 requests per IP per minute
+const searchRateLimitStore = _createRateLimitStore();
 
 // ── Crypto helpers (same pattern as COM-2 Single-Vendor) ──────────────────────
 
@@ -141,8 +145,9 @@ app.post('/auth/vendor-request-otp', async (c) => {
       success: true,
       data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -214,8 +219,9 @@ app.post('/auth/vendor-verify-otp', async (c) => {
       success: true,
       data: { token, vendor_id: vendor.id, vendor_name: vendor.name, phone: e164 },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -246,7 +252,8 @@ app.get('/', async (c) => {
         total_products: productCount?.count ?? 0,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: { active_vendors: 0, total_products: 0 } });
   }
 });
@@ -266,7 +273,8 @@ app.get('/vendors', async (c) => {
        ORDER BY name ASC`
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
@@ -299,7 +307,8 @@ app.get('/vendors/:id/products', async (c) => {
        LIMIT 100`
     ).bind(vendorId, tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
@@ -346,7 +355,7 @@ app.get('/vendors/:id/products/:productId/variants', async (c) => {
  */
 app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
@@ -392,8 +401,9 @@ app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => 
     ).run();
 
     return c.json({ success: true, data: { id, status: 'pending', ...body } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -404,7 +414,7 @@ app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => 
  */
 app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
@@ -434,8 +444,9 @@ app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
     ).bind(body.status ?? null, body.commission_rate ?? null, now, id, tenantId).run();
 
     return c.json({ success: true, data: { id, ...body, updated_at: now } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -505,8 +516,9 @@ app.post('/vendors/:id/products', async (c) => {
       success: true,
       data: { id, vendor_id: vendorId, tenant_id: tenantId, ...body },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -568,8 +580,9 @@ app.patch('/vendors/:id/products/:productId', async (c) => {
       `UPDATE products SET ${fields.join(', ')} WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL`
     ).bind(...values).run();
     return c.json({ success: true, data: { id: productId } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -602,8 +615,9 @@ app.delete('/vendors/:id/products/:productId', async (c) => {
       "UPDATE products SET deleted_at = ?, is_active = 0 WHERE id = ? AND vendor_id = ? AND tenant_id = ?"
     ).bind(Date.now(), productId, vendorId, tenantId).run();
     return c.json({ success: true, data: { id: productId } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -658,7 +672,8 @@ app.get('/orders', async (c) => {
       };
     });
     return c.json({ success: true, data });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
@@ -686,7 +701,8 @@ app.get('/ledger', async (c) => {
        LIMIT 200`
     ).bind(tenantId, vendor.vendorId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
@@ -721,11 +737,22 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   if (!body.customer_email?.trim()) {
     return c.json({ success: false, error: 'customer_email is required' }, 400);
   }
+  const rlCheckout = body.customer_phone ?? body.customer_email ?? 'anon';
+  if (!checkRateLimit(checkoutRateLimitStore, `${tenantId}:checkout:${rlCheckout}`, 10, 60_000)) {
+    return c.json({ success: false, error: 'Too many checkout attempts. Please wait before retrying.' }, 429);
+  }
 
   const subtotalPreVerify = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
 
   // ── MV-4: Server-side Paystack verification ───────────────────────────────
-  if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET && body.payment_reference) {
+  // When PAYSTACK_SECRET is configured, enforce strict verification:
+  //   - payment_reference is required (can't verify without it → 400)
+  //   - fetches Paystack API to confirm the transaction succeeded
+  // When PAYSTACK_SECRET is not configured (local/test env), skip silently.
+  if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET) {
+    if (!body.payment_reference) {
+      return c.json({ success: false, error: 'payment_reference is required for Paystack payments' }, 400);
+    }
     try {
       const psRes = await fetch(
         `https://api.paystack.co/transaction/verify/${encodeURIComponent(body.payment_reference)}`,
@@ -745,10 +772,11 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         }, 402);
       }
     } catch (fetchErr) {
-      return c.json({ success: false, error: `Paystack API error: ${String(fetchErr)}` }, 502);
+      console.error('[MV][checkout] Paystack verification request failed:', fetchErr);
+      return c.json({ success: false, error: 'Payment verification service unavailable. Please retry.' }, 502);
     }
-  } else if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET && !body.payment_reference) {
-    return c.json({ success: false, error: 'payment_reference is required for Paystack payments' }, 400);
+  } else if (body.payment_method === 'paystack' && !c.env.PAYSTACK_SECRET) {
+    console.warn('[MV][checkout] PAYSTACK_SECRET not configured — skipping server-side verification');
   }
 
   const now = Date.now();
@@ -881,8 +909,9 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         vendor_breakdown: breakdownMap,
       },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -944,8 +973,9 @@ app.post('/vendor-auth/request-otp', async (c) => {
       success: true,
       data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1008,8 +1038,9 @@ app.post('/vendor-auth/verify-otp', async (c) => {
     );
 
     return c.json({ success: true, data: { token, vendor_id: vendor.id, vendor_name: vendor.name, phone: e164 } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1135,8 +1166,9 @@ app.post('/vendors/:id/kyc', async (c) => {
         message: 'KYC submitted successfully. Admin review typically takes 1-2 business days.',
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1167,7 +1199,20 @@ app.get('/catalog', async (c) => {
   const perPage   = Math.min(Number(c.req.query('per_page') ?? '12'), 24);
   const noCache   = c.req.query('nocache') === '1';
 
-  const cacheKey = `mv_catalog_${tenantId}_${after}_${search}_${category}_${vendorId}_${perPage}`;
+  if (search) {
+    const searchRlKey = `${tenantId}:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+    if (!checkRateLimit(searchRateLimitStore, searchRlKey, 60, 60_000)) {
+      return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
+    }
+  }
+
+  // Include catalog version in cache key so that any inventory.updated event
+  // (which writes a new catalog_version:${tenantId} KV value) immediately
+  // makes all old entries un-hittable without needing prefix-deletes.
+  const catalogVer = c.env.CATALOG_CACHE
+    ? ((await c.env.CATALOG_CACHE.get(`catalog_version:${tenantId}`)) ?? '0')
+    : '0';
+  const cacheKey = `mv_catalog_${tenantId}_v${catalogVer}_${after}_${search}_${category}_${vendorId}_${perPage}`;
 
   // ── KV cache hit ──────────────────────────────────────────────────────────
   if (!noCache && c.env.CATALOG_CACHE) {
@@ -1211,8 +1256,9 @@ app.get('/catalog', async (c) => {
         searchJoin = `INNER JOIN products_fts fts ON fts.product_id = p.id AND fts.tenant_id = p.tenant_id`;
         conditions.push('products_fts MATCH ?');
         binds.push(search);
-      } catch {
+      } catch (ftsErr) {
         // Fallback to LIKE if FTS5 table absent
+        console.warn('[MV][catalog/search] FTS5 unavailable, falling back to LIKE:', ftsErr);
         searchJoin = '';
         conditions.push(`(p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)`);
         const like = `%${search}%`;
@@ -1316,10 +1362,12 @@ app.get('/catalog', async (c) => {
         const page = hasMore ? results.slice(0, perPage) : results;
         return c.json({ success: true, data: page, meta: { count: page.length, has_more: hasMore, next_cursor: hasMore ? page[page.length - 1]!.id : null, per_page: perPage } });
       } catch (e2) {
-        return c.json({ success: false, error: String(e2) }, 500);
+        console.error('[MV][catalog/search] FTS fallback error:', e2);
+        return c.json({ success: false, error: 'Internal server error' }, 500);
       }
     }
-    return c.json({ success: false, error: String(e) }, 500);
+    console.error('[MV][catalog/search] error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1385,8 +1433,9 @@ app.get('/orders/track', async (c) => {
         vendor_orders: childOrders,
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1523,8 +1572,9 @@ app.post('/cart', ndprConsentMiddleware, async (c) => {
         expires_at: expiresAt,
       },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1583,8 +1633,9 @@ app.get('/cart/:token', async (c) => {
         updated_at: cart.updated_at,
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1623,14 +1674,16 @@ app.post('/paystack/webhook', async (c) => {
     if (hex !== signature) {
       return c.json({ success: false, error: 'Invalid signature' }, 401);
     }
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: false, error: 'Signature verification error' }, 401);
   }
 
   let payload: { event: string; data: Record<string, unknown> };
   try {
     payload = JSON.parse(rawBody);
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
@@ -1705,7 +1758,8 @@ app.post('/paystack/webhook', async (c) => {
     await c.env.DB.prepare(
       `UPDATE paystack_webhook_log SET error = ? WHERE id = ?`
     ).bind(String(e), logId).run();
-    return c.json({ success: false, error: String(e) }, 500);
+    console.error('[MV][paystack/webhook] handler error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1780,8 +1834,9 @@ app.post('/delivery-zones', async (c) => {
     ).run();
 
     return c.json({ success: true, data: { id: dzId, vendor_id: body.vendor_id, state: body.state, lga: body.lga ?? null, base_fee: body.base_fee } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1851,8 +1906,9 @@ app.get('/shipping/estimate', async (c) => {
         estimated_days_max: zone.estimated_days_max,
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1918,8 +1974,9 @@ app.get('/vendors/:id/settlements', async (c) => {
         total_count: rows.results?.length ?? 0,
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -2017,8 +2074,9 @@ app.post('/vendors/:id/payout-request', async (c) => {
         status: 'pending',
       },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -2030,5 +2088,11 @@ export { app as multiVendorRouter };
  */
 export function _resetOtpRateLimitStore(): void {
   otpRateLimitStore.clear();
+}
+export function _resetCheckoutRateLimitStore(): void {
+  checkoutRateLimitStore.clear();
+}
+export function _resetSearchRateLimitStore(): void {
+  searchRateLimitStore.clear();
 }
 

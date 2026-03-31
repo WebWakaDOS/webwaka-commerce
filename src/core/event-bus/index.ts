@@ -83,6 +83,14 @@ export function registerHandler(eventType: string, handler: EventHandler): void 
 }
 
 /**
+ * Clear all registered consumer handlers.
+ * Used by registerAllHandlers to enable safe re-registration with a fresh env.
+ */
+export function clearHandlers(): void {
+  consumerHandlers.clear();
+}
+
+/**
  * Dispatch a consumed event from the CF Queue batch.
  * Called by worker.ts `queue` export.
  */

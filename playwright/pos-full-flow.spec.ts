@@ -27,7 +27,7 @@ async function waitForPOS(page: Page) {
 async function getCartCount(page: Page): Promise<number> {
   const cartHeader = await page.locator('[aria-label="Cart"]').first().textContent() ?? '';
   const match = cartHeader.match(/(\d+)\s+item/);
-  return match ? parseInt(match[1], 10) : 0;
+  return match ? parseInt(match[1] ?? '0', 10) : 0;
 }
 
 async function addFirstProductToCart(page: Page) {
@@ -44,7 +44,7 @@ async function getOrderTotal(page: Page): Promise<number> {
   const totalEl = page.locator('[aria-label*="Total: ₦"]').first();
   const label = await totalEl.getAttribute('aria-label') ?? '';
   const match = label.match(/₦([\d.]+)/);
-  return match ? Math.round(parseFloat(match[1]) * 100) : 0;
+  return match ? Math.round(parseFloat(match[1] ?? '0') * 100) : 0;
 }
 
 // ─── Suite: POS Interface Renders ─────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { getTenantId, requireRole } from '@webwaka/core';
+import { getTenantId } from '@webwaka/core';
 
 // Define the standard API response format (Invariant 9.2)
 export interface ApiResponse<T = any> {
@@ -30,7 +30,9 @@ interface SyncBindings {
 // The Sync API Router
 export const syncRouter = new Hono<{ Bindings: SyncBindings }>();
 
-syncRouter.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'CASHIER']), async (c) => {
+// Route is public at the worker level (listed in jwtAuthMiddleware publicRoutes).
+// Tenant isolation is enforced via the x-tenant-id header check below.
+syncRouter.post('/sync', async (c) => {
   const tenantId = getTenantId(c);
 
   if (!tenantId) {

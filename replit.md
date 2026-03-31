@@ -209,3 +209,64 @@ See `.env.example` for reference:
 - On accepted mutation: upserts the new version into `sync_versions` (INSERT … ON CONFLICT DO UPDATE) so subsequent syncs detect real conflicts.
 - **`migrations/012_sync_versions.sql`** (new): `sync_versions` table with `(tenant_id, entity_type, entity_id)` composite PK + index.
 - **`src/core/sync/server.test.ts`**: Updated to pass `mockEnv` with a mock D1 that returns version 1 for `item_2` (enabling real conflict detection test).
+
+---
+
+## Production Hardening Phase 2 (session March 31 2026)
+
+### Package Structure — @webwaka/core
+- **`packages/webwaka-core/`** (new): Real local npm package (`file:./packages/webwaka-core`).
+  - Exports: `getTenantId`, `requireRole`, `jwtAuthMiddleware` (HS256 JWT, public-route allowlist), `signJwt`, `verifyJwt` (Web Crypto API, no Node.js crypto), `sendTermiiSms`.
+  - All backend API modules import from `@webwaka/core`; Vitest tests use `src/__mocks__/webwaka-core.ts` via vitest.config.ts alias.
+  - `tsconfig.json` paths aliased to the package source.
+
+### Migration 013 — vendor_orders
+- **`migrations/013_vendor_orders.sql`**: `CREATE TABLE vendor_orders` with full column set (`id`, `tenant_id`, `umbrella_order_id`, `vendor_id`, `fulfilment_status`, `tracking_number`, `tracking_url`, `shipped_at`, `delivered_at`, `updated_at`, `created_at`) + indexes. Fixes D1 runtime crash from delivery event handlers.
+
+### Error Handling Hardening
+- **`src/modules/pos/api.ts`**, **`src/modules/single-vendor/api.ts`**, **`src/modules/multi-vendor/api.ts`**: All 44 bare `catch {}` blocks replaced with `catch (err)` + `console.error` logging. All `String(e)` leaks in HTTP responses replaced with generic `'Internal server error'`. FTS5 fallback catches use `console.warn` (expected degradation, not error).
+- **`src/middleware/ndpr.ts`**: Fixed TypeScript error on `ndpr_consent` property access.
+- **`src/worker.ts`**: `ADMIN_API_KEY?: string` added to `Env` interface; `app.onError()` global handler confirmed present.
+
+### Paystack Webhook — Single-Vendor
+- **`src/modules/single-vendor/api.ts`**: `POST /paystack/webhook` endpoint added (mirrors MV implementation). HMAC-SHA512 signature verification via Web Crypto. Handles `charge.success` → marks orders paid + eligible settlements. Idempotent via `paystack_webhook_log` table. PAYSTACK_SECRET guard: 500 if not configured.
+- **`src/middleware/auth.ts`**: `/api/single-vendor/paystack/webhook` added to public routes allowlist.
+
+### Rate Limiting — Checkout & Search
+- **`src/modules/single-vendor/api.ts`**: `checkoutRateLimitStore` (10 req/min/identity) applied to `POST /checkout`; `searchRateLimitStore` (60 req/min/IP) applied to `GET /catalog/search`. Reset exports added for test isolation.
+- **`src/modules/multi-vendor/api.ts`**: Same rate limiting on `POST /checkout` and `GET /catalog` (when `?q=` search param present).
+
+### PAYSTACK_SECRET Guard — Multi-Vendor Checkout
+- **`src/modules/multi-vendor/api.ts`**: When `PAYSTACK_SECRET` is set, `payment_reference` is **required** for Paystack payments (400 if missing), and Paystack API verification is enforced. When `PAYSTACK_SECRET` is not configured (local/test envs), verification is skipped with a `console.warn`. Error messages no longer leak `String(fetchErr)`.
+
+### InventorySyncService — D1-backed (T008)
+- **`src/core/sync/inventory-service.ts`**: Rewrote from in-memory `Map` to D1 queries. Constructor now requires `D1Database`. `applySync` uses `SELECT` + conditional `UPDATE` / `INSERT OR IGNORE INTO products`. `_getSyncPrefs` queries `tenants.sync_config` JSON column. Factory `createInventorySyncService(db)` exported instead of a singleton.
+- **`src/core/sync/inventory-service.test.ts`**: Rewritten to mock D1 `prepare/bind/first/run` chain; verifies correct SQL is issued per conflict resolution strategy.
+
+### Sync Public Route (T009)
+- **`src/middleware/auth.ts`**: `POST /api/sync/sync` added to `jwtAuthMiddleware` public routes. Tenant isolation enforced server-side via `x-tenant-id` header in `syncRouter`.
+- **`src/core/sync/server.ts`**: Removed `requireRole` from `POST /sync` (route now public at middleware level; tenant validated by header check).
+
+### KV Cache Invalidation — Version Counter (T010)
+- **`src/core/event-bus/handlers/index.ts`**: `handleInventoryUpdated` now writes a `catalog_version:${tenantId}` timestamp to `CATALOG_CACHE` KV (replaces incorrect fixed-key deletes).
+- **`src/modules/multi-vendor/api.ts`**: `GET /catalog` reads `catalog_version:${tenantId}` from KV and includes it in the cache key (`mv_catalog_${tenantId}_v${catalogVer}_...`). All old entries become un-hittable instantly on any inventory update; no prefix-delete needed.
+
+### registerAllHandlers — Safe Re-registration (T010)
+- **`src/core/event-bus/index.ts`**: `clearHandlers()` exported — clears the `consumerHandlers` Map.
+- **`src/core/event-bus/handlers/index.ts`**: `_registered` module-level boolean removed. `registerAllHandlers` calls `clearHandlers()` first → always registers with the fresh `env` binding, never duplicates.
+
+### CI Pipeline (T011)
+- **`.github/workflows/ci.yml`** (new): 3-job CI on push/PR to `main`/`develop`:
+  1. `test` — `npm run test` (Vitest)
+  2. `typecheck` — `tsc --noEmit`
+  3. `build` — `wrangler deploy --dry-run` (runs after test + typecheck)
+  - `concurrency` group cancels stale runs on new pushes.
+
+### Migration Runner (T011)
+- **`scripts/migrate.sh`** (new, executable): Applies all `migrations/*.sql` files in lexicographic order via `wrangler d1 execute`. Usage: `./scripts/migrate.sh staging` or `./scripts/migrate.sh prod`.
+- **`package.json`**: `migrate:staging` and `migrate:prod` scripts present.
+
+### Playwright TypeScript Fixes (T011)
+- **`playwright/pos-full-flow.spec.ts`**: Fixed 2 `string | undefined` TS errors — `match[1]` in `getCartCount` and `getOrderTotal` now uses `match[1] ?? '0'` null coalesce.
+
+**Test count: 801 passing, 0 TypeScript errors (production files), 0 bare catch blocks**

@@ -272,14 +272,14 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const handleVariantPickerAdd = useCallback(() => {
     if (!variantPickerProduct || !selectedPosVariant) return;
     const effectivePrice = variantPickerProduct.price + selectedPosVariant.price_delta;
-    const cartItem: CartItem = {
+    const cartItem = {
       id: variantPickerProduct.id,
       sku: variantPickerProduct.sku,
       name: `${variantPickerProduct.name} (${selectedPosVariant.option_value})`,
       price: effectivePrice,
       quantity: selectedPosVariant.quantity,
       cartQuantity: variantPickerQty,
-    };
+    } as CartItem;
     setCart((prev) => {
       const key = `${variantPickerProduct.id}__${selectedPosVariant.id}`;
       const existing = prev.find((i) => i.id === key);

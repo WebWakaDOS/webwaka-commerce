@@ -48,7 +48,8 @@ app.get('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asyn
       .bind(tenantId)
       .first();
     return c.json({ success: true, data: session ?? null });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
@@ -70,7 +71,8 @@ app.get('/sessions/history', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async
       .bind(tenantId, limit, offset)
       .all();
     return c.json({ success: true, data: results, limit, offset });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
@@ -131,7 +133,8 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       },
       201,
     );
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Failed to open session' }, 500);
   }
 });
@@ -209,7 +212,8 @@ app.patch(
         .run();
 
       return c.json({ success: true, data: zReport });
-    } catch {
+    } catch (err) {
+      console.error('[POS] route error:', err);
       return c.json({ success: false, error: 'Failed to close session' }, 500);
     }
   },
@@ -229,7 +233,8 @@ app.get('/', async (c) => {
       .bind(tenantId)
       .all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
@@ -257,7 +262,8 @@ app.get('/products', async (c) => {
     params.push(limit, offset);
     const { results } = await c.env.DB.prepare(query).bind(...params).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
@@ -292,7 +298,8 @@ app.get('/products/barcode/:code', async (c) => {
     }
 
     return c.json({ success: true, data: { ...product, variants } });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Product not found' }, 404);
   }
 });
@@ -309,7 +316,8 @@ app.get('/products/:id/variants', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'S
        ORDER BY option_name ASC, option_value ASC`,
     ).bind(productId, tenantId).all();
     return c.json({ success: true, data: { variants: results } });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: true, data: { variants: [] } });
   }
 });
@@ -338,7 +346,8 @@ app.get('/customers/lookup', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
         total_spend: customer.total_spend ?? 0,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
@@ -361,8 +370,9 @@ app.post('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), as
       success: true,
       data: { id, name: body.name.trim(), phone: body.phone.trim(), loyalty_points: 0, total_spend: 0 },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[POS] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -377,7 +387,8 @@ app.get('/products/low-stock', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAF
       .bind(tenantId, threshold)
       .all();
     return c.json({ success: true, data: results, threshold, count: results.length });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
@@ -418,7 +429,8 @@ app.post('/products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       )
       .run();
     return c.json({ success: true, data: { id, ...body, tenant_id: tenantId } }, 201);
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Failed to create product' }, 500);
   }
 });
@@ -435,7 +447,8 @@ app.get('/products/:id', async (c) => {
       .first();
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
     return c.json({ success: true, data: product });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Product not found' }, 404);
   }
 });
@@ -467,7 +480,8 @@ app.patch('/products/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'])
       .bind(...values, now, id, tenantId)
       .run();
     return c.json({ success: true, data: { id, ...body } });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Failed to update product' }, 500);
   }
 });
@@ -674,8 +688,9 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       },
       201,
     );
-  } catch {
+  } catch (err) {
     // PCI hardening: never leak internal error details
+    console.error('[POS][checkout] transaction error:', err);
     return c.json({ success: false, error: 'Transaction failed' }, 500);
   }
 });
@@ -728,7 +743,8 @@ app.post('/orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
         total_amount: order.total_amount,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Transaction failed' }, 500);
   }
 });
@@ -806,7 +822,8 @@ app.post(
       };
 
       return c.json({ success: true, data: receipt }, 201);
-    } catch {
+    } catch (err) {
+      console.error('[POS] route error:', err);
       return c.json({ success: false, error: 'Service unavailable' }, 503);
     }
   },
@@ -828,7 +845,8 @@ app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async 
       .bind(tenantId, limit, offset)
       .all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
@@ -886,7 +904,8 @@ app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (
           )
           .run();
         applied.push(m.entity_id);
-      } catch {
+      } catch (err) {
+        console.error('[POS][sync] mutation apply error:', err);
         failed.push(m.entity_id);
       }
     }
@@ -933,7 +952,8 @@ app.get('/dashboard', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
         low_stock_count: lowStockCount?.count ?? 0,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });

@@ -13,7 +13,7 @@
 
 import type { Env } from '../../../worker';
 import type { WebWakaEvent } from '../index';
-import { registerHandler } from '../index';
+import { registerHandler, clearHandlers } from '../index';
 
 // ─── Handler: inventory.updated → invalidate catalog KV cache ────────────────
 
@@ -24,20 +24,16 @@ export async function handleInventoryUpdated(
   const tenantId = event.tenantId;
   if (!tenantId) return;
 
-  // Invalidate all catalog cache keys for this tenant.
-  // KV does not support prefix-delete, so we delete the known page keys
-  // (pages 1–5, most common). Full invalidation happens via TTL (60s).
-  const knownCacheKeys = [
-    `catalog:${tenantId}:1`,
-    `catalog:${tenantId}:2`,
-    `catalog:${tenantId}:3`,
-    `catalog:${tenantId}:featured`,
-    `catalog:${tenantId}:search`,
-  ];
-
-  await Promise.allSettled(
-    knownCacheKeys.map((key) => env.CATALOG_CACHE.delete(key)),
-  );
+  // KV cache invalidation — version-counter approach.
+  // Increment the tenant's catalog version; the MV catalog route includes this
+  // version in its cache key, so all stale entries become un-hittable instantly.
+  // Old entries expire naturally via their TTL (60 s).
+  if (env.CATALOG_CACHE) {
+    const versionKey = `catalog_version:${tenantId}`;
+    await env.CATALOG_CACHE.put(versionKey, String(Date.now()), {
+      expirationTtl: 86400, // 24 h; a new version is written on every update anyway
+    });
+  }
 }
 
 // ─── Handler: order.created → placeholder (Super Admin V2 will consume) ───────
@@ -162,18 +158,16 @@ export async function handleDeliveryStatusUpdated(
 
 // ─── Registration (called once at module init) ────────────────────────────────
 
-let _registered = false;
-
 /**
  * Register all server-side consumer handlers with the dispatchEvent registry.
- * Safe to call multiple times (idempotent via `_registered` guard).
+ * Safe to call multiple times — clears the registry first so handlers always
+ * run with the current env binding and are never duplicated.
  *
  * IMPORTANT: This function receives `env` because handlers need Worker
  * bindings (DB, KV). The env is curried into each handler via a closure.
  */
 export function registerAllHandlers(env: Env): void {
-  if (_registered) return;
-  _registered = true;
+  clearHandlers();
 
   registerHandler('inventory.updated', (event) =>
     handleInventoryUpdated(event as WebWakaEvent<{ productId?: string; tenantId?: string }>, env),

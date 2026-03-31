@@ -25,8 +25,13 @@ const MAX_PAGE_SIZE = 100;
 
 const app = new Hono<{ Bindings: Env }>();
 
-// ── OTP rate-limit store (5 requests per phone per 15 min) ────────────────────
+// ── Rate-limit stores ─────────────────────────────────────────────────────────
+// OTP: 5 requests per phone per 15 min (SMS abuse prevention)
 const otpRateLimitStore = _createRateLimitStore();
+// Checkout: 10 requests per phone/IP per minute (order flood prevention)
+const checkoutRateLimitStore = _createRateLimitStore();
+// Search: 60 requests per IP per minute (crawler/scraper mitigation)
+const searchRateLimitStore = _createRateLimitStore();
 
 // ── Tenant middleware ─────────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
@@ -44,7 +49,8 @@ app.get('/', async (c) => {
       'SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: [], message: 'DB not yet initialized' });
   }
 });
@@ -57,6 +63,11 @@ app.get('/catalog/search', async (c) => {
   const perPage = Math.min(Number(c.req.query('per_page') ?? DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
 
   if (!q) return c.json({ success: false, error: 'Search query (q) is required' }, 400);
+
+  const searchRlKey = `${tenantId}:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+  if (!checkRateLimit(searchRateLimitStore, searchRlKey, 60, 60_000)) {
+    return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
+  }
 
   try {
     // FTS5 MATCH with JOIN to apply tenant + active filters
@@ -74,8 +85,9 @@ app.get('/catalog/search', async (c) => {
     ).bind(sanitizeFts(q), tenantId, perPage).all();
 
     return c.json({ success: true, data: { products: results, query: q, count: results.length } });
-  } catch {
+  } catch (ftsErr) {
     // FTS table may not exist in early envs — graceful fallback with LIKE
+    console.warn('[SV][catalog/search] FTS5 query failed, falling back to LIKE:', ftsErr);
     try {
       const { results } = await c.env.DB.prepare(
         `SELECT id, name, description, price, quantity, category, image_url, sku, has_variants
@@ -85,7 +97,8 @@ app.get('/catalog/search', async (c) => {
          ORDER BY name ASC LIMIT ?`
       ).bind(tenantId, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, perPage).all();
       return c.json({ success: true, data: { products: results, query: q, count: results.length } });
-    } catch {
+    } catch (err) {
+      console.error('[SV] route error:', err);
       return c.json({ success: true, data: { products: [], query: q, count: 0 } });
     }
   }
@@ -151,7 +164,8 @@ app.get('/catalog', async (c) => {
     }
 
     return c.json({ success: true, data: payload });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { products: [], next_cursor: null, has_more: false } });
   }
 });
@@ -170,7 +184,8 @@ app.get('/products/by-slug/:slug', async (c) => {
     ).bind(tenantId, slug).first();
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
     return c.json({ success: true, data: product });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Product not found' }, 404);
   }
 });
@@ -187,7 +202,8 @@ app.get('/products/:id/variants', async (c) => {
        ORDER BY option_name ASC, option_value ASC`
     ).bind(productId, tenantId).all();
     return c.json({ success: true, data: { variants: results } });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { variants: [] } });
   }
 });
@@ -210,8 +226,9 @@ app.post('/cart', async (c) => {
        ON CONFLICT(id) DO UPDATE SET items_json = excluded.items_json, updated_at = excluded.updated_at`
     ).bind(id, tenantId, token, JSON.stringify(body.items), expiresAt, now, now).run();
     return c.json({ success: true, data: { id, session_token: token, items: body.items, expires_at: expiresAt } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -225,7 +242,8 @@ app.get('/cart/:token', async (c) => {
     ).bind(token, tenantId, Date.now()).first();
     if (!cart) return c.json({ success: false, error: 'Cart not found or expired' }, 404);
     return c.json({ success: true, data: cart });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Cart not found' }, 404);
   }
 });
@@ -256,8 +274,9 @@ app.post('/promo/validate', async (c) => {
 
     const discountKobo = computeDiscount(promo.discount_type, promo.discount_value, body.subtotal_kobo);
     return c.json({ success: true, data: { code: promo.code, discount_type: promo.discount_type, discount_value: promo.discount_value, discount_kobo: discountKobo, description: promo.description } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -279,6 +298,10 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   if (!body.items || body.items.length === 0) return c.json({ success: false, error: 'Cart is empty' }, 400);
   if (!body.customer_email && !body.customer_phone) return c.json({ success: false, error: 'customer_email or customer_phone required' }, 400);
   if (!body.paystack_reference || body.paystack_reference.trim() === '') return c.json({ success: false, error: 'paystack_reference is required' }, 400);
+  const rlPhone = body.customer_phone ?? body.customer_email ?? 'anon';
+  if (!checkRateLimit(checkoutRateLimitStore, `${getTenantId(c) ?? 'x'}:checkout:${rlPhone}`, 10, 60_000)) {
+    return c.json({ success: false, error: 'Too many checkout attempts. Please wait before retrying.' }, 429);
+  }
   for (const item of body.items) {
     if (!item.product_id || item.quantity <= 0) return c.json({ success: false, error: 'Invalid item: product_id required and quantity must be > 0' }, 400);
   }
@@ -403,8 +426,9 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         payment_status: 'paid', order_status: 'confirmed', items_count: body.items.length,
       },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -444,7 +468,8 @@ app.get('/orders/:id/track', async (c) => {
         updated_at: order.updated_at,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Order not found' }, 404);
   }
 });
@@ -484,7 +509,8 @@ app.get('/orders/:id', async (c) => {
         delivery_address_json: undefined,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Order not found' }, 404);
   }
 });
@@ -497,7 +523,8 @@ app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
       "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
@@ -510,7 +537,8 @@ app.get('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
       'SELECT id, name, email, phone, loyalty_points, total_spend, ndpr_consent, created_at FROM customers WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
@@ -554,8 +582,9 @@ app.post('/auth/request-otp', async (c) => {
     });
 
     return c.json({ success: true, data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -619,8 +648,9 @@ app.post('/auth/verify-otp', async (c) => {
       success: true,
       data: { token, customer_id: customer.id, phone: e164, loyalty_points: customer.loyalty_points },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -640,7 +670,8 @@ app.get('/wishlist', async (c) => {
        ORDER BY w.added_at DESC`
     ).bind(tenantId, customer.customerId).all();
     return c.json({ success: true, data: { items: results, count: results.length } });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { items: [], count: 0 } });
   }
 });
@@ -670,14 +701,16 @@ app.post('/wishlist', async (c) => {
       ).bind(wlId, tenantId, customer.customerId, body.product_id, now).run();
       return c.json({ success: true, data: { action: 'added', product_id: body.product_id } }, 201);
     }
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 // ── GET /account/orders — Customer's own orders, paginated ───────────────────
 app.get('/account/orders', async (c) => {
   const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant ID' }, 400);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -717,7 +750,8 @@ app.get('/account/orders', async (c) => {
     const nextCursor = hasMore ? orders[orders.length - 1]?.id ?? null : null;
 
     return c.json({ success: true, data: { orders, next_cursor: nextCursor, has_more: hasMore } });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { orders: [], next_cursor: null, has_more: false } });
   }
 });
@@ -736,7 +770,8 @@ app.get('/account/profile', async (c) => {
 
     if (!profile) return c.json({ success: false, error: 'Customer not found' }, 404);
     return c.json({ success: true, data: profile });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Profile not found' }, 404);
   }
 });
@@ -744,7 +779,7 @@ app.get('/account/profile', async (c) => {
 // ── GET /analytics — Today/week revenue, conversion %, top products (ANLT-1) ─
 app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  const expectedKey = (c.env as Record<string, unknown>).ADMIN_API_KEY as string | undefined;
+  const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
@@ -813,7 +848,8 @@ app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
       },
     });
   } catch (err) {
-    return c.json({ success: false, error: String(err) }, 500);
+    console.error('[SV][analytics] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -828,7 +864,8 @@ app.get('/delivery-zones', async (c) => {
        ORDER BY state ASC, lga ASC`,
     ).bind(tenantId).all();
     return c.json({ success: true, data: { zones: results } });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { zones: [] } });
   }
 });
@@ -858,8 +895,9 @@ app.post('/delivery-zones', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async 
       success: true,
       data: { id, state: body.state, lga: body.lga ?? null, fee_kobo: body.fee_kobo },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -900,7 +938,8 @@ app.get('/shipping/estimate', async (c) => {
         is_estimate: true,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({
       success: true,
       data: { state, lga: lga ?? null, fee_kobo: 0, estimated_days_min: 1, estimated_days_max: 7, is_estimate: true },
@@ -939,7 +978,8 @@ app.get('/products/:id/reviews', async (c) => {
         avg_rating: avgRating,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { reviews: [], count: 0, avg_rating: 0 } });
   }
 });
@@ -979,8 +1019,9 @@ app.post('/products/:id/reviews', async (c) => {
       success: true,
       data: { id, rating: body.rating, verified_purchase: !!purchaseCheck },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1023,6 +1064,90 @@ async function authenticateCustomer(c: { req: { header: (h: string) => string | 
   return { customerId: String(claims.sub), phone: String(claims.phone) };
 }
 
+// ── POST /paystack/webhook — SV HMAC-SHA512 payment event handler ─────────────
+app.post('/paystack/webhook', async (c) => {
+  if (!c.env.PAYSTACK_SECRET) {
+    console.error('[SV][paystack/webhook] PAYSTACK_SECRET is not configured');
+    return c.json({ success: false, error: 'Webhook handler not configured' }, 500);
+  }
+  const signature = c.req.header('x-paystack-signature');
+  if (!signature) {
+    return c.json({ success: false, error: 'Missing x-paystack-signature header' }, 400);
+  }
+
+  const rawBody = await c.req.text();
+
+  try {
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw', enc.encode(c.env.PAYSTACK_SECRET),
+      { name: 'HMAC', hash: 'SHA-512' }, false, ['sign'],
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(rawBody));
+    const hex = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    if (hex !== signature) {
+      return c.json({ success: false, error: 'Invalid signature' }, 401);
+    }
+  } catch (err) {
+    console.error('[SV][paystack/webhook] signature verification error:', err);
+    return c.json({ success: false, error: 'Signature verification error' }, 401);
+  }
+
+  let payload: { event: string; data: Record<string, unknown> };
+  try {
+    payload = JSON.parse(rawBody) as { event: string; data: Record<string, unknown> };
+  } catch (err) {
+    console.error('[SV][paystack/webhook] invalid JSON body:', err);
+    return c.json({ success: false, error: 'Invalid JSON body' }, 400);
+  }
+
+  const { event, data } = payload;
+  const reference = (data.reference ?? '') as string;
+  const tenantId = (data.metadata as Record<string, unknown> | undefined)?.tenant_id as string | undefined;
+  const now = Date.now();
+  const logId = `pwl_${event.replace('.', '_')}_${reference}`;
+
+  const existing = await c.env.DB.prepare(
+    `SELECT id, processed FROM paystack_webhook_log WHERE id = ?`
+  ).bind(logId).first<{ id: string; processed: number }>();
+
+  if (existing?.processed) {
+    return c.json({ success: true, message: 'Already processed' });
+  }
+
+  await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO paystack_webhook_log
+       (id, event, reference, tenant_id, raw_json, processed, received_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?)`
+  ).bind(logId, event, reference, tenantId ?? null, rawBody, now).run();
+
+  try {
+    if (event === 'charge.success' && tenantId && reference) {
+      await c.env.DB.prepare(
+        `UPDATE orders SET payment_status = 'paid', updated_at = ?
+         WHERE payment_reference = ? AND tenant_id = ?`
+      ).bind(now, reference, tenantId).run();
+
+      await c.env.DB.prepare(
+        `UPDATE settlements SET status = 'eligible', updated_at = ?
+         WHERE tenant_id = ? AND payment_reference = ? AND status = 'held' AND hold_until <= ?`
+      ).bind(now, tenantId, reference, now).run();
+    }
+
+    await c.env.DB.prepare(
+      `UPDATE paystack_webhook_log SET processed = 1 WHERE id = ?`
+    ).bind(logId).run();
+
+    return c.json({ success: true });
+  } catch (e) {
+    await c.env.DB.prepare(
+      `UPDATE paystack_webhook_log SET error = ? WHERE id = ?`
+    ).bind(String(e), logId).run();
+    console.error('[SV][paystack/webhook] handler error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 export { app as singleVendorRouter };
 
 /**
@@ -1031,4 +1156,10 @@ export { app as singleVendorRouter };
  */
 export function _resetOtpRateLimitStore(): void {
   otpRateLimitStore.clear();
+}
+export function _resetCheckoutRateLimitStore(): void {
+  checkoutRateLimitStore.clear();
+}
+export function _resetSearchRateLimitStore(): void {
+  searchRateLimitStore.clear();
 }

@@ -15,7 +15,7 @@
  *   ADDR-1: Nigerian delivery address stored in order
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { singleVendorRouter, computeDiscount, _resetOtpRateLimitStore } from './api';
+import { singleVendorRouter, computeDiscount, _resetOtpRateLimitStore, _resetCheckoutRateLimitStore, _resetSearchRateLimitStore } from './api';
 
 // ── Mock D1 database ──────────────────────────────────────────────────────────
 let mockFirstImpl: () => Promise<unknown> = () => Promise.resolve(null);
@@ -126,6 +126,8 @@ describe('COM-2: Single-Vendor Storefront API', () => {
       { meta: { changes: 1 } },
     ]);
     _resetOtpRateLimitStore();
+    _resetCheckoutRateLimitStore();
+    _resetSearchRateLimitStore();
   });
 
   afterEach(() => {

@@ -14,7 +14,7 @@
 import type { MiddlewareHandler } from 'hono';
 
 export const ndprConsentMiddleware: MiddlewareHandler = async (c, next) => {
-  const body = await c.req.json<{ ndpr_consent?: unknown }>().catch(() => ({}));
+  const body = await c.req.json<{ ndpr_consent?: unknown }>().catch(() => ({ ndpr_consent: undefined }));
   if (!body.ndpr_consent) {
     return c.json({ success: false, error: 'NDPR consent required' }, 400);
   }

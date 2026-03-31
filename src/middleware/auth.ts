@@ -52,6 +52,8 @@ export const jwtAuthMiddleware = coreJwtAuthMiddleware({
     { method: 'POST', path: '/api/multi-vendor/vendor-auth/verify-otp' },
     // Paystack webhook — signed with HMAC-SHA512, not a JWT-protected route
     { method: 'POST', path: '/api/multi-vendor/paystack/webhook' },
+    // Sync API — offline-first sync endpoint; tenant validated server-side via x-tenant-id
+    { method: 'POST', path: '/api/sync/sync' },
   ],
 });
 
