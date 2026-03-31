@@ -229,6 +229,48 @@ export async function checkRateLimit(_opts: RateLimitOptions): Promise<RateLimit
   return { allowed: true, remaining: 999, resetAt: Date.now() + 60_000 };
 }
 
+// ── KYC provider stub ─────────────────────────────────────────────────────────
+
+export interface KycVerificationResult {
+  verified: boolean;
+  matchScore?: number;
+  reason?: string;
+  provider: string;
+}
+
+export interface IKycProvider {
+  verifyBvn(bvnHash: string, firstName: string, lastName: string, dob: string): Promise<KycVerificationResult>;
+  verifyNin(ninHash: string, firstName: string, lastName: string): Promise<KycVerificationResult>;
+  verifyCac(rcNumber: string, businessName: string): Promise<KycVerificationResult>;
+}
+
+/** Mock createKycProvider — returns a provider that approves BVN and CAC by default. */
+export function createKycProvider(
+  _smilePartnerId: string,
+  _smileApiKey: string,
+  _premblyApiKey: string,
+  _premblyAppId: string,
+  _environment?: string,
+): IKycProvider {
+  return {
+    verifyBvn: async (_bvnHash, _firstName, _lastName, _dob) => ({
+      verified: true,
+      matchScore: 99,
+      provider: 'smile_identity',
+    }),
+    verifyNin: async (_ninHash, _firstName, _lastName) => ({
+      verified: true,
+      matchScore: 99,
+      provider: 'smile_identity',
+    }),
+    verifyCac: async (_rcNumber, _businessName) => ({
+      verified: true,
+      reason: 'Business name matched',
+      provider: 'prembly',
+    }),
+  };
+}
+
 // ── Commerce Events constants ─────────────────────────────────────────────────
 
 export const CommerceEvents = {
@@ -241,12 +283,17 @@ export const CommerceEvents = {
   SHIFT_OPENED: 'shift.opened',
   SHIFT_CLOSED: 'shift.closed',
   VENDOR_KYC_SUBMITTED: 'vendor.kyc.submitted',
+  VENDOR_KYC_APPROVED: 'vendor.kyc_approved',
+  VENDOR_KYC_REJECTED: 'vendor.kyc_rejected',
   VENDOR_APPROVED: 'vendor.approved',
   DELIVERY_BOOKING_CONFIRMED: 'delivery.booking.confirmed',
   DELIVERY_STATUS_UPDATED: 'delivery.status.updated',
+  DELIVERY_QUOTE: 'delivery.quote',
+  DELIVERY_STATUS: 'delivery.status_changed',
   WISHLIST_ITEM_ADDED: 'wishlist.item.added',
   WISHLIST_ITEM_REMOVED: 'wishlist.item.removed',
   REVIEW_SUBMITTED: 'review.submitted',
   FLASH_SALE_STARTED: 'flash_sale.started',
   FLASH_SALE_ENDED: 'flash_sale.ended',
+  STOCK_ADJUSTED: 'stock.adjusted',
 } as const;

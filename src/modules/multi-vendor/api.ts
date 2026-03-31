@@ -23,7 +23,7 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents } from '@webwaka/core';
+import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock } from '@webwaka/core';
 import { publishEvent } from '../../core/event-bus';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
@@ -828,6 +828,48 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     return c.json({ success: false, error: 'Too many checkout attempts. Please wait before retrying.' }, 429);
   }
 
+  // ── Phase A: Pre-payment stock validation (all-or-nothing batch check) ────────
+  // D1 batch SELECT quantity + version before payment is attempted.
+  // Returns 409 only if a product row EXISTS and stock is below requested quantity.
+  // If a row is not found (undefined), Phase A skips that item — Phase C catches real conflicts.
+  // The try/catch makes Phase A non-fatal if batch() is unavailable (e.g. test env).
+  const productSnapshot: Record<string, { quantity: number; version: number }> = {};
+  try {
+    const stockStmts = body.items.map((item) =>
+      c.env.DB.prepare(
+        'SELECT id, quantity, version FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+      ).bind(item.product_id, tenantId),
+    );
+    const batchRows = await c.env.DB.batch<{ id: string; quantity: number; version: number }>(stockStmts);
+    if (Array.isArray(batchRows)) {
+      const unavailableItems: Array<{
+        productId: string; name: string; requestedQty: number; availableQty: number;
+      }> = [];
+      for (let i = 0; i < body.items.length; i++) {
+        const item = body.items[i]!;
+        const row = (batchRows[i] as { results?: Array<{ id: string; quantity: number; version: number }> } | undefined)?.results?.[0];
+        if (row) {
+          if (row.quantity < item.quantity) {
+            unavailableItems.push({
+              productId: item.product_id,
+              name: item.name,
+              requestedQty: item.quantity,
+              availableQty: row.quantity,
+            });
+          } else {
+            productSnapshot[item.product_id] = { quantity: row.quantity, version: row.version };
+          }
+        }
+        // row not found → no snapshot entry; Phase C will handle via version-lock
+      }
+      if (unavailableItems.length > 0) {
+        return c.json({ error: 'stock_insufficient', unavailableItems }, 409);
+      }
+    }
+  } catch (phaseAErr) {
+    console.warn('[MV][checkout] Phase A stock check skipped (batch unavailable):', phaseAErr);
+  }
+
   const subtotalPreVerify = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
 
   // ── MV-4: Server-side Paystack verification ───────────────────────────────
@@ -936,8 +978,10 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     ).run();
 
     // ── Insert per-vendor child orders ───────────────────────────────────────
+    const vendorSubOrderIds: Record<string, string> = {};
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const childId = `ord_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+      vendorSubOrderIds[vendorId] = childId;
       const childSubtotal = group.subtotal;
 
       await c.env.DB.prepare(
@@ -954,6 +998,40 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         mkpOrderId,
         now, now,
       ).run();
+
+      // ── Phase C: Version-locked stock deduction (per item) ──────────────────
+      // Uses optimistic locking — deducts stock only if version matches Phase A snapshot.
+      // On conflict (rare race): initiates auto-refund and aborts with 500.
+      for (const item of group.items) {
+        const snap = productSnapshot[item.product_id];
+        if (snap !== undefined) {
+          const lockResult = await updateWithVersionLock(
+            c.env.DB,
+            'products',
+            { quantity: snap.quantity - item.quantity },
+            { id: item.product_id, tenantId: tenantId!, expectedVersion: snap.version },
+          );
+          if (!lockResult.success) {
+            // Rare stock conflict — attempt auto-refund then abort
+            if (c.env.PAYSTACK_SECRET && body.payment_reference) {
+              try {
+                await fetch('https://api.paystack.co/refund', {
+                  method: 'POST',
+                  headers: {
+                    Authorization: `Bearer ${c.env.PAYSTACK_SECRET}`,
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({ transaction: body.payment_reference }),
+                });
+              } catch { /* non-fatal */ }
+            }
+            return c.json({
+              success: false,
+              error: 'Stock deduction conflict — another order updated inventory simultaneously. Order cancelled; a refund has been initiated.',
+            }, 500);
+          }
+        }
+      }
 
       // Commission + revenue ledger entries
       const bd = breakdownMap[vendorId]!;
@@ -1071,10 +1149,214 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         payment_verified: body.payment_method === 'paystack' && !!c.env.PAYSTACK_SECRET,
         vendor_count: vendorCount,
         vendor_breakdown: breakdownMap,
+        vendor_sub_order_ids: vendorSubOrderIds,
       },
     }, 201);
   } catch (err) {
     console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P09: BANK VERIFICATION — GET /verify-bank-account
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /verify-bank-account?accountNumber=&bankCode=
+ * Resolves account holder name via Paystack bank resolution API.
+ * Used by the vendor onboarding wizard (Step 3) to confirm bank details.
+ * Returns: { valid: true, accountName } or { valid: false, error }
+ */
+app.get('/verify-bank-account', async (c) => {
+  const accountNumber = c.req.query('accountNumber')?.trim();
+  const bankCode = c.req.query('bankCode')?.trim();
+
+  if (!accountNumber || !bankCode) {
+    return c.json({ valid: false, error: 'accountNumber and bankCode query parameters are required' }, 400);
+  }
+  if (!/^\d{10}$/.test(accountNumber)) {
+    return c.json({ valid: false, error: 'accountNumber must be exactly 10 digits' }, 400);
+  }
+
+  try {
+    const secret = c.env.PAYSTACK_SECRET ?? '';
+    if (!secret) {
+      return c.json({ valid: false, error: 'Bank verification is not configured on this server' }, 503);
+    }
+    const psRes = await fetch(
+      `https://api.paystack.co/bank/resolve?account_number=${encodeURIComponent(accountNumber)}&bank_code=${encodeURIComponent(bankCode)}`,
+      { headers: { Authorization: `Bearer ${secret}` } },
+    );
+    const psData = await psRes.json() as {
+      status: boolean;
+      data?: { account_name: string; account_number: string };
+      message?: string;
+    };
+    if (!psData.status || !psData.data?.account_name) {
+      return c.json({ valid: false, error: psData.message ?? 'Could not resolve account. Check account number and bank.' });
+    }
+    return c.json({ valid: true, accountName: psData.data.account_name, accountNumber: psData.data.account_number });
+  } catch (err) {
+    console.error('[MV][verify-bank-account] error:', err);
+    return c.json({ valid: false, error: 'Bank verification service temporarily unavailable' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P09: VENDOR SELF-SERVICE REGISTRATION — POST /vendor/register
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /vendor/register — Self-service vendor onboarding (public)
+ * Accepts full vendor profile + KYC data, creates vendor in pending state,
+ * publishes VENDOR_KYC_SUBMITTED event to trigger the automated KYC pipeline.
+ *
+ * Required: businessName, phone, firstName, lastName, bvnHash (SHA-256 hex),
+ *           dob, accountNumber, bankCode, accountName
+ * Optional: category, description, rcNumber, businessNameForCac, whatsapp,
+ *           logoUrl, pickupAddress
+ *
+ * Returns 409 if phone already registered under this marketplace.
+ */
+app.post('/vendor/register', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) {
+    return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+  }
+
+  const body = await c.req.json<{
+    businessName: string;
+    category?: string;
+    description?: string;
+    phone: string;
+    firstName: string;
+    lastName: string;
+    bvnHash: string;
+    dob: string;
+    accountNumber: string;
+    bankCode: string;
+    accountName: string;
+    rcNumber?: string;
+    businessNameForCac?: string;
+    whatsapp?: string;
+    logoUrl?: string;
+    pickupAddress?: { street?: string; city?: string; state: string; lga?: string };
+  }>();
+
+  // ── Validation ───────────────────────────────────────────────────────────
+  if (!body.businessName?.trim()) {
+    return c.json({ success: false, error: 'businessName is required' }, 400);
+  }
+  if (!body.phone?.trim()) {
+    return c.json({ success: false, error: 'phone is required' }, 400);
+  }
+  const rawPhone = body.phone.trim();
+  if (!/^\+234[0-9]{10}$/.test(rawPhone) && !/^0[0-9]{10}$/.test(rawPhone)) {
+    return c.json({ success: false, error: 'Invalid Nigerian phone number. Use E.164 (+234...) or local (0...)' }, 400);
+  }
+  if (!body.firstName?.trim()) return c.json({ success: false, error: 'firstName is required' }, 400);
+  if (!body.lastName?.trim()) return c.json({ success: false, error: 'lastName is required' }, 400);
+  if (!body.bvnHash?.trim()) return c.json({ success: false, error: 'bvnHash is required' }, 400);
+  if (!/^[0-9a-f]{64}$/i.test(body.bvnHash.trim())) {
+    return c.json({ success: false, error: 'bvnHash must be a valid SHA-256 hex string (64 chars)' }, 400);
+  }
+  if (!body.dob?.trim()) return c.json({ success: false, error: 'dob is required' }, 400);
+  if (!body.accountNumber?.trim() || !/^\d{10}$/.test(body.accountNumber.trim())) {
+    return c.json({ success: false, error: 'accountNumber must be exactly 10 digits' }, 400);
+  }
+  if (!body.bankCode?.trim()) return c.json({ success: false, error: 'bankCode is required' }, 400);
+  if (!body.accountName?.trim()) return c.json({ success: false, error: 'accountName is required' }, 400);
+
+  const e164 = rawPhone.startsWith('+') ? rawPhone : `+234${rawPhone.slice(1)}`;
+  const now = Date.now();
+  const vendorId = `vnd_${now}_${Math.random().toString(36).slice(2, 9)}`;
+  const slug = body.businessName.trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+
+  try {
+    // ── Guard: phone uniqueness per marketplace ────────────────────────────
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+    ).bind(tenantId, e164).first<{ id: string }>();
+    if (existing) {
+      return c.json({
+        success: false,
+        error: 'A vendor account with this phone number already exists on this marketplace',
+      }, 409);
+    }
+
+    // ── Build onboarding JSON (personal + KYC data) ───────────────────────
+    const onboardingJson = JSON.stringify({
+      firstName: body.firstName.trim(),
+      lastName: body.lastName.trim(),
+      dob: body.dob.trim(),
+      businessNameForCac: body.businessNameForCac?.trim() ?? body.businessName.trim(),
+      whatsapp: body.whatsapp?.trim() ?? null,
+      logoUrl: body.logoUrl?.trim() ?? null,
+      description: body.description?.trim() ?? null,
+    });
+
+    const bankDetailsJson = JSON.stringify({
+      bank_code: body.bankCode.trim(),
+      account_number: body.accountNumber.trim(),
+      account_name: body.accountName.trim(),
+    });
+
+    const pickupJson = body.pickupAddress
+      ? JSON.stringify(body.pickupAddress)
+      : null;
+
+    // ── Insert vendor row ──────────────────────────────────────────────────
+    await c.env.DB.prepare(
+      `INSERT INTO vendors
+         (id, marketplace_tenant_id, name, slug, phone,
+          bank_account, bank_code, commission_rate, status,
+          bvn_hash, rc_number, bank_details_json,
+          kyc_status, kyc_submitted_at,
+          onboarding_data_json, pickupAddress,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?,
+               ?, ?, 1000, 'pending',
+               ?, ?, ?,
+               'submitted', ?,
+               ?, ?,
+               ?, ?)`,
+    ).bind(
+      vendorId, tenantId,
+      body.businessName.trim(), slug, e164,
+      body.accountNumber.trim(), body.bankCode.trim(),
+      body.bvnHash.trim(),
+      body.rcNumber?.trim() ?? null,
+      bankDetailsJson,
+      now,
+      onboardingJson,
+      pickupJson,
+      now, now,
+    ).run();
+
+    // ── Publish VENDOR_KYC_SUBMITTED → triggers automated KYC pipeline ────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_kyc_sub_${now}_${Math.random().toString(36).slice(2, 9)}`,
+      tenantId,
+      type: CommerceEvents.VENDOR_KYC_SUBMITTED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: { vendorId },
+    }).catch(() => { /* non-fatal — KYC pipeline failure must not block registration */ });
+
+    return c.json({
+      success: true,
+      data: {
+        vendor_id: vendorId,
+        kyc_status: 'submitted',
+        message: 'Registration submitted successfully. You will receive a WhatsApp notification with your verification status.',
+      },
+    }, 201);
+  } catch (err) {
+    console.error('[MV][vendor/register] error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });

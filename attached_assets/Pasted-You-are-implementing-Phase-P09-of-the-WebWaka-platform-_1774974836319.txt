@@ -1,0 +1,90 @@
+You are implementing Phase P09 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase implements vendor operations: automated KYC pipeline, vendor self-service onboarding wizard, and the complete multi-vendor umbrella checkout flow.
+
+Read the following files fully before starting:
+- src/core/event-bus/handlers/index.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/multi-vendor/ui.tsx
+- src/core/offline/db.ts
+
+## Tasks:
+
+### TASK 1 — Automated KYC Pipeline (MV-E05)
+In src/core/event-bus/handlers/index.ts, fully replace the stub handleVendorKycSubmitted with:
+
+1. Import createKycProvider from @webwaka/core
+2. Create provider: createKycProvider(env.SMILE_IDENTITY_PARTNER_ID, env.SMILE_IDENTITY_API_KEY, env.PREMBLY_API_KEY, env.PREMBLY_APP_ID)
+3. Run in parallel: [bvnResult, cacResult] = await Promise.allSettled([provider.verifyBvn(...), provider.verifyCac(...)])
+4. Logic:
+- bvnVerified && cacVerified → newStatus = 'AUTO_APPROVED'
+- !bvnVerified → newStatus = 'AUTO_REJECTED'
+- bvnVerified && !cacVerified → newStatus = 'MANUAL_REVIEW'
+5. UPDATE kyc_review_queue SET status = newStatus, reviewedAt = NOW() WHERE vendorId = ? AND tenantId = ?
+6. If AUTO_APPROVED:
+a. UPDATE vendors SET kycStatus = 'APPROVED', active = 1 WHERE id = ? AND tenantId = ?
+b. Publish CommerceEvents.VENDOR_KYC_APPROVED
+c. Send WhatsApp via createSmsProvider: "Congratulations! Your seller account is now live on [store name]."
+7. If AUTO_REJECTED:
+a. Send WhatsApp: "We could not verify your BVN details. Please check your information and resubmit."
+8. If MANUAL_REVIEW:
+a. Send WhatsApp: "Your application is under review. We will contact you within 48 hours."
+b. Notify marketplace admin via SMS
+
+### TASK 2 — Vendor Self-Service Onboarding Wizard (MV-E07)
+Create src/modules/multi-vendor/Onboarding.tsx — a multi-step form component.
+
+Steps:
+Step 1 — Business Info: businessName, category, description, phone, whatsapp (optional)
+Step 2 — Identity/KYC: firstName, lastName, bvn (input; hash client-side using SHA-256 before sending), dob, rcNumber (optional), businessNameForCac (optional)
+Client-side BVN hashing: const bvnHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bvn)); convert to hex string. Never send raw BVN to server.
+Step 3 — Bank Account: accountNumber, bankCode (use Nigeria bank list from @webwaka/core), verify account name via GET /api/multi-vendor/verify-bank-account?accountNumber=&bankCode=
+Step 4 — Store Setup: logoUrl (file upload input), storeDescription, pickupAddress (form with street, city, state, LGA dropdowns using Nigerian states/LGAs from @webwaka/core)
+Step 5 — Product Tutorial: show a short guide for adding first products. Include a "Add First Product" button.
+
+State management:
+- Store wizard progress in Dexie 'onboardingState' table (from Phase P03-T02 Dexie version 8)
+- On each step submit: upsert { tenantId, vendorId: tempId, step, data, updatedAt } into Dexie
+- On wizard mount: read from Dexie and resume from last saved step
+
+Final submission (after step 5):
+- POST /api/multi-vendor/vendor/register with all collected data
+- Server publishes CommerceEvents.VENDOR_KYC_SUBMITTED event
+- Show "Under Review" status screen
+
+Add GET /api/multi-vendor/verify-bank-account in api.ts:
+- Call Paystack bank account resolution API: GET https://api.paystack.co/bank/resolve?account_number=&bank_code=
+- Return { accountName, valid: true } or { valid: false, error }
+
+### TASK 3 — Full Umbrella Checkout (MV-E06)
+In src/modules/multi-vendor/api.ts, in the umbrella order checkout handler:
+
+Phase A — Pre-payment validation (all or nothing):
+1. Group cart items by vendorId
+2. For each vendor's items, in a D1 batch: SELECT quantity, version FROM products WHERE id = ? AND tenantId = ?
+3. If ANY product has insufficient stock: return HTTP 409 with structured error:
+{ error: 'stock_insufficient', unavailableItems: [{ productId, name, requestedQty, availableQty }] }
+Do NOT proceed to payment if any stock check fails.
+
+Phase B — Payment:
+4. Compute per-vendor amounts and commission
+5. Call Paystack split payment API with per-vendor subaccounts
+6. If payment fails: return HTTP 402 with Paystack error message
+
+Phase C — Order creation (only after successful payment):
+7. INSERT umbrella order record
+8. For each vendor: INSERT vendor sub-order with vendor's items
+9. Use updateWithVersionLock from @webwaka/core for each product stock deduction
+10. If any lock fails at this stage (rare): initiate auto-refund and return 500
+
+Phase D — Post-creation:
+11. Publish CommerceEvents.ORDER_READY_DELIVERY for each vendor sub-order (from Phase P05)
+12. Return umbrella order ID and per-vendor sub-order IDs for tracking
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Manual test: submit vendor KYC with valid sandbox BVN — verify AUTO_APPROVED in kyc_review_queue
+4. Manual test: umbrella checkout with one vendor having insufficient stock — verify 409 returned before payment attempted
+5. Add SMILE_IDENTITY_PARTNER_ID, SMILE_IDENTITY_API_KEY, PREMBLY_API_KEY, PREMBLY_APP_ID to staging environment secrets
+```

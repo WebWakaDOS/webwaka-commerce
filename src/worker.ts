@@ -40,6 +40,10 @@ export interface Env {
   CF_IMAGES_ACCOUNT_HASH?: string;
   KYCSALT?: string;                     // KYC BVN/NIN hashing salt (P3-T03)
   ADMIN_API_KEY?: string;               // Internal admin API key for admin endpoints
+  SMILE_IDENTITY_PARTNER_ID?: string;   // Smile Identity partner_id (P09 KYC)
+  SMILE_IDENTITY_API_KEY?: string;      // Smile Identity api_key (P09 KYC)
+  PREMBLY_API_KEY?: string;             // Prembly x-api-key (P09 CAC)
+  PREMBLY_APP_ID?: string;              // Prembly app-id (P09 CAC)
 }
 
 const app = new Hono<{ Bindings: Env }>();
