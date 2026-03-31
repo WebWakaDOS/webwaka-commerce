@@ -162,6 +162,7 @@ export interface MvProduct {
   tenantId: string;
   vendorId: string;
   vendorName: string;
+  vendorBadge?: string;
   sku: string;
   name: string;
   description?: string;

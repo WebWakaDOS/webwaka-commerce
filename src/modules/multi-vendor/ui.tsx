@@ -87,6 +87,7 @@ export const MarketplaceInterface: React.FC<{
           image_url?: string;
           vendor_id: string;
           vendor_name: string;
+          vendor_badge?: string | null;
         }>;
       };
       if (!json.success || signal?.aborted) return;
@@ -105,6 +106,7 @@ export const MarketplaceInterface: React.FC<{
         ...(p.category != null ? { category: p.category } : {}),
         ...(p.image_url != null ? { imageUrl: p.image_url } : {}),
         ...(p.description != null ? { description: p.description } : {}),
+        ...(p.vendor_badge ? { vendorBadge: p.vendor_badge } : {}),
       }));
 
       if (signal?.aborted) return;
@@ -218,8 +220,20 @@ export const MarketplaceInterface: React.FC<{
 
   const totalAmount = cart.reduce((sum, item) => sum + item.price * item.cartQuantity, 0);
 
-  // Group inventory by vendor for display
+  // Group inventory by vendor for display — include badge from first matching item
   const vendorNames = Array.from(new Set(inventory.map(i => i.vendorName)));
+  const vendorBadgeMap: Record<string, string | undefined> = {};
+  for (const item of inventory) {
+    if (item.vendorBadge && !vendorBadgeMap[item.vendorName]) {
+      vendorBadgeMap[item.vendorName] = item.vendorBadge;
+    }
+  }
+
+  const badgeLabel: Record<string, string> = {
+    TOP_SELLER: '🏆 Top Seller',
+    VERIFIED: '✅ Verified',
+    TRUSTED: '⭐ Trusted',
+  };
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -266,10 +280,17 @@ export const MarketplaceInterface: React.FC<{
             )}
           </div>
         ) : (
-          vendorNames.map(vendorName => (
+          vendorNames.map(vendorName => {
+            const badge = vendorBadgeMap[vendorName];
+            return (
             <div key={vendorName} style={{ marginBottom: '2rem' }}>
-              <h2 style={{ fontSize: '1.2rem', marginBottom: '1rem', borderBottom: '2px solid #ccc', paddingBottom: '0.5rem' }}>
+              <h2 style={{ fontSize: '1.2rem', marginBottom: '1rem', borderBottom: '2px solid #ccc', paddingBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 {vendorName}
+                {badge && badgeLabel[badge] && (
+                  <span style={{ fontSize: '0.75rem', fontWeight: 'normal', padding: '2px 8px', borderRadius: '12px', background: badge === 'TOP_SELLER' ? '#fef3c7' : badge === 'VERIFIED' ? '#d1fae5' : '#ede9fe', color: badge === 'TOP_SELLER' ? '#92400e' : badge === 'VERIFIED' ? '#065f46' : '#5b21b6' }}>
+                    {badgeLabel[badge]}
+                  </span>
+                )}
               </h2>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '1rem' }}>
                 {inventory.filter(i => i.vendorName === vendorName).map(item => (
@@ -304,7 +325,8 @@ export const MarketplaceInterface: React.FC<{
                 ))}
               </div>
             </div>
-          ))
+          );
+          })
         )}
 
         {cart.length > 0 && (

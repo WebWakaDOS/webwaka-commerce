@@ -2583,7 +2583,8 @@ app.get('/search', async (c) => {
       SELECT
         p.id, p.sku, p.name, p.description, p.category,
         p.price, p.quantity, p.image_url, p.vendor_id,
-        v.name AS vendor_name, v.slug AS vendor_slug
+        v.name AS vendor_name, v.slug AS vendor_slug,
+        v.badge AS vendor_badge, v.performanceScore AS vendor_score
       FROM products p
       INNER JOIN vendors v ON v.id = p.vendor_id
       ${searchJoin}
@@ -2597,6 +2598,7 @@ app.get('/search', async (c) => {
       id: string; sku: string; name: string; description: string | null;
       category: string | null; price: number; quantity: number; image_url: string | null;
       vendor_id: string; vendor_name: string; vendor_slug: string;
+      vendor_badge: string | null; vendor_score: number | null;
     }>();
 
     return c.json({ success: true, data: results, meta: { count: results.length, query: q } });
@@ -2620,7 +2622,8 @@ app.get('/search', async (c) => {
         const { results } = await c.env.DB.prepare(
           `SELECT p.id, p.sku, p.name, p.description, p.category,
                   p.price, p.quantity, p.image_url, p.vendor_id,
-                  v.name AS vendor_name, v.slug AS vendor_slug
+                  v.name AS vendor_name, v.slug AS vendor_slug,
+                  v.badge AS vendor_badge, v.performanceScore AS vendor_score
            FROM products p
            INNER JOIN vendors v ON v.id = p.vendor_id
            WHERE ${conditions.join(' AND ')}
@@ -2629,6 +2632,7 @@ app.get('/search', async (c) => {
           id: string; sku: string; name: string; description: string | null; category: string | null;
           price: number; quantity: number; image_url: string | null;
           vendor_id: string; vendor_name: string; vendor_slug: string;
+          vendor_badge: string | null; vendor_score: number | null;
         }>();
 
         return c.json({ success: true, data: results, meta: { count: results.length, query: q } });
@@ -2907,6 +2911,18 @@ app.post('/disputes', async (c) => {
 
     if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
 
+    // Validate that the reporter actually has standing to open this dispute
+    const reporterPhone = claims.phone ? String(claims.phone) : null;
+    if (reporterRole === 'customer') {
+      if (!reporterPhone || order.customer_phone !== reporterPhone) {
+        return c.json({ success: false, error: 'You are not the buyer of this order' }, 403);
+      }
+    } else if (reporterRole === 'vendor') {
+      if (!order.vendor_id || order.vendor_id !== reporterId) {
+        return c.json({ success: false, error: 'You do not have items in this order' }, 403);
+      }
+    }
+
     const now = Date.now();
     const disputeId = `dsp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
@@ -3045,6 +3061,17 @@ app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMI
       paystack_reference: string | null; items_json: string | null; total_amount: number;
     }>();
     if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    if (
+      body.resolution === 'PARTIAL_REFUND' &&
+      body.amountKobo !== undefined &&
+      body.amountKobo > order.total_amount
+    ) {
+      return c.json({
+        success: false,
+        error: `Partial refund amount (${body.amountKobo} kobo) cannot exceed the order total (${order.total_amount} kobo)`,
+      }, 400);
+    }
 
     const now = Date.now();
 

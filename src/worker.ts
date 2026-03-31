@@ -338,8 +338,8 @@ export default {
       console.error('[cron] First abandoned cart nudge error:', err);
     }
 
-    // ── Abandoned cart nudge — second nudge (> 24 h, already nudged once) ────
-    const cutoffSecond = now - 24 * 60 * 60 * 1000; // 24 hours ago
+    // ── Abandoned cart nudge — second nudge (first nudge > 24 h ago, not converted) ─
+    const cutoffSecond = now - 24 * 60 * 60 * 1000; // nudge must have been sent > 24h ago
 
     try {
       interface CartSessionWithAc {
@@ -354,11 +354,13 @@ export default {
       const { results: secondNudgeCarts } = await env.DB.prepare(
         `SELECT cs.id, cs.tenant_id, cs.session_token, cs.items_json, cs.customer_phone, cs.created_at
          FROM cart_sessions cs
-         WHERE cs.created_at < ? AND cs.customer_phone IS NOT NULL
+         WHERE cs.customer_phone IS NOT NULL
            AND cs.status != 'COMPLETED'
            AND EXISTS (
              SELECT 1 FROM abandoned_carts ac
-             WHERE ac.cart_token = cs.session_token AND ac.nudge_sent_at IS NOT NULL
+             WHERE ac.cart_token = cs.session_token
+               AND ac.nudge_sent_at IS NOT NULL
+               AND ac.nudge_sent_at < ?
                AND ac.second_nudge_sent_at IS NULL
            )
            AND NOT EXISTS (
@@ -506,7 +508,7 @@ export default {
           const totalOrders = orderStats?.total_orders ?? 0;
           const deliveredOrders = orderStats?.delivered_orders ?? 0;
           const fulfillmentRate = totalOrders > 0 ? deliveredOrders / totalOrders : 0;
-          const avgRating = ratingRow?.avg_rating ?? 4.0;
+          const avgRating = ratingRow?.avg_rating ?? 0.0;
           const disputeCount = disputeRow?.dispute_count ?? 0;
           const disputeRate = totalOrders > 0 ? disputeCount / totalOrders : 0;
 
