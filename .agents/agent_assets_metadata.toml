@@ -18,3 +18,9 @@ id = "d1PR3tyOYMZciJTyIi8j9"
 uri = "file://docs/IMPLEMENTATION_PROMPTS.md"
 type = "text"
 title = "WebWaka Commerce — Implementation Prompts (Copy-Paste Per Phase)"
+
+[[outputs]]
+id = "yOX9VyK3ZDUxC-7xmf7P0"
+uri = "file://docs/QA_PROMPTS.md"
+type = "text"
+title = "WebWaka Commerce — QA Verification Prompts (Copy-Paste Per Phase)"
