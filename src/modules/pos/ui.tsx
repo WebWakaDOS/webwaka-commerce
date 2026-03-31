@@ -291,9 +291,10 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [stockTakeRows, setStockTakeRows] = useState<StockTakeRow[]>([]);
   const [stockTakeSubmitting, setStockTakeSubmitting] = useState(false);
   const [stockTakeMsg, setStockTakeMsg] = useState<string | null>(null);
+  const [stockTakePreviewMode, setStockTakePreviewMode] = useState(false);
 
   // ── Phase 7 (P07): Recent Orders tab ─────────────────────────────────────
-  interface RecentOrder { id: string; order_status: string; total_amount: number; payment_method: string; created_at: string | number; customer_phone?: string; items_json?: string }
+  interface RecentOrder { id: string; order_status: string; total_amount: number; payment_method: string; created_at: string | number; customer_phone?: string; items_json?: string; receiptJson?: string }
   const [recentOrders, setRecentOrders] = useState<RecentOrder[]>([]);
   const [recentOrdersLoading, setRecentOrdersLoading] = useState(false);
   const [recentOrdersError, setRecentOrdersError] = useState<string | null>(null);
@@ -561,6 +562,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     }));
     setStockTakeRows(rows);
     setStockTakeMsg(null);
+    setStockTakePreviewMode(false);
     setScreen('stock-take');
   }, [products]);
 
@@ -584,6 +586,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       const json = await res.json() as { success: boolean; data?: { adjusted: number }; error?: string };
       if (json.success) {
         setStockTakeMsg(`✓ ${json.data?.adjusted ?? adjustments.length} adjustment(s) saved.`);
+        setStockTakePreviewMode(false);
       } else {
         setStockTakeMsg(`Error: ${json.error ?? 'Unknown error'}`);
       }
@@ -594,12 +597,37 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     }
   }, [stockTakeRows, tenantId]);
 
-  // ── P07: Load recent orders ───────────────────────────────────────────────
+  // ── P07: Load recent orders — Dexie-first, API fallback ──────────────────
   const loadRecentOrders = useCallback(async () => {
     setRecentOrdersLoading(true);
     setRecentOrdersError(null);
     try {
-      const res = await fetch('/api/pos/orders/recent?limit=30', {
+      // 1. Dexie-first: read cached posReceipts for offline support
+      const db = getCommerceDB(tenantId);
+      const localReceipts = await db.posReceipts.where('tenantId').equals(tenantId).toArray();
+      if (localReceipts.length > 0) {
+        const sorted = localReceipts.sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+        const mapped: RecentOrder[] = sorted.map((r) => {
+          let rec: Record<string, unknown> = {};
+          try { rec = JSON.parse(r.receiptJson) as Record<string, unknown>; } catch { /* ignore */ }
+          return {
+            id: ((rec.order_id ?? rec.id ?? r.orderId) as string | undefined) ?? r.orderId,
+            order_status: (rec.order_status as string | undefined) ?? 'fulfilled',
+            total_amount: ((rec.total_kobo ?? rec.total_amount) as number | undefined) ?? 0,
+            payment_method: (rec.payment_method as string | undefined) ?? '—',
+            created_at: r.createdAt,
+            receiptJson: r.receiptJson,
+          };
+        });
+        setRecentOrders(mapped);
+        return;
+      }
+      // 2. Fallback to API when Dexie is empty
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        setRecentOrders([]);
+        return;
+      }
+      const res = await fetch('/api/pos/orders/recent?limit=50', {
         headers: { 'x-tenant-id': tenantId },
       });
       if (!res.ok) throw new Error('Failed to load orders');
@@ -1220,15 +1248,47 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
                         {new Date(typeof o.created_at === 'number' ? o.created_at : Number(o.created_at)).toLocaleString('en-NG')}
                       </td>
                       <td style={{ padding: '0.5rem 0.75rem' }}>
-                        {['fulfilled', 'DELIVERED', 'COMPLETED'].includes(o.order_status) && !returnOrderId && (
-                          <button onClick={() => {
-                            setReturnOrderId(o.id);
-                            setReturnMsg(null);
-                            setReturnItems(parsedItems.map((i) => ({ productId: i.product_id, quantity: 1 })));
-                          }} style={{ padding: '0.25rem 0.5rem', background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', borderRadius: '4px', cursor: 'pointer', fontSize: '0.72rem', whiteSpace: 'nowrap' }}>
-                            Return
-                          </button>
-                        )}
+                        <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap' }}>
+                          {/* Print — injects receipt content into hidden div and triggers window.print() */}
+                          <button
+                            aria-label="Print receipt"
+                            onClick={() => {
+                              const total = `₦${((o.total_amount ?? 0) / 100).toFixed(2)}`;
+                              const dateStr = new Date(typeof o.created_at === 'number' ? o.created_at : Number(o.created_at)).toLocaleString('en-NG');
+                              let innerHtml = o.receiptJson
+                                ? (() => { try { const r = JSON.parse(o.receiptJson!) as Record<string, unknown>; return `<h2>WebWaka POS</h2><p>Order: ${r.order_id ?? o.id}</p><p>Total: ${total}</p><p>Method: ${o.payment_method}</p><p>Date: ${dateStr}</p>`; } catch { return ''; } })()
+                                : `<h2>WebWaka POS</h2><p>Order: ${o.id}</p><p>Total: ${total}</p><p>Method: ${o.payment_method}</p><p>Date: ${dateStr}</p>`;
+                              const div = document.createElement('div');
+                              div.className = 'pos-thermal-receipt-root';
+                              div.innerHTML = innerHtml;
+                              document.body.appendChild(div);
+                              window.print();
+                              document.body.removeChild(div);
+                            }}
+                            style={{ padding: '0.2rem 0.4rem', background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '4px', cursor: 'pointer', fontSize: '0.7rem', whiteSpace: 'nowrap' }}
+                          >🖨 Print</button>
+                          {/* WhatsApp share */}
+                          <button
+                            aria-label="Share via WhatsApp"
+                            onClick={() => {
+                              const total = `₦${((o.total_amount ?? 0) / 100).toFixed(2)}`;
+                              const dateStr = new Date(typeof o.created_at === 'number' ? o.created_at : Number(o.created_at)).toLocaleString('en-NG');
+                              const text = encodeURIComponent(`WebWaka Receipt\nOrder: ${o.id.slice(0, 20)}\nTotal: ${total}\nMethod: ${o.payment_method}\nDate: ${dateStr}`);
+                              window.open(`https://wa.me/?text=${text}`, '_blank', 'noopener,noreferrer');
+                            }}
+                            style={{ padding: '0.2rem 0.4rem', background: '#dcfce7', color: '#166534', border: '1px solid #86efac', borderRadius: '4px', cursor: 'pointer', fontSize: '0.7rem', whiteSpace: 'nowrap' }}
+                          >📱 WA</button>
+                          {/* Return — only for completed orders */}
+                          {['fulfilled', 'DELIVERED', 'COMPLETED'].includes(o.order_status) && !returnOrderId && (
+                            <button onClick={() => {
+                              setReturnOrderId(o.id);
+                              setReturnMsg(null);
+                              setReturnItems(parsedItems.map((i) => ({ productId: i.product_id, quantity: 1 })));
+                            }} style={{ padding: '0.2rem 0.4rem', background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', borderRadius: '4px', cursor: 'pointer', fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+                              ↩ Return
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -1243,18 +1303,44 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
   // ── P07: Stock Take screen ────────────────────────────────────────────────
   if (screen === 'stock-take') {
+    // Compute changed rows for preview
+    const changedRows = stockTakeRows.filter((r) => {
+      const c = parseInt(r.countedQty, 10);
+      return !isNaN(c) && c !== r.systemQty;
+    });
+
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
         <header style={{ padding: '0.75rem 1rem', backgroundColor: '#000', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <h1 style={{ margin: 0, fontSize: '1rem' }}>WebWaka POS — Stock Take</h1>
+          <h1 style={{ margin: 0, fontSize: '1rem' }}>WebWaka POS — Stock Take{stockTakePreviewMode ? ' · Preview' : ''}</h1>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: '0.5rem' }}>
-            <button onClick={handleStockTakeSubmit} disabled={stockTakeSubmitting}
-              style={{ padding: '0.4rem 0.85rem', background: stockTakeSubmitting ? '#6b7280' : '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: stockTakeSubmitting ? 'wait' : 'pointer', fontSize: '0.8rem' }}>
-              {stockTakeSubmitting ? 'Saving…' : 'Save Adjustments'}
-            </button>
-            <button onClick={() => setScreen('pos')} style={{ padding: '0.35rem 0.75rem', background: '#374151', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}>
-              ← Back to POS
-            </button>
+            {stockTakePreviewMode ? (
+              <>
+                <button onClick={handleStockTakeSubmit} disabled={stockTakeSubmitting}
+                  style={{ padding: '0.4rem 0.85rem', background: stockTakeSubmitting ? '#6b7280' : '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: stockTakeSubmitting ? 'wait' : 'pointer', fontSize: '0.8rem' }}>
+                  {stockTakeSubmitting ? 'Saving…' : `Confirm & Submit (${changedRows.length})`}
+                </button>
+                <button onClick={() => setStockTakePreviewMode(false)}
+                  style={{ padding: '0.4rem 0.7rem', background: '#374151', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}>
+                  ← Edit
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => {
+                    if (changedRows.length === 0) { setStockTakeMsg('No changes detected.'); return; }
+                    setStockTakeMsg(null);
+                    setStockTakePreviewMode(true);
+                  }}
+                  style={{ padding: '0.4rem 0.85rem', background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}>
+                  Preview Changes ({changedRows.length})
+                </button>
+                <button onClick={() => setScreen('pos')} style={{ padding: '0.35rem 0.75rem', background: '#374151', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}>
+                  ← Back to POS
+                </button>
+              </>
+            )}
           </div>
         </header>
         <div style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
@@ -1263,48 +1349,87 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               {stockTakeMsg}
             </div>
           )}
-          <p style={{ fontSize: '0.82rem', color: '#6b7280', marginTop: 0 }}>
-            Enter physical counted quantities. Only changed rows are submitted.
-          </p>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
-            <thead>
-              <tr style={{ background: '#f9fafb' }}>
-                {['Product', 'System Qty', 'Counted Qty', 'Reason', 'Delta'].map((h) => (
-                  <th key={h} style={{ padding: '0.5rem 0.75rem', textAlign: 'left', borderBottom: '2px solid #e5e7eb', fontWeight: 600, color: '#374151' }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {stockTakeRows.map((row, idx) => {
-                const counted = parseInt(row.countedQty, 10);
-                const delta = isNaN(counted) ? 0 : counted - row.systemQty;
-                const changed = !isNaN(counted) && counted !== row.systemQty;
-                return (
-                  <tr key={row.productId} style={{ borderBottom: '1px solid #e5e7eb', background: changed ? (delta < 0 ? '#fff7ed' : '#f0fdf4') : 'transparent' }}>
-                    <td style={{ padding: '0.5rem 0.75rem', fontWeight: 500 }}>{row.productName}</td>
-                    <td style={{ padding: '0.5rem 0.75rem', color: '#6b7280', textAlign: 'center' }}>{row.systemQty}</td>
-                    <td style={{ padding: '0.5rem 0.75rem' }}>
-                      <input type="number" min={0} value={row.countedQty}
-                        onChange={(e) => setStockTakeRows((prev) => prev.map((r, i) => i === idx ? { ...r, countedQty: e.target.value } : r))}
-                        aria-label={`Counted quantity for ${row.productName}`}
-                        style={{ width: '70px', padding: '0.2rem 0.4rem', border: `1px solid ${changed ? (delta < 0 ? '#f59e0b' : '#22c55e') : '#d1d5db'}`, borderRadius: '4px', fontSize: '0.82rem', textAlign: 'center' }} />
-                    </td>
-                    <td style={{ padding: '0.5rem 0.75rem' }}>
-                      <select value={row.reason} onChange={(e) => setStockTakeRows((prev) => prev.map((r, i) => i === idx ? { ...r, reason: e.target.value } : r))}
-                        style={{ padding: '0.2rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.78rem' }}>
-                        {['DAMAGE', 'THEFT', 'SUPPLIER_SHORT', 'CORRECTION'].map((r) => <option key={r} value={r}>{r}</option>)}
-                      </select>
-                    </td>
-                    <td style={{ padding: '0.5rem 0.75rem', fontWeight: changed ? 600 : 400, color: delta < 0 ? '#dc2626' : delta > 0 ? '#16a34a' : '#6b7280', textAlign: 'center' }}>
-                      {changed ? (delta > 0 ? `+${delta}` : String(delta)) : '—'}
-                    </td>
+
+          {stockTakePreviewMode ? (
+            /* ── Preview: show only changed rows as a diff ─────────────────── */
+            <>
+              <p style={{ fontSize: '0.82rem', color: '#374151', marginTop: 0, fontWeight: 600 }}>
+                Review {changedRows.length} adjustment{changedRows.length !== 1 ? 's' : ''} before submitting:
+              </p>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                <thead>
+                  <tr style={{ background: '#f9fafb' }}>
+                    {['Product', 'System Qty', 'Counted Qty', 'Delta', 'Reason'].map((h) => (
+                      <th key={h} style={{ padding: '0.5rem 0.75rem', textAlign: 'left', borderBottom: '2px solid #e5e7eb', fontWeight: 600, color: '#374151' }}>{h}</th>
+                    ))}
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-          {stockTakeRows.length === 0 && (
-            <p style={{ textAlign: 'center', color: '#6b7280', padding: '2rem' }}>No products loaded. Return to POS and open Stock Take once products are loaded.</p>
+                </thead>
+                <tbody>
+                  {changedRows.map((row) => {
+                    const counted = parseInt(row.countedQty, 10);
+                    const delta = counted - row.systemQty;
+                    return (
+                      <tr key={row.productId} style={{ borderBottom: '1px solid #e5e7eb', background: delta < 0 ? '#fff7ed' : '#f0fdf4' }}>
+                        <td style={{ padding: '0.5rem 0.75rem', fontWeight: 500 }}>{row.productName}</td>
+                        <td style={{ padding: '0.5rem 0.75rem', color: '#6b7280', textAlign: 'center' }}>{row.systemQty}</td>
+                        <td style={{ padding: '0.5rem 0.75rem', textAlign: 'center', fontWeight: 600 }}>{counted}</td>
+                        <td style={{ padding: '0.5rem 0.75rem', fontWeight: 700, color: delta < 0 ? '#dc2626' : '#16a34a', textAlign: 'center' }}>
+                          {delta > 0 ? `+${delta}` : String(delta)}
+                        </td>
+                        <td style={{ padding: '0.5rem 0.75rem', fontSize: '0.78rem', color: '#374151' }}>{row.reason}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
+          ) : (
+            /* ── Edit mode: all rows with inputs ───────────────────────────── */
+            <>
+              <p style={{ fontSize: '0.82rem', color: '#6b7280', marginTop: 0 }}>
+                Enter physical counted quantities. Only changed rows are submitted.
+              </p>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                <thead>
+                  <tr style={{ background: '#f9fafb' }}>
+                    {['Product', 'System Qty', 'Counted Qty', 'Reason', 'Delta'].map((h) => (
+                      <th key={h} style={{ padding: '0.5rem 0.75rem', textAlign: 'left', borderBottom: '2px solid #e5e7eb', fontWeight: 600, color: '#374151' }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {stockTakeRows.map((row, idx) => {
+                    const counted = parseInt(row.countedQty, 10);
+                    const delta = isNaN(counted) ? 0 : counted - row.systemQty;
+                    const changed = !isNaN(counted) && counted !== row.systemQty;
+                    return (
+                      <tr key={row.productId} style={{ borderBottom: '1px solid #e5e7eb', background: changed ? (delta < 0 ? '#fff7ed' : '#f0fdf4') : 'transparent' }}>
+                        <td style={{ padding: '0.5rem 0.75rem', fontWeight: 500 }}>{row.productName}</td>
+                        <td style={{ padding: '0.5rem 0.75rem', color: '#6b7280', textAlign: 'center' }}>{row.systemQty}</td>
+                        <td style={{ padding: '0.5rem 0.75rem' }}>
+                          <input type="number" min={0} value={row.countedQty}
+                            onChange={(e) => setStockTakeRows((prev) => prev.map((r, i) => i === idx ? { ...r, countedQty: e.target.value } : r))}
+                            aria-label={`Counted quantity for ${row.productName}`}
+                            style={{ width: '70px', padding: '0.2rem 0.4rem', border: `1px solid ${changed ? (delta < 0 ? '#f59e0b' : '#22c55e') : '#d1d5db'}`, borderRadius: '4px', fontSize: '0.82rem', textAlign: 'center' }} />
+                        </td>
+                        <td style={{ padding: '0.5rem 0.75rem' }}>
+                          <select value={row.reason} onChange={(e) => setStockTakeRows((prev) => prev.map((r, i) => i === idx ? { ...r, reason: e.target.value } : r))}
+                            style={{ padding: '0.2rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.78rem' }}>
+                            {['DAMAGE', 'THEFT', 'SUPPLIER_SHORT', 'CORRECTION'].map((r) => <option key={r} value={r}>{r}</option>)}
+                          </select>
+                        </td>
+                        <td style={{ padding: '0.5rem 0.75rem', fontWeight: changed ? 600 : 400, color: delta < 0 ? '#dc2626' : delta > 0 ? '#16a34a' : '#6b7280', textAlign: 'center' }}>
+                          {changed ? (delta > 0 ? `+${delta}` : String(delta)) : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              {stockTakeRows.length === 0 && (
+                <p style={{ textAlign: 'center', color: '#6b7280', padding: '2rem' }}>No products loaded. Return to POS and open Stock Take once products are loaded.</p>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -1835,20 +1960,22 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           </button>
         )}
 
-        {/* Recent Orders tab */}
+        {/* Recent Orders tab — ADMIN only */}
         {/* eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion */}
         {(() => { const s = screen as string; return (
-          <button
-            onClick={() => setScreen(s === 'orders' ? 'pos' : 'orders')}
-            aria-label="View recent orders and process returns"
-            style={{
-              padding: '0.35rem 0.65rem', background: s === 'orders' ? '#1d4ed8' : '#374151', color: '#fff',
-              border: 'none', borderRadius: '4px', cursor: 'pointer',
-              fontSize: '0.78rem', whiteSpace: 'nowrap',
-            }}
-          >
-            Orders
-          </button>
+          <RequireRole role="ADMIN" userRole={userRole}>
+            <button
+              onClick={() => setScreen(s === 'orders' ? 'pos' : 'orders')}
+              aria-label="View recent orders and process returns"
+              style={{
+                padding: '0.35rem 0.65rem', background: s === 'orders' ? '#1d4ed8' : '#374151', color: '#fff',
+                border: 'none', borderRadius: '4px', cursor: 'pointer',
+                fontSize: '0.78rem', whiteSpace: 'nowrap',
+              }}
+            >
+              Orders
+            </button>
+          </RequireRole>
         ); })()}
 
         {/* Dashboard tab — ADMIN only */}

@@ -1150,6 +1150,25 @@ app.get('/dashboard', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
 // OFFLINE CUSTOMER CACHE — Top 200 customers for Dexie seeding (POS-E05)
 // ──────────────────────────────────────────────────────────────────────────────
 
+// GET /api/pos/orders/recent — Last N orders for the Recent Orders screen (offline receipt reprint)
+app.get('/orders/recent', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10), 100);
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, order_status, total_amount, payment_method, customer_phone, items_json, session_id, created_at
+       FROM orders
+       WHERE tenant_id = ? AND deleted_at IS NULL
+       ORDER BY created_at DESC
+       LIMIT ?`,
+    ).bind(tenantId, limit).all();
+    return c.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[POS] route error:', err);
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
+  }
+});
+
 // GET /api/pos/customers/top — Top 200 customers by last purchase for offline cache
 app.get('/customers/top', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
@@ -1298,8 +1317,12 @@ app.post('/stock-adjustments', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), asy
   type AdjBody = { sessionId?: string; adjustments: Adjustment[] };
   const body = await c.req.json<AdjBody>();
 
-  if (!body.adjustments || !Array.isArray(body.adjustments) || body.adjustments.length === 0) {
-    return c.json({ success: false, error: 'adjustments array is required and must not be empty' }, 400);
+  if (!body.adjustments || !Array.isArray(body.adjustments)) {
+    return c.json({ success: false, error: 'adjustments must be an array' }, 400);
+  }
+  // Zero adjustments — success with no-op (edge case: all quantities unchanged)
+  if (body.adjustments.length === 0) {
+    return c.json({ success: true, data: { adjusted: 0, log: [] } });
   }
   const validReasons = ['DAMAGE', 'THEFT', 'SUPPLIER_SHORT', 'CORRECTION'] as const;
   for (const adj of body.adjustments) {

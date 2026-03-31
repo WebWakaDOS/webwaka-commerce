@@ -78,9 +78,10 @@ async function resolveCommissionRate(
   const vendorRule = await db.prepare(
     `SELECT rateBps FROM commission_rules
      WHERE tenantId = ? AND vendorId = ?
+       AND (effectiveFrom IS NULL OR effectiveFrom <= ?)
        AND (effectiveUntil IS NULL OR effectiveUntil > ?)
      ORDER BY effectiveFrom DESC LIMIT 1`,
-  ).bind(tenantId, vendorId, now).first<{ rateBps: number }>();
+  ).bind(tenantId, vendorId, now, now).first<{ rateBps: number }>();
 
   if (vendorRule?.rateBps != null) return vendorRule.rateBps;
 
@@ -89,9 +90,10 @@ async function resolveCommissionRate(
     const catRule = await db.prepare(
       `SELECT rateBps FROM commission_rules
        WHERE tenantId = ? AND category = ? AND vendorId IS NULL
+         AND (effectiveFrom IS NULL OR effectiveFrom <= ?)
          AND (effectiveUntil IS NULL OR effectiveUntil > ?)
        ORDER BY effectiveFrom DESC LIMIT 1`,
-    ).bind(tenantId, category, now).first<{ rateBps: number }>();
+    ).bind(tenantId, category, now, now).first<{ rateBps: number }>();
 
     if (catRule?.rateBps != null) return catRule.rateBps;
   }
