@@ -397,8 +397,6 @@ const STATE_LGAS: Record<string, string[]> = {
   'Delta': ['Aniocha North','Aniocha South','Bomadi','Burutu','Ethiope East','Ethiope West','Ika North East','Ika South','Isoko North','Isoko South','Ndokwa East','Ndokwa West','Okpe','Oshimili North','Oshimili South','Patani','Sapele','Udu','Ughelli North','Ughelli South','Ukwuani','Uvwie','Warri North','Warri South','Warri South West'],
 };
 
-// VAT_RATE constant removed — use createTaxEngine({ vatRate: 0.075, vatRegistered: true, exemptCategories: [] }) instead
-
 declare global {
   interface Window {
     PaystackPop: {

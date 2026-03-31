@@ -54,8 +54,6 @@ async function kvCheckRL(
   return checkRateLimit(store, key, maxRequests, windowMs);
 }
 
-void createTaxEngine; // imported for future marketplace VAT computation
-
 // ── Crypto helpers (same pattern as COM-2 Single-Vendor) ──────────────────────
 
 /** SHA-256 hex digest of OTP string */
@@ -801,6 +799,14 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   const subtotal = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
   const paymentRef = body.payment_reference ?? `pay_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
+  // ── VAT computation via TaxEngine ────────────────────────────────────────
+  const mvTaxConfig = (c.get('tenantConfig' as never) as {
+    taxConfig?: { vatRate: number; vatRegistered: boolean; exemptCategories: string[] };
+  } | undefined)?.taxConfig ?? { vatRate: 0.075, vatRegistered: true, exemptCategories: [] };
+  const { vatKobo: mvVatKobo } = createTaxEngine(mvTaxConfig).compute([
+    { category: 'general', amountKobo: subtotal },
+  ]);
+
   // ── Group items by vendor ─────────────────────────────────────────────────
   const vendorGroups = body.items.reduce((acc, item) => {
     if (!acc[item.vendor_id]) acc[item.vendor_id] = { items: [], subtotal: 0 };
@@ -920,6 +926,8 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       success: true,
       data: {
         marketplace_order_id: mkpOrderId,
+        subtotal,
+        vat_kobo: mvVatKobo,
         total_amount: subtotal,
         payment_reference: paymentRef,
         payment_verified: body.payment_method === 'paystack' && !!c.env.PAYSTACK_SECRET,

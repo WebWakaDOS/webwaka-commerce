@@ -1421,6 +1421,39 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           role="main"
           aria-label="Product catalogue"
         >
+          {/* Product management controls — ADMIN only */}
+          <RequireRole role="ADMIN" userRole={userRole}>
+            <div
+              aria-label="Product management"
+              style={{
+                display: 'flex', gap: '0.5rem', marginBottom: '0.75rem',
+                paddingBottom: '0.75rem', borderBottom: '1px dashed #e5e7eb',
+              }}
+            >
+              <button
+                aria-label="Add new product"
+                onClick={() => { /* product add handler — Phase 5 */ }}
+                style={{
+                  padding: '0.3rem 0.75rem', background: '#16a34a', color: '#fff',
+                  border: 'none', borderRadius: '6px', fontSize: '0.78rem',
+                  fontWeight: 600, cursor: 'pointer',
+                }}
+              >
+                + Add Product
+              </button>
+              <button
+                aria-label="Manage product catalogue"
+                onClick={() => { /* product catalogue management — Phase 5 */ }}
+                style={{
+                  padding: '0.3rem 0.75rem', background: '#1d4ed8', color: '#fff',
+                  border: 'none', borderRadius: '6px', fontSize: '0.78rem',
+                  fontWeight: 600, cursor: 'pointer',
+                }}
+              >
+                Edit Catalogue
+              </button>
+            </div>
+          </RequireRole>
           {loading ? (
             <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: '3rem' }}>
               Loading products…
