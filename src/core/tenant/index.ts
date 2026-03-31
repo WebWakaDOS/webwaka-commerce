@@ -1,3 +1,6 @@
+/**
+ * Only KV-backed tenant resolution is permitted. Do not add mock resolvers.
+ */
 import { Context, Next, MiddlewareHandler } from 'hono';
 import { getTenantId } from '@webwaka/core';
 
@@ -71,7 +74,7 @@ moduleRegistry.register({
   dependencies: ['core_event_bus']
 });
 
-// 3. Real KV-backed tenant resolver middleware (P0-T07)
+// 3. KV-backed tenant resolver middleware (the only permitted production resolver)
 /**
  * Returns a Hono middleware that resolves the tenant from the TENANT_CONFIG KV
  * namespace using the `x-tenant-id` (or `X-Tenant-ID`) request header.
@@ -94,68 +97,11 @@ export function createTenantResolverMiddleware(kv: KVNamespace): MiddlewareHandl
   };
 }
 
-// 4. Edge Worker Router (Legacy Tenant Resolver Middleware — mock KV, kept for tests)
-// In production use createTenantResolverMiddleware(env.TENANT_CONFIG) instead.
-const mockKVStore: Record<string, TenantConfig> = {
-  'shop.example.com': {
-    tenantId: 'tnt_123',
-    domain: 'shop.example.com',
-    enabledModules: ['retail_pos', 'single_vendor_storefront'],
-    branding: { primaryColor: '#000000', logoUrl: '/logo.png' },
-    permissions: { admin: ['*'] },
-    featureFlags: {},
-    inventorySyncPreferences: {
-      sync_pos_to_single_vendor: true,
-      sync_pos_to_multi_vendor: false,
-      sync_single_vendor_to_multi_vendor: false,
-      conflict_resolution: 'last_write_wins'
-    }
-  },
-  'vendor1.marketplace.com': {
-    tenantId: 'tnt_vendor_1',
-    marketplaceId: 'tnt_marketplace_1', // Scoped tenant
-    domain: 'vendor1.marketplace.com',
-    enabledModules: ['retail_pos', 'multi_vendor_marketplace'],
-    branding: { primaryColor: '#FF0000', logoUrl: '/v1-logo.png' },
-    permissions: { admin: ['*'] },
-    featureFlags: {},
-    inventorySyncPreferences: {
-      sync_pos_to_single_vendor: false,
-      sync_pos_to_multi_vendor: true,
-      sync_single_vendor_to_multi_vendor: false,
-      conflict_resolution: 'last_write_wins'
-    }
-  }
-};
-
-export const tenantResolver = async (c: Context, next: Next) => {
-  // Resolve by domain or explicit header
-  const domain = new URL(c.req.url).hostname;
-  const explicitTenantId = c.req.header('X-Tenant-ID');
-
-  let tenantConfig: TenantConfig | undefined;
-
-  if (explicitTenantId) {
-    tenantConfig = Object.values(mockKVStore).find(t => t.tenantId === explicitTenantId);
-  } else {
-    tenantConfig = mockKVStore[domain];
-  }
-
-  if (!tenantConfig) {
-    return c.json({ success: false, errors: ['Tenant not found'] }, 404);
-  }
-
-  // Inject tenant config into context
-  c.set('tenant', tenantConfig);
-  
-  await next();
-};
-
 // Middleware to check if a module is enabled for the current tenant
 export const requireModule = (moduleId: string) => {
   return async (c: Context, next: Next) => {
-    const tenant = c.get('tenant') as TenantConfig;
-    
+    const tenant = c.get('tenantConfig') as TenantConfig | undefined;
+
     if (!tenant) {
       return c.json({ success: false, errors: ['Tenant context missing'] }, 500);
     }

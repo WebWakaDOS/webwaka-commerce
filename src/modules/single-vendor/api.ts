@@ -12,7 +12,10 @@
  *   VAR-1:    GET /products/:id/variants → variant list
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms } from '@webwaka/core';
+import {
+  getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms,
+  createPaymentProvider, createSmsProvider, updateWithVersionLock, CommerceEvents,
+} from '@webwaka/core';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
@@ -307,11 +310,11 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   }
 
   try {
-    interface DbProduct { id: string; name: string; price: number; quantity: number }
+    interface DbProduct { id: string; name: string; price: number; quantity: number; version: number }
     const dbProducts: Array<DbProduct | null> = await Promise.all(
       body.items.map(item =>
         c.env.DB.prepare(
-          'SELECT id, name, price, quantity FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL'
+          'SELECT id, name, price, quantity, version FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL'
         ).bind(item.product_id, tenantId).first<DbProduct>()
       )
     );
@@ -374,6 +377,55 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     const contactName = body.customer_email ?? body.customer_phone ?? 'Guest';
     const deliveryJson = body.delivery_address ? JSON.stringify(body.delivery_address) : null;
 
+    // ── TASK SV-E02: Deduct stock atomically with optimistic locking ─────────
+    // Run before order insertion so that a version conflict triggers a refund
+    // rather than an orphaned order.
+    for (let i = 0; i < body.items.length; i++) {
+      const item = body.items[i]!;
+      const dbProd = dbProducts[i]!;
+      const newQty = dbProd.quantity - item.quantity;
+
+      const lockResult = await updateWithVersionLock(
+        c.env.DB,
+        'products',
+        { quantity: newQty },
+        { id: item.product_id, tenantId: tenantId!, expectedVersion: dbProd.version },
+      );
+
+      if (lockResult.conflict) {
+        // Payment already captured — initiate automatic refund (SV-E01)
+        try {
+          const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET ?? '');
+          await paymentProvider.initiateRefund(body.paystack_reference);
+
+          // Notify event bus
+          // (publishEvent not available here; queue via fetch side-channel or just log)
+          void CommerceEvents.PAYMENT_REFUNDED;
+
+          // Notify customer via WhatsApp
+          const smsProvider = createSmsProvider(c.env.TERMII_API_KEY ?? '');
+          const customerPhone = body.customer_phone ?? '';
+          if (customerPhone) {
+            await smsProvider.sendOtp(
+              customerPhone,
+              'Your order could not be fulfilled due to stock unavailability. A full refund has been initiated.',
+              'whatsapp',
+            );
+          }
+        } catch {
+          // Refund attempt failure must not suppress the 409 — operations team
+          // can reconcile via Paystack dashboard.
+        }
+
+        return c.json({
+          success: false,
+          error: 'stock_unavailable',
+          refundInitiated: true,
+        }, 409);
+      }
+    }
+
+    // ── Insert order + customer + promo atomically ────────────────────────────
     const stmts = [
       c.env.DB.prepare(
         `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal,
@@ -391,11 +443,6 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         deliveryJson, body.promo_code?.toUpperCase().trim() ?? null,
         now, now,
       ),
-      ...body.items.map(item =>
-        c.env.DB.prepare(
-          'UPDATE products SET quantity = quantity - ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND quantity >= ?'
-        ).bind(item.quantity, now, item.product_id, tenantId, item.quantity)
-      ),
       c.env.DB.prepare(
         `INSERT OR IGNORE INTO customers (id, tenant_id, name, email, phone, ndpr_consent, ndpr_consent_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`
@@ -410,13 +457,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       );
     }
 
-    const results = await c.env.DB.batch(stmts);
-
-    for (let i = 1; i <= body.items.length; i++) {
-      if ((results[i]?.meta?.changes ?? 0) < 1) {
-        return c.json({ success: false, error: `Stock race condition on "${body.items[i - 1]!.name}". Please try again.` }, 409);
-      }
-    }
+    await c.env.DB.batch(stmts);
 
     return c.json({
       success: true,

@@ -2080,6 +2080,121 @@ app.post('/vendors/:id/payout-request', async (c) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-E01: DEDICATED SEARCH ENDPOINT — FTS5-first with LIKE fallback
+// GET /search?q={query}&category={category}&per_page={n}
+// Used by the marketplace frontend instead of per-vendor product loops.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /search
+ * Full-text product search across all active vendors in the marketplace.
+ * Uses FTS5 MATCH when the products_fts table is available; falls back to LIKE.
+ * Tenant-isolated: all queries are scoped to the x-tenant-id header.
+ */
+app.get('/search', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const q        = (c.req.query('q') ?? '').trim();
+  const category = (c.req.query('category') ?? '').trim();
+  const perPage  = Math.min(Number(c.req.query('per_page') ?? '24'), 48);
+
+  // Rate-limit search requests (60 per IP per minute)
+  if (q) {
+    const rlKey = `${tenantId}:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+    if (!checkRateLimit(searchRateLimitStore, rlKey, 60, 60_000)) {
+      return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
+    }
+  }
+
+  try {
+    const conditions: string[] = [
+      'p.tenant_id = ?',
+      'p.is_active = 1',
+      'p.deleted_at IS NULL',
+      'v.status = ?',
+      'v.deleted_at IS NULL',
+    ];
+    const binds: unknown[] = [tenantId, 'active'];
+
+    if (category) {
+      conditions.push('p.category = ?');
+      binds.push(category);
+    }
+
+    let searchJoin = '';
+    if (q) {
+      searchJoin = `INNER JOIN products_fts fts ON fts.product_id = p.id AND fts.tenant_id = p.tenant_id`;
+      conditions.push('products_fts MATCH ?');
+      binds.push(q);
+    }
+
+    const where = conditions.join(' AND ');
+    binds.push(perPage);
+
+    const sql = `
+      SELECT
+        p.id, p.sku, p.name, p.description, p.category,
+        p.price, p.quantity, p.image_url, p.vendor_id,
+        v.name AS vendor_name, v.slug AS vendor_slug
+      FROM products p
+      INNER JOIN vendors v ON v.id = p.vendor_id
+      ${searchJoin}
+      WHERE ${where}
+      ORDER BY p.id ASC
+      LIMIT ?
+    `.trim();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { results } = await c.env.DB.prepare(sql).bind(...(binds as any[])).all<{
+      id: string; sku: string; name: string; description: string | null;
+      category: string | null; price: number; quantity: number; image_url: string | null;
+      vendor_id: string; vendor_name: string; vendor_slug: string;
+    }>();
+
+    return c.json({ success: true, data: results, meta: { count: results.length, query: q } });
+  } catch (e) {
+    // FTS5 table absent — retry with LIKE fallback
+    if (String(e).includes('no such table: products_fts') || String(e).includes('MATCH')) {
+      try {
+        const conditions: string[] = [
+          'p.tenant_id = ?', 'p.is_active = 1', 'p.deleted_at IS NULL',
+          'v.status = ?', 'v.deleted_at IS NULL',
+        ];
+        const binds: unknown[] = [tenantId, 'active'];
+        if (category) { conditions.push('p.category = ?'); binds.push(category); }
+        if (q) {
+          conditions.push('(p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)');
+          binds.push(`%${q}%`, `%${q}%`, `%${q}%`);
+        }
+        binds.push(perPage);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { results } = await c.env.DB.prepare(
+          `SELECT p.id, p.sku, p.name, p.description, p.category,
+                  p.price, p.quantity, p.image_url, p.vendor_id,
+                  v.name AS vendor_name, v.slug AS vendor_slug
+           FROM products p
+           INNER JOIN vendors v ON v.id = p.vendor_id
+           WHERE ${conditions.join(' AND ')}
+           ORDER BY p.id ASC LIMIT ?`,
+        ).bind(...(binds as any[])).all<{
+          id: string; sku: string; name: string; description: string | null; category: string | null;
+          price: number; quantity: number; image_url: string | null;
+          vendor_id: string; vendor_name: string; vendor_slug: string;
+        }>();
+
+        return c.json({ success: true, data: results, meta: { count: results.length, query: q } });
+      } catch (e2) {
+        console.error('[MV][search] LIKE fallback error:', e2);
+      }
+    }
+    console.error('[MV][search] error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 export { app as multiVendorRouter };
 
 /**

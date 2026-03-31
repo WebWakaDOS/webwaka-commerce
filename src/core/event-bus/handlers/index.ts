@@ -14,6 +14,7 @@
 import type { Env } from '../../../worker';
 import type { WebWakaEvent } from '../index';
 import { registerHandler, clearHandlers } from '../index';
+import { CommerceEvents } from '@webwaka/core';
 
 // ─── Handler: inventory.updated → invalidate catalog KV cache ────────────────
 
@@ -36,38 +37,103 @@ export async function handleInventoryUpdated(
   }
 }
 
-// ─── Handler: order.created → placeholder (Super Admin V2 will consume) ───────
+// ─── Handler: order.created → log to platform_order_log ──────────────────────
 
 export async function handleOrderCreated(
-  event: WebWakaEvent,
-  _env: Env,
+  event: WebWakaEvent<{ order?: { id?: string } }>,
+  env: Env,
 ): Promise<void> {
-  // Consumed by webwaka-super-admin-v2 via CF Queues subscription.
-  // This handler is a local stub — no action needed in commerce worker.
-  // Event schema: see docs/EVENT_SCHEMAS.md > order.created
-  void event;
+  const tenantId = event.tenantId;
+  if (!tenantId) return;
+
+  const orderId = (event.payload?.order?.id ?? event.id) as string;
+  const logId = `pol_${event.id}`;
+  const createdAt = new Date(event.timestamp).toISOString();
+
+  try {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO platform_order_log
+         (id, tenant_id, order_id, source_module, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+      .bind(logId, tenantId, orderId, event.sourceModule, createdAt)
+      .run();
+  } catch {
+    // Table may not exist yet; migration 0002_stubs.sql creates it.
+    // Non-fatal: CF Queues will not retry a handler that returns normally.
+  }
 }
 
-// ─── Handler: shift.closed → placeholder (analytics pipeline) ─────────────────
+// ─── Handler: shift.closed → compute Z-report and insert shift_analytics ─────
 
 export async function handleShiftClosed(
-  event: WebWakaEvent,
-  _env: Env,
+  event: WebWakaEvent<{ sessionId?: string }>,
+  env: Env,
 ): Promise<void> {
-  // Future: push Z-report summary to analytics pipeline.
-  // Currently a no-op stub.
-  void event;
+  const tenantId = event.tenantId;
+  const sessionId = event.payload?.sessionId;
+  if (!tenantId || !sessionId) return;
+
+  try {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS total_orders,
+              COALESCE(SUM(total_amount), 0) AS revenue_kobo,
+              COALESCE(AVG(total_amount), 0) AS avg_order_kobo
+       FROM orders
+       WHERE tenant_id = ? AND session_id = ? AND deleted_at IS NULL`,
+    )
+      .bind(tenantId, sessionId)
+      .first<{ total_orders: number; revenue_kobo: number; avg_order_kobo: number }>();
+
+    if (!row) return;
+
+    const analyticsId = `sa_${event.id}`;
+    const recordedAt = new Date(event.timestamp).toISOString();
+
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO shift_analytics
+         (id, tenant_id, session_id, total_orders, revenue_kobo, avg_order_kobo, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        analyticsId,
+        tenantId,
+        sessionId,
+        row.total_orders,
+        row.revenue_kobo,
+        Math.round(row.avg_order_kobo),
+        recordedAt,
+      )
+      .run();
+  } catch {
+    // Non-fatal — table may not exist until migration 0002_stubs.sql runs.
+  }
 }
 
-// ─── Handler: vendor.kyc.submitted → placeholder (Super Admin V2 review) ─────
+// ─── Handler: vendor.kyc.submitted → queue for manual review ─────────────────
 
 export async function handleVendorKycSubmitted(
-  event: WebWakaEvent,
-  _env: Env,
+  event: WebWakaEvent<{ vendorId?: string }>,
+  env: Env,
 ): Promise<void> {
-  // Consumed by webwaka-super-admin-v2 KYC review queue.
-  // No action in commerce worker.
-  void event;
+  const tenantId = event.tenantId;
+  const vendorId = event.payload?.vendorId;
+  if (!tenantId || !vendorId) return;
+
+  const queueId = `kyc_${event.id}`;
+  const submittedAt = new Date(event.timestamp).toISOString();
+
+  try {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO kyc_review_queue
+         (id, tenant_id, vendor_id, submitted_at, status)
+       VALUES (?, ?, ?, ?, 'PENDING')`,
+    )
+      .bind(queueId, tenantId, vendorId, submittedAt)
+      .run();
+  } catch {
+    // Non-fatal — table may not exist until migration 0002_stubs.sql runs.
+  }
 }
 
 // ─── Handler: delivery.booking.confirmed → update vendor_orders tracking ──────
@@ -169,12 +235,18 @@ export async function handleDeliveryStatusUpdated(
 export function registerAllHandlers(env: Env): void {
   clearHandlers();
 
-  registerHandler('inventory.updated', (event) =>
+  registerHandler(CommerceEvents.INVENTORY_UPDATED, (event) =>
     handleInventoryUpdated(event as WebWakaEvent<{ productId?: string; tenantId?: string }>, env),
   );
-  registerHandler('order.created', (event) => handleOrderCreated(event, env));
-  registerHandler('shift.closed', (event) => handleShiftClosed(event, env));
-  registerHandler('vendor.kyc.submitted', (event) => handleVendorKycSubmitted(event, env));
+  registerHandler(CommerceEvents.ORDER_CREATED, (event) =>
+    handleOrderCreated(event as WebWakaEvent<{ order?: { id?: string } }>, env),
+  );
+  registerHandler(CommerceEvents.SHIFT_CLOSED, (event) =>
+    handleShiftClosed(event as WebWakaEvent<{ sessionId?: string }>, env),
+  );
+  registerHandler(CommerceEvents.VENDOR_KYC_SUBMITTED, (event) =>
+    handleVendorKycSubmitted(event as WebWakaEvent<{ vendorId?: string }>, env),
+  );
   registerHandler('delivery.booking.confirmed', (event) =>
     handleDeliveryBookingConfirmed(event as WebWakaEvent<{
       vendor_order_id: string;

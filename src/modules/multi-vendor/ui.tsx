@@ -2,6 +2,7 @@
  * COM-3: Multi-Vendor Marketplace UI
  * Offline-First pattern: Dexie/IndexedDB local cache + background mutation queue.
  * Invariants: Offline-First, Mobile-First, Nigeria-First (kobo integers), Multi-tenancy.
+ * P02-MV-E01: Replaced per-vendor product loop with single FTS5 catalog search call.
  */
 import React, { useState, useEffect, useCallback } from 'react';
 import { MarketplaceCore, MarketplaceCartItem } from './core';
@@ -35,75 +36,77 @@ export const MarketplaceInterface: React.FC<{
   const [syncError, setSyncError] = useState<string | null>(null);
   const [marketplaceCore] = useState(() => new MarketplaceCore(marketplaceId));
 
-  // ── Load products: Dexie first (offline-safe), then background API refresh ──
-  const loadProducts = useCallback(async (signal?: AbortSignal) => {
+  // ── Search / filter state ─────────────────────────────────────────────────
+  const [searchQuery, setSearchQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
+
+  // ── Load products via single catalog search call (P02-MV-E01) ─────────────
+  const loadProducts = useCallback(async (signal?: AbortSignal, q = '', category = '') => {
+    setIsLoading(true);
+
     // Step 1 — serve from IndexedDB immediately (works fully offline)
     const cached = await getMvProducts(tenantId);
     if (!signal?.aborted && cached.length > 0) {
-      setInventory(cached);
+      const filtered = cached.filter(p =>
+        (!q || p.name.toLowerCase().includes(q.toLowerCase())) &&
+        (!category || p.category === category),
+      );
+      setInventory(filtered);
       setIsLoading(false);
     }
 
-    // Step 2 — background fetch to refresh the IndexedDB cache
+    // Step 2 — single catalog API call (FTS5 on the server, no per-vendor loop)
     try {
-      const vendorRes = await fetch('/api/multi-vendor/vendors', {
+      const params = new URLSearchParams();
+      if (q) params.set('q', q);
+      if (category) params.set('category', category);
+      params.set('per_page', '48');
+
+      const res = await fetch(`/api/multi-vendor/search?${params.toString()}`, {
         headers: { 'x-tenant-id': tenantId },
         signal: signal ?? null,
       });
-      if (!vendorRes.ok || signal?.aborted) return;
+      if (!res.ok || signal?.aborted) return;
 
-      const vendorJson = await vendorRes.json() as {
+      const json = await res.json() as {
         success: boolean;
-        data: Array<{ id: string; name: string }>;
+        data: Array<{
+          id: string;
+          sku: string;
+          name: string;
+          description?: string;
+          price: number;
+          quantity: number;
+          category?: string;
+          image_url?: string;
+          vendor_id: string;
+          vendor_name: string;
+        }>;
       };
-      if (!vendorJson.success || !vendorJson.data?.length) return;
+      if (!json.success || signal?.aborted) return;
 
       const now = Date.now();
-      const freshProducts: MvProduct[] = [];
+      const freshProducts: MvProduct[] = (json.data ?? []).map(p => ({
+        id: p.id,
+        tenantId,
+        vendorId: p.vendor_id,
+        vendorName: p.vendor_name,
+        sku: p.sku,
+        name: p.name,
+        price: p.price,
+        quantity: p.quantity,
+        cachedAt: now,
+        ...(p.category != null ? { category: p.category } : {}),
+        ...(p.image_url != null ? { imageUrl: p.image_url } : {}),
+        ...(p.description != null ? { description: p.description } : {}),
+      }));
 
-      for (const vendor of vendorJson.data) {
-        if (signal?.aborted) return;
-        const pRes = await fetch(`/api/multi-vendor/vendors/${vendor.id}/products`, {
-          headers: { 'x-tenant-id': tenantId },
-          signal: signal ?? null,
-        });
-        if (!pRes.ok || signal?.aborted) continue;
-
-        const pJson = await pRes.json() as {
-          success: boolean;
-          data: Array<{
-            id: string;
-            sku: string;
-            name: string;
-            price: number;
-            quantity: number;
-            category?: string;
-            image_url?: string;
-          }>;
-        };
-        if (!pJson.success || !pJson.data?.length) continue;
-
-        for (const p of pJson.data) {
-          freshProducts.push({
-            id: p.id,
-            tenantId,
-            vendorId: vendor.id,
-            vendorName: vendor.name,
-            sku: p.sku,
-            name: p.name,
-            price: p.price,       // kobo — strict integer from server
-            quantity: p.quantity,
-            cachedAt: now,
-            ...(p.category != null ? { category: p.category } : {}),
-            ...(p.image_url != null ? { imageUrl: p.image_url } : {}),
-          });
-        }
-      }
-
-      if (signal?.aborted || freshProducts.length === 0) return;
+      if (signal?.aborted) return;
 
       // Write to IndexedDB (Build Once Use Infinitely pattern)
-      await cacheMvProducts(tenantId, freshProducts);
+      if (freshProducts.length > 0) {
+        await cacheMvProducts(tenantId, freshProducts);
+      }
 
       if (!signal?.aborted) {
         setInventory(freshProducts);
@@ -112,18 +115,17 @@ export const MarketplaceInterface: React.FC<{
       }
     } catch (err) {
       if (signal?.aborted) return;
-      // Network offline — IndexedDB cache already shown; log for diagnostics
-      console.warn('[MV] Background API sync failed (offline?):', err);
+      console.warn('[MV] Catalog API call failed (offline?):', err);
       setSyncError('Showing cached data. Some prices may be outdated.');
-      if (isLoading) setIsLoading(false);
+      setIsLoading(false);
     }
   }, [tenantId]);
 
   useEffect(() => {
     const controller = new AbortController();
-    loadProducts(controller.signal);
+    loadProducts(controller.signal, searchQuery, categoryFilter);
     return () => controller.abort();
-  }, [loadProducts]);
+  }, [loadProducts, searchQuery, categoryFilter]);
 
   // ── Cart operations ────────────────────────────────────────────────────────
 
@@ -155,7 +157,7 @@ export const MarketplaceInterface: React.FC<{
         product_id: i.id,
         vendor_id: i.vendorId,
         quantity: i.cartQuantity,
-        price: i.price,     // kobo — strict integer
+        price: i.price,
         name: i.name,
       }));
 
@@ -173,9 +175,6 @@ export const MarketplaceInterface: React.FC<{
         },
       );
 
-      // Attempt live checkout via MarketplaceCore.
-      // MarketplaceCartItem extends InventoryItem which requires version/timestamps;
-      // supply safe defaults since MvProduct is a cache record, not a full InventoryItem.
       const now = Date.now();
       const apiCart: MarketplaceCartItem[] = cart.map(i => ({
         ...i,
@@ -227,6 +226,26 @@ export const MarketplaceInterface: React.FC<{
         )}
       </header>
 
+      {/* Search & filter bar */}
+      <div style={{ padding: '0.75rem 1rem', backgroundColor: '#fff', borderBottom: '1px solid #e5e7eb', display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+        <input
+          type="search"
+          placeholder="Search products…"
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          style={{ flex: 1, minWidth: '180px', padding: '0.5rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.95rem' }}
+          aria-label="Search products"
+        />
+        <input
+          type="text"
+          placeholder="Category filter"
+          value={categoryFilter}
+          onChange={e => setCategoryFilter(e.target.value)}
+          style={{ width: '160px', padding: '0.5rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.95rem' }}
+          aria-label="Filter by category"
+        />
+      </div>
+
       <main style={{ flex: 1, padding: '1rem', maxWidth: '800px', margin: '0 auto', width: '100%' }}>
         {isLoading ? (
           <div style={{ textAlign: 'center', padding: '3rem', color: '#666' }}>
@@ -234,7 +253,11 @@ export const MarketplaceInterface: React.FC<{
           </div>
         ) : inventory.length === 0 ? (
           <div style={{ textAlign: 'center', padding: '3rem', color: '#666' }}>
-            <p style={{ fontSize: '1rem' }}>No products available in this marketplace yet.</p>
+            {searchQuery || categoryFilter ? (
+              <p style={{ fontSize: '1rem' }}>No products match your search. Try different keywords.</p>
+            ) : (
+              <p style={{ fontSize: '1rem' }}>No products available in this marketplace yet.</p>
+            )}
           </div>
         ) : (
           vendorNames.map(vendorName => (

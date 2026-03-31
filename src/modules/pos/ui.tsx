@@ -167,6 +167,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   // ── Products ─────────────────────────────────────────────────────────────
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
+  const [offlineMode, setOfflineMode] = useState(false);
   const [isOnline, setIsOnline] = useState(
     typeof navigator !== 'undefined' ? navigator.onLine : true,
   );
@@ -175,13 +176,50 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     async (search = '') => {
       setLoading(true);
       try {
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          // ── Offline path: serve from Dexie product cache ──────────────────
+          const { getCommerceDB } = await import('../../core/offline/db');
+          const db = getCommerceDB(tenantId);
+          const cached = await db.table('products')
+            .where('tenantId').equals(tenantId).toArray() as Product[];
+          if (cached.length > 0) {
+            setProducts(cached);
+            setOfflineMode(true);
+          }
+          return;
+        }
+
+        // ── Online path: fetch from network, then upsert into Dexie ─────────
         const url = `/api/pos/products${search ? `?search=${encodeURIComponent(search)}` : ''}`;
         const res = await fetch(url, { headers: { 'x-tenant-id': tenantId } });
         if (res.ok) {
           const json = (await res.json()) as { success: boolean; data: Product[] };
-          if (json.success) setProducts(json.data);
+          if (json.success) {
+            setProducts(json.data);
+            setOfflineMode(false);
+            // Upsert into Dexie for future offline reads
+            try {
+              const { getCommerceDB } = await import('../../core/offline/db');
+              const db = getCommerceDB(tenantId);
+              await db.table('products').bulkPut(
+                json.data.map((p) => ({ ...p, tenantId, cachedAt: Date.now() })),
+              );
+            } catch { /* IndexedDB write failure is non-fatal */ }
+          }
         }
-      } catch { /* offline — keep last known */ } finally {
+      } catch {
+        // Network error while online — attempt to serve from cache
+        try {
+          const { getCommerceDB } = await import('../../core/offline/db');
+          const db = getCommerceDB(tenantId);
+          const cached = await db.table('products')
+            .where('tenantId').equals(tenantId).toArray() as Product[];
+          if (cached.length > 0) {
+            setProducts(cached);
+            setOfflineMode(true);
+          }
+        } catch { /* cache read also failed — keep last known */ }
+      } finally {
         setLoading(false);
       }
     },
@@ -1093,6 +1131,21 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         >
           OFFLINE — Sales will sync when connection is restored
           {pendingSync > 0 ? ` (${pendingSync} queued)` : ''}
+        </div>
+      )}
+
+      {/* Offline Mode badge — shown when products are served from local cache */}
+      {offlineMode && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            background: '#78350f', color: '#fde68a', textAlign: 'center',
+            padding: '0.3rem', fontSize: '0.78rem', fontWeight: 600,
+            letterSpacing: '0.02em',
+          }}
+        >
+          Offline Mode — Product prices from local cache. Some items may be outdated.
         </div>
       )}
 

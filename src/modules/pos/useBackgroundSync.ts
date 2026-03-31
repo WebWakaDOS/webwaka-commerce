@@ -2,6 +2,7 @@
  * useBackgroundSync — flushes pending Dexie mutations to the server (Phase 2)
  * Triggers on component mount (if online) and on every `online` event.
  * Uses the existing POST /api/pos/sync endpoint (idempotent).
+ * After a successful flush, seeds the local product cache via syncProductCache.
  */
 import { useEffect, useCallback, useRef } from 'react';
 
@@ -10,6 +11,29 @@ interface SyncResult {
   skipped: string[];
   failed: string[];
   synced_at: number;
+}
+
+/**
+ * Fetch all POS products from the server and upsert them into the Dexie
+ * 'products' table so offline reads are always backed by fresh data.
+ */
+async function syncProductCache(tenantId: string): Promise<void> {
+  try {
+    const res = await fetch('/api/pos/products', {
+      headers: { 'x-tenant-id': tenantId },
+    });
+    if (!res.ok) return;
+
+    const json = (await res.json()) as { success: boolean; data: unknown[] };
+    if (!json.success || !Array.isArray(json.data)) return;
+
+    const { getCommerceDB } = await import('../../core/offline/db');
+    const db = getCommerceDB(tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await db.table('products').bulkPut(json.data as any[]);
+  } catch {
+    // Network or DB error — non-fatal; will retry on next sync cycle
+  }
 }
 
 async function flushPendingMutations(tenantId: string): Promise<SyncResult | null> {
@@ -70,6 +94,9 @@ export function useBackgroundSync(
       const result = await flushPendingMutations(tenantId);
       if (result && result.applied.length > 0) {
         onSynced?.(result);
+        // Seed the product cache after a successful flush so the POS is
+        // ready to serve customers even when they go offline afterward.
+        await syncProductCache(tenantId);
       }
     } finally {
       syncInProgress.current = false;

@@ -1,11 +1,11 @@
 import { Hono } from 'hono';
-import { getTenantId } from '@webwaka/core';
+import { getTenantId, updateWithVersionLock } from '@webwaka/core';
 
 // Define the standard API response format (Invariant 9.2)
-export interface ApiResponse<T = any> {
+export interface ApiResponse<T = unknown> {
   success: boolean;
   data?: T;
-  errors?: any[];
+  errors?: unknown[];
 }
 
 export interface SyncPayload {
@@ -15,10 +15,17 @@ export interface SyncPayload {
     entityType: string;
     entityId: string;
     action: 'CREATE' | 'UPDATE' | 'DELETE';
-    payload: any;
+    payload: unknown;
     version: number;
     timestamp: number;
   }[];
+}
+
+interface PosCheckoutItem {
+  productId: string;
+  quantity: number;
+  newQuantity: number;
+  knownVersion: number;
 }
 
 // Minimal binding interface so the sync router can access D1 without
@@ -43,19 +50,12 @@ syncRouter.post('/sync', async (c) => {
     const body = await c.req.json<SyncPayload>();
     const mutations = body.mutations;
 
-    // 1. Group mutations by entity to handle them in order
-    // 2. Fetch current versions from the database (D1/Postgres)
-    // 3. Apply conflict resolution (e.g., optimistic concurrency)
-    // 4. Apply successful mutations to the database
-    // 5. Publish events to the Event Bus for successful mutations
-
     const results = {
       applied: [] as number[],
-      conflicts: [] as any[],
-      errors: [] as any[]
+      conflicts: [] as unknown[],
+      errors: [] as unknown[]
     };
 
-    // Mock processing logic for the architecture plan
     for (const mutation of mutations) {
       // Enforce multi-tenancy invariant
       if (mutation.tenantId !== tenantId) {
@@ -63,8 +63,42 @@ syncRouter.post('/sync', async (c) => {
         continue;
       }
 
-      // Real conflict resolution: query D1 for the entity's current version.
-      // Falls back to 0 (entity is new) when no row exists or DB is unavailable.
+      // ── POS-E08: pos.checkout — lock each item's stock atomically ────────
+      if (mutation.entityType === 'pos.checkout' && c.env?.DB) {
+        const payload = mutation.payload as { items?: PosCheckoutItem[] };
+        const items: PosCheckoutItem[] = Array.isArray(payload?.items) ? payload.items : [];
+        let checkoutConflict = false;
+
+        for (const item of items) {
+          if (!item.productId) continue;
+
+          const lockResult = await updateWithVersionLock(
+            c.env.DB,
+            'products',
+            { quantity: item.newQuantity },
+            { id: item.productId, tenantId, expectedVersion: item.knownVersion },
+          );
+
+          if (lockResult.conflict) {
+            results.conflicts.push({
+              id: mutation.id,
+              entityType: mutation.entityType,
+              entityId: mutation.entityId,
+              productId: item.productId,
+              reason: 'inventory_conflict',
+            });
+            checkoutConflict = true;
+            break;
+          }
+        }
+
+        if (!checkoutConflict) {
+          results.applied.push(mutation.id);
+        }
+        continue;
+      }
+
+      // ── Standard mutation: version-based conflict detection ───────────────
       let dbVersion = 0;
       if (c.env?.DB) {
         try {
@@ -82,7 +116,6 @@ syncRouter.post('/sync', async (c) => {
       }
 
       if (mutation.version < dbVersion) {
-        // Conflict detected
         results.conflicts.push({
           id: mutation.id,
           entityType: mutation.entityType,
@@ -91,8 +124,6 @@ syncRouter.post('/sync', async (c) => {
           clientVersion: mutation.version
         });
       } else {
-        // Apply mutation — upsert the version in sync_versions so subsequent
-        // syncs see the updated version and detect future conflicts correctly.
         results.applied.push(mutation.id);
 
         if (c.env?.DB) {
@@ -119,25 +150,23 @@ syncRouter.post('/sync', async (c) => {
     }
 
     if (results.conflicts.length > 0 || results.errors.length > 0) {
-      return c.json<ApiResponse>({ 
-        success: false, 
-        data: results 
-      }, 409); // 409 Conflict
+      return c.json<ApiResponse>({
+        success: false,
+        data: results
+      }, 409);
     }
 
-    return c.json<ApiResponse>({ 
-      success: true, 
-      data: { applied: results.applied } 
+    return c.json<ApiResponse>({
+      success: true,
+      data: { applied: results.applied, conflicts: results.conflicts }
     });
 
   } catch (error) {
-    // Zero console.log invariant - use platform logger in real implementation
-    return c.json<ApiResponse>({ 
-      success: false, 
-      errors: [error instanceof Error ? error.message : 'Internal Server Error'] 
+    return c.json<ApiResponse>({
+      success: false,
+      errors: [error instanceof Error ? error.message : 'Internal Server Error']
     }, 500);
   }
 });
 
-// Export as default for Cloudflare Workers
 export default syncRouter;

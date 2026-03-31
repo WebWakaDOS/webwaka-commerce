@@ -1,5 +1,6 @@
 import { eventBus } from '../../core/event-bus';
 import { InventoryItem } from '../../core/db/schema';
+import { createPaymentProvider, CommerceEvents } from '@webwaka/core';
 
 export interface StorefrontCartItem extends InventoryItem {
   cartQuantity: number;
@@ -18,28 +19,25 @@ export interface StorefrontOrder {
 
 export class StorefrontCore {
   private tenantId: string;
+  private paystackSecret: string;
 
-  constructor(tenantId: string) {
+  constructor(tenantId: string, paystackSecret = '') {
     this.tenantId = tenantId;
-  }
-
-  // Paystack integration (Nigeria First Invariant)
-  // The browser checkout flow uses the Paystack Inline SDK (handlePayWithPaystack in app.tsx).
-  // This method is used server-side for legacy / unit-test purposes only.
-  async processPayment(amount: number, _email: string): Promise<{ success: boolean; reference: string }> {
-    const reference = `pay_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    return { success: amount > 0, reference };
+    this.paystackSecret = paystackSecret;
   }
 
   async checkout(cart: StorefrontCartItem[], customerEmail: string): Promise<StorefrontOrder> {
     const totalAmount = cart.reduce((sum, item) => sum + (item.price * item.cartQuantity), 0);
-    
+
     const orderId = `ord_sv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-    // 1. Process Payment (Nigeria First)
-    const paymentResult = await this.processPayment(totalAmount, customerEmail);
+    const payment = createPaymentProvider(this.paystackSecret);
 
-    if (!paymentResult.success) {
+    const chargeResult = await payment.verifyCharge(
+      `ref_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    );
+
+    if (!chargeResult.success) {
       throw new Error('Payment failed');
     }
 
@@ -50,41 +48,39 @@ export class StorefrontCore {
       items: cart,
       totalAmount,
       status: 'PAID',
-      paymentReference: paymentResult.reference,
+      paymentReference: chargeResult.reference,
       createdAt: Date.now()
     };
 
-    // 2. Publish events to the Platform Event Bus
-    
     // Publish order created event
     await eventBus.publish({
       id: `evt_ord_${Date.now()}`,
       tenantId: this.tenantId,
-      type: 'order.created',
+      type: CommerceEvents.ORDER_CREATED,
       sourceModule: 'single_vendor_storefront',
       timestamp: Date.now(),
       payload: { order }
     });
 
-    // Publish payment completed event
+    // Publish payment received event
     await eventBus.publish({
       id: `evt_pay_${Date.now()}`,
       tenantId: this.tenantId,
-      type: 'payment.completed',
+      type: CommerceEvents.PAYMENT_COMPLETED,
       sourceModule: 'single_vendor_storefront',
       timestamp: Date.now(),
-      payload: { 
-        orderId: order.id, 
-        amount: totalAmount, 
+      payload: {
+        orderId: order.id,
+        amount: totalAmount,
         method: 'PAYSTACK',
-        reference: paymentResult.reference
+        reference: chargeResult.reference
       }
     });
 
     // Publish inventory updates
     for (const item of cart) {
       const updatedQuantity = item.quantity - item.cartQuantity;
-      
+
       const inventoryUpdate = {
         ...item,
         quantity: updatedQuantity,
@@ -94,7 +90,7 @@ export class StorefrontCore {
       await eventBus.publish({
         id: `evt_inv_${Date.now()}_${item.id}`,
         tenantId: this.tenantId,
-        type: 'inventory.updated',
+        type: CommerceEvents.INVENTORY_UPDATED,
         sourceModule: 'single_vendor_storefront',
         timestamp: Date.now(),
         payload: { item: inventoryUpdate }
