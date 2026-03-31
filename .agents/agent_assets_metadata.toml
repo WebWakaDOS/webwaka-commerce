@@ -6,3 +6,15 @@ id = "zwfowSek-eNbsRRIBlzmk"
 uri = "file://docs/COMMERCE_ENHANCEMENT_RESEARCH.md"
 type = "text"
 title = "WebWaka Commerce Suite — Deep Research & Enhancement Plan"
+
+[[outputs]]
+id = "WDOzmg2ibI-Wu9J5tQzab"
+uri = "file://docs/IMPLEMENTATION_PLAN.md"
+type = "text"
+title = "WebWaka Commerce — Implementation Plan (Full Technical Detail)"
+
+[[outputs]]
+id = "d1PR3tyOYMZciJTyIi8j9"
+uri = "file://docs/IMPLEMENTATION_PROMPTS.md"
+type = "text"
+title = "WebWaka Commerce — Implementation Prompts (Copy-Paste Per Phase)"
