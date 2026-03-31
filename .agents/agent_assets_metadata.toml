@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "zwfowSek-eNbsRRIBlzmk"
+uri = "file://docs/COMMERCE_ENHANCEMENT_RESEARCH.md"
+type = "text"
+title = "WebWaka Commerce Suite — Deep Research & Enhancement Plan"
