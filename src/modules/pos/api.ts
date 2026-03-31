@@ -6,10 +6,11 @@
  * Invariants: Nigeria-First (Paystack), Offline-First (sync), Multi-tenancy, PCI-DSS error hygiene
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, updateWithVersionLock, createTaxEngine, checkRateLimit as kvCheckRateLimit, hashPin, verifyPin, createSmsProvider } from '@webwaka/core';
+import { getTenantId, requireRole, updateWithVersionLock, createTaxEngine, checkRateLimit as kvCheckRateLimit, hashPin, verifyPin, createSmsProvider, CommerceEvents } from '@webwaka/core';
 import { checkRateLimit, _createRateLimitStore, generatePayRef } from '../../utils';
 import type { RateLimitStore } from '../../utils';
 import type { Env } from '../../worker';
+import { publishEvent } from '../../core/event-bus';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -333,6 +334,22 @@ app.patch(
       // Cash variance: cash collected vs opening float (spec: sales - float)
       const cashVarianceKobo = cashSales - session.initial_float_kobo;
 
+      // ── Cashier-level breakdown (POS-E11) ────────────────────────────────
+      const cashierBreakdownResult = await c.env.DB.prepare(
+        `SELECT cashier_id as cashierId,
+                COUNT(*) as orderCount,
+                COALESCE(SUM(total_amount), 0) as revenueKobo,
+                COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN total_amount ELSE 0 END), 0) as cashKobo,
+                COALESCE(SUM(CASE WHEN payment_method != 'cash' THEN total_amount ELSE 0 END), 0) as digitalKobo
+         FROM orders
+         WHERE session_id = ? AND tenant_id = ? AND order_status != 'voided'
+         GROUP BY cashier_id`,
+      ).bind(id, tenantId).all<{
+        cashierId: string | null; orderCount: number;
+        revenueKobo: number; cashKobo: number; digitalKobo: number;
+      }>();
+      const cashierBreakdown = cashierBreakdownResult.results ?? [];
+
       const zReport = {
         id,
         cashier_id: session.cashier_id,
@@ -344,6 +361,7 @@ app.patch(
         cash_sales_kobo: cashSales,
         order_count: orderCount,
         cash_variance_kobo: cashVarianceKobo,
+        cashier_breakdown: cashierBreakdown,
       };
 
       await c.env.DB.prepare(
@@ -797,10 +815,19 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       }
     }
 
-    // Step 6b — Insert order (stock already deducted above)
+    // Step 6b — Resolve cashier_id from open session (POS-E11)
+    let resolvedCashierId: string | null = null;
+    if (body.session_id) {
+      const sessRow = await c.env.DB.prepare(
+        'SELECT cashier_id FROM pos_sessions WHERE id = ? AND tenant_id = ?',
+      ).bind(body.session_id, tenantId).first<{ cashier_id: string | null }>();
+      resolvedCashierId = sessRow?.cashier_id ?? null;
+    }
+
+    // Step 6c — Insert order (stock already deducted above)
     const insertStmt = c.env.DB.prepare(
-      `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal, discount, total_amount, payment_method, payments_json, session_id, payment_status, order_status, channel, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`,
+      `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal, discount, total_amount, payment_method, payments_json, session_id, cashier_id, payment_status, order_status, channel, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`,
     ).bind(
       orderId,
       tenantId,
@@ -813,6 +840,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       primaryMethod,
       JSON.stringify(resolvedPayments),
       body.session_id ?? null,
+      resolvedCashierId,
       now,
       now,
     );
@@ -1115,6 +1143,229 @@ app.get('/dashboard', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
   } catch (err) {
     console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OFFLINE CUSTOMER CACHE — Top 200 customers for Dexie seeding (POS-E05)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/pos/customers/top — Top 200 customers by last purchase for offline cache
+app.get('/customers/top', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, tenant_id as tenantId, name, phone, creditBalanceKobo, loyalty_points as loyaltyPoints
+       FROM customers
+       WHERE tenant_id = ? AND deleted_at IS NULL
+       ORDER BY lastPurchaseAt DESC
+       LIMIT 200`,
+    ).bind(tenantId).all();
+    const now = Date.now();
+    const customers = (results as Array<Record<string, unknown>>).map((row) => ({
+      ...row,
+      updatedAt: now,
+    }));
+    return c.json({ success: true, customers });
+  } catch (err) {
+    console.error('[POS] route error:', err);
+    return c.json({ success: false, error: 'Service unavailable' }, 503);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PARTIAL RETURNS AND STORE CREDIT (POS-E04)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// POST /api/pos/orders/:id/return — Process a partial return
+app.post('/orders/:id/return', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const originalOrderId = c.req.param('id');
+
+  type ReturnItem = { productId: string; quantity: number; reason?: string };
+  type ReturnBody = { items: ReturnItem[]; returnMethod: string };
+  const body = await c.req.json<ReturnBody>();
+
+  if (!body.items || !Array.isArray(body.items) || body.items.length === 0) {
+    return c.json({ success: false, error: 'items array is required and must not be empty' }, 400);
+  }
+  const validMethods = ['CASH', 'STORE_CREDIT', 'EXCHANGE'] as const;
+  if (!validMethods.includes(body.returnMethod as (typeof validMethods)[number])) {
+    return c.json({ success: false, error: `returnMethod must be one of: ${validMethods.join(', ')}` }, 400);
+  }
+
+  try {
+    // 1. Fetch original order — must belong to this tenant and be deliverable
+    const order = await c.env.DB.prepare(
+      `SELECT id, tenant_id, customer_phone, order_status, items_json
+       FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+    ).bind(originalOrderId, tenantId).first<{
+      id: string; tenant_id: string; customer_phone: string | null;
+      order_status: string; items_json: string | null;
+    }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+    if (!['DELIVERED', 'COMPLETED', 'fulfilled'].includes(order.order_status)) {
+      return c.json({ success: false, error: `Cannot return an order with status '${order.order_status}'. Order must be DELIVERED or COMPLETED.` }, 422);
+    }
+
+    // 2. Parse original items and validate return quantities
+    type OrigItem = { product_id: string; quantity: number; price: number; name: string };
+    const origItems: OrigItem[] = order.items_json ? JSON.parse(order.items_json) : [];
+    const origByProduct = new Map(origItems.map((i) => [i.product_id, i]));
+
+    for (const item of body.items) {
+      if (!item.productId?.trim()) return c.json({ success: false, error: 'Each return item must have a productId' }, 400);
+      if (!Number.isInteger(item.quantity) || item.quantity < 1) return c.json({ success: false, error: 'Each return item quantity must be a positive integer' }, 400);
+      const orig = origByProduct.get(item.productId);
+      if (!orig) return c.json({ success: false, error: `Product ${item.productId} was not in the original order` }, 422);
+      if (item.quantity > orig.quantity) {
+        return c.json({ success: false, error: `Return quantity (${item.quantity}) exceeds original quantity (${orig.quantity}) for product ${item.productId}` }, 422);
+      }
+    }
+
+    // 3. Compute credit amount (sum of return item amounts)
+    const creditAmountKobo = body.items.reduce((sum, item) => {
+      const orig = origByProduct.get(item.productId);
+      return sum + (orig ? orig.price * item.quantity : 0);
+    }, 0);
+
+    const now = Date.now();
+    const returnId = `ret_${now}_${crypto.randomUUID().slice(0, 8)}`;
+
+    // 4. D1 batch: restore inventory + optional store credit + insert return record
+    const batchStmts = [
+      // Restore stock for each returned item
+      ...body.items.map((item) =>
+        c.env.DB.prepare(
+          'UPDATE products SET quantity = quantity + ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
+        ).bind(item.quantity, now, item.productId, tenantId),
+      ),
+    ];
+
+    // Store credit: credit customer's wallet
+    if (body.returnMethod === 'STORE_CREDIT' && order.customer_phone) {
+      batchStmts.push(
+        c.env.DB.prepare(
+          'UPDATE customers SET creditBalanceKobo = creditBalanceKobo + ?, updated_at = ? WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+        ).bind(creditAmountKobo, now, tenantId, order.customer_phone),
+      );
+    }
+
+    // Insert return record
+    batchStmts.push(
+      c.env.DB.prepare(
+        `INSERT INTO order_returns (id, tenantId, originalOrderId, returnedItems, returnMethod, creditAmountKobo, processedBy, status, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, 'PENDING', ?)`,
+      ).bind(
+        returnId, tenantId, originalOrderId,
+        JSON.stringify(body.items),
+        body.returnMethod,
+        creditAmountKobo,
+        new Date(now).toISOString(),
+      ),
+    );
+
+    await c.env.DB.batch(batchStmts);
+
+    // 5. Publish INVENTORY_UPDATED for each returned product (non-blocking)
+    for (const item of body.items) {
+      publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_inv_${now}_${crypto.randomUUID().slice(0, 8)}`,
+        tenantId: tenantId!,
+        type: CommerceEvents.INVENTORY_UPDATED,
+        sourceModule: 'pos',
+        timestamp: now,
+        payload: { productId: item.productId, delta: item.quantity, reason: 'return', returnId },
+      }).catch(() => { /* non-fatal */ });
+    }
+
+    return c.json({ success: true, data: { returnId, creditAmountKobo, returnMethod: body.returnMethod } }, 201);
+  } catch (err) {
+    console.error('[POS] route error:', err);
+    return c.json({ success: false, error: 'Failed to process return' }, 500);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// STOCK TAKE (POS-E06)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// POST /api/pos/stock-adjustments — Admin-only stock take
+app.post('/stock-adjustments', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  type Adjustment = { productId: string; countedQuantity: number; reason: string };
+  type AdjBody = { sessionId?: string; adjustments: Adjustment[] };
+  const body = await c.req.json<AdjBody>();
+
+  if (!body.adjustments || !Array.isArray(body.adjustments) || body.adjustments.length === 0) {
+    return c.json({ success: false, error: 'adjustments array is required and must not be empty' }, 400);
+  }
+  const validReasons = ['DAMAGE', 'THEFT', 'SUPPLIER_SHORT', 'CORRECTION'] as const;
+  for (const adj of body.adjustments) {
+    if (!adj.productId?.trim()) return c.json({ success: false, error: 'Each adjustment must have a productId' }, 400);
+    if (!Number.isInteger(adj.countedQuantity) || adj.countedQuantity < 0) {
+      return c.json({ success: false, error: 'countedQuantity must be a non-negative integer' }, 400);
+    }
+    if (!validReasons.includes(adj.reason as (typeof validReasons)[number])) {
+      return c.json({ success: false, error: `reason must be one of: ${validReasons.join(', ')}` }, 400);
+    }
+  }
+
+  const now = Date.now();
+  const logRows: object[] = [];
+
+  try {
+    for (const adj of body.adjustments) {
+      // Read current quantity
+      const product = await c.env.DB.prepare(
+        'SELECT id, quantity FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+      ).bind(adj.productId, tenantId).first<{ id: string; quantity: number }>();
+
+      if (!product) continue;
+
+      const previousQty = product.quantity;
+      const delta = adj.countedQuantity - previousQty;
+      const logId = `sadj_${now}_${crypto.randomUUID().slice(0, 8)}`;
+
+      await c.env.DB.batch([
+        c.env.DB.prepare(
+          'UPDATE products SET quantity = ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
+        ).bind(adj.countedQuantity, now, adj.productId, tenantId),
+        c.env.DB.prepare(
+          `INSERT INTO stock_adjustment_log (id, tenantId, productId, previousQty, newQty, delta, reason, sessionId, createdAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          logId, tenantId, adj.productId,
+          previousQty, adj.countedQuantity, delta,
+          adj.reason, body.sessionId ?? null,
+          new Date(now).toISOString(),
+        ),
+      ]);
+
+      logRows.push({ id: logId, productId: adj.productId, previousQty, newQty: adj.countedQuantity, delta, reason: adj.reason });
+
+      // Publish events (non-blocking)
+      const evtBase = { tenantId: tenantId!, sourceModule: 'pos' as const, timestamp: now };
+      publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_stk_${now}_${crypto.randomUUID().slice(0, 8)}`,
+        type: CommerceEvents.STOCK_ADJUSTED,
+        ...evtBase,
+        payload: { productId: adj.productId, previousQty, newQty: adj.countedQuantity, delta, reason: adj.reason, sessionId: body.sessionId ?? null },
+      }).catch(() => { /* non-fatal */ });
+
+      publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_inv_${now}_${crypto.randomUUID().slice(0, 8)}`,
+        type: CommerceEvents.INVENTORY_UPDATED,
+        ...evtBase,
+        payload: { productId: adj.productId, delta, reason: 'stock_take' },
+      }).catch(() => { /* non-fatal */ });
+    }
+
+    return c.json({ success: true, data: { adjusted: logRows.length, log: logRows } });
+  } catch (err) {
+    console.error('[POS] route error:', err);
+    return c.json({ success: false, error: 'Failed to process stock adjustments' }, 500);
   }
 });
 

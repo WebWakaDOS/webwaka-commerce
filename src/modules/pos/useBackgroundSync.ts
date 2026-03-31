@@ -79,6 +79,31 @@ async function flushPendingMutations(tenantId: string): Promise<SyncResult | nul
   }
 }
 
+/**
+ * Fetch top 200 POS customers from the server (ordered by lastPurchaseAt)
+ * and upsert them into the Dexie 'customers' table so the POS can do
+ * instant phone/name lookups even when offline.
+ * Called after every successful mutation flush.
+ */
+export async function syncCustomerCache(tenantId: string): Promise<void> {
+  try {
+    const res = await fetch('/api/pos/customers/top', {
+      headers: { 'x-tenant-id': tenantId },
+    });
+    if (!res.ok) return;
+
+    const json = (await res.json()) as { success: boolean; customers: unknown[] };
+    if (!json.success || !Array.isArray(json.customers)) return;
+
+    const { getCommerceDB } = await import('../../core/offline/db');
+    const db = getCommerceDB(tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await db.table('customers').bulkPut(json.customers as any[]);
+  } catch {
+    // Network or DB error — non-fatal; will retry on next sync cycle
+  }
+}
+
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 export function useBackgroundSync(
   tenantId: string,
@@ -94,9 +119,10 @@ export function useBackgroundSync(
       const result = await flushPendingMutations(tenantId);
       if (result && result.applied.length > 0) {
         onSynced?.(result);
-        // Seed the product cache after a successful flush so the POS is
-        // ready to serve customers even when they go offline afterward.
+        // Seed product and customer caches after a successful flush so the POS
+        // is ready to serve customers even when they go offline afterward.
         await syncProductCache(tenantId);
+        await syncCustomerCache(tenantId);
       }
     } finally {
       syncInProgress.current = false;

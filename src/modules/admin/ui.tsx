@@ -125,7 +125,114 @@ export const RetailAdminDashboard: React.FC<{ user: User; config: TenantConfig }
   );
 };
 
-export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantConfig }> = ({ user, config }) => {
+// ── Commission Management card (MV-E02) ─────────────────────────────────────
+
+interface CommissionRule {
+  id?: string;
+  vendorId?: string | null;
+  category?: string | null;
+  rateBps: number;
+  effectiveFrom?: string;
+  effectiveUntil?: string | null;
+}
+
+const CommissionManagement: React.FC<{ tenantId: string }> = ({ tenantId }) => {
+  const [rules, setRules] = useState<CommissionRule[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [form, setForm] = useState<{ vendorId: string; category: string; ratePct: string; effectiveFrom: string }>({
+    vendorId: '', category: '', ratePct: '10', effectiveFrom: new Date().toISOString().slice(0, 10),
+  });
+
+  const loadRules = () => {
+    setLoading(true);
+    fetch('/api/multi-vendor/admin/commission-rules', { headers: { 'x-tenant-id': tenantId } })
+      .then((r) => r.json() as Promise<{ success: boolean; data?: CommissionRule[] }>)
+      .then((j) => { if (j.success) setRules(j.data ?? []); })
+      .catch(() => setMsg('Failed to load rules.'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { loadRules(); }, []);
+
+  const handleAddRule = () => {
+    const rateBps = Math.round(parseFloat(form.ratePct) * 100);
+    if (isNaN(rateBps) || rateBps < 0 || rateBps > 10000) { setMsg('Rate must be 0–100%.'); return; }
+    setMsg(null);
+    fetch('/api/multi-vendor/admin/commission-rules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId },
+      body: JSON.stringify({
+        vendorId: form.vendorId.trim() || null,
+        category: form.category.trim() || null,
+        rateBps,
+        effectiveFrom: form.effectiveFrom,
+      }),
+    })
+      .then((r) => r.json() as Promise<{ success: boolean; error?: string }>)
+      .then((j) => {
+        if (j.success) { setMsg('✓ Rule saved.'); loadRules(); }
+        else setMsg(`Error: ${j.error ?? 'Unknown'}`);
+      })
+      .catch(() => setMsg('Network error.'));
+  };
+
+  return (
+    <div>
+      {msg && (
+        <div style={{ padding: '6px 10px', borderRadius: '4px', marginBottom: '10px', fontSize: '13px', background: msg.startsWith('✓') ? '#d1fae5' : '#fee2e2', color: msg.startsWith('✓') ? '#065f46' : '#dc2626' }}>
+          {msg}
+        </div>
+      )}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr auto', gap: '8px', marginBottom: '12px', alignItems: 'end' }}>
+        <div>
+          <label style={{ fontSize: '12px', color: '#64748b', display: 'block', marginBottom: '2px' }}>Vendor ID (optional)</label>
+          <input value={form.vendorId} onChange={(e) => setForm({ ...form, vendorId: e.target.value })} placeholder="All vendors" style={{ width: '100%', padding: '6px', border: '1px solid #e2e8f0', borderRadius: '4px', fontSize: '13px', boxSizing: 'border-box' }} />
+        </div>
+        <div>
+          <label style={{ fontSize: '12px', color: '#64748b', display: 'block', marginBottom: '2px' }}>Category (optional)</label>
+          <input value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} placeholder="All categories" style={{ width: '100%', padding: '6px', border: '1px solid #e2e8f0', borderRadius: '4px', fontSize: '13px', boxSizing: 'border-box' }} />
+        </div>
+        <div>
+          <label style={{ fontSize: '12px', color: '#64748b', display: 'block', marginBottom: '2px' }}>Rate (%)</label>
+          <input type="number" min={0} max={100} step={0.5} value={form.ratePct} onChange={(e) => setForm({ ...form, ratePct: e.target.value })} style={{ width: '100%', padding: '6px', border: '1px solid #e2e8f0', borderRadius: '4px', fontSize: '13px', boxSizing: 'border-box' }} />
+        </div>
+        <div>
+          <label style={{ fontSize: '12px', color: '#64748b', display: 'block', marginBottom: '2px' }}>Effective From</label>
+          <input type="date" value={form.effectiveFrom} onChange={(e) => setForm({ ...form, effectiveFrom: e.target.value })} style={{ width: '100%', padding: '6px', border: '1px solid #e2e8f0', borderRadius: '4px', fontSize: '13px', boxSizing: 'border-box' }} />
+        </div>
+        <Button primary onClick={handleAddRule}>Add Rule</Button>
+      </div>
+
+      {loading ? <p style={{ color: '#64748b', fontSize: '13px' }}>Loading rules…</p> : (
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+          <thead>
+            <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
+              {['Vendor', 'Category', 'Rate', 'Effective From', 'Until'].map((h) => (
+                <th key={h} style={{ padding: '6px 8px', textAlign: 'left' }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rules.length === 0 ? (
+              <tr><td colSpan={5} style={{ padding: '8px', color: '#94a3b8', textAlign: 'center' }}>No rules — default 10% applies.</td></tr>
+            ) : rules.map((r, i) => (
+              <tr key={r.id ?? i} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: '12px' }}>{r.vendorId ?? <span style={{ color: '#94a3b8' }}>All</span>}</td>
+                <td style={{ padding: '6px 8px' }}>{r.category ?? <span style={{ color: '#94a3b8' }}>All</span>}</td>
+                <td style={{ padding: '6px 8px', fontWeight: 600, color: '#2563eb' }}>{(r.rateBps / 100).toFixed(1)}%</td>
+                <td style={{ padding: '6px 8px', fontSize: '12px' }}>{r.effectiveFrom ?? '—'}</td>
+                <td style={{ padding: '6px 8px', fontSize: '12px', color: '#94a3b8' }}>{r.effectiveUntil ?? 'Open'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+};
+
+export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantConfig; tenantId?: string }> = ({ user, config, tenantId = 'default' }) => {
   return (
     <div style={{ padding: '20px', maxWidth: '800px', margin: '0 auto', fontFamily: 'system-ui, sans-serif' }}>
       <h2>Marketplace Owner Dashboard</h2>
@@ -169,6 +276,10 @@ export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantCon
             </tr>
           </tbody>
         </table>
+      </Card>
+
+      <Card title="Commission Management (MV-E02)">
+        <CommissionManagement tenantId={tenantId} />
       </Card>
     </div>
   );

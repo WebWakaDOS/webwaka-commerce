@@ -134,7 +134,7 @@ export interface SyncConflict {
   resolvedAt?: number;
 }
 
-// ─── Offline customer cache (P03) ────────────────────────────────────────────
+// ─── Offline customer cache (P03 / P07-E05) ──────────────────────────────────
 export interface OfflineCustomer {
   id: string;
   tenantId: string;
@@ -142,6 +142,7 @@ export interface OfflineCustomer {
   email?: string;
   name?: string;
   creditBalanceKobo?: number;
+  loyaltyPoints?: number;
   updatedAt: number;
 }
 

@@ -20,6 +20,12 @@ interface MvCartItem extends MvProduct {
   cartQuantity: number;
 }
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+interface LedgerEntry {
+  id: string; type: string; amountKobo: number; balanceKobo: number;
+  reference: string; description: string; orderId: string | null; createdAt: string;
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export const MarketplaceInterface: React.FC<{
@@ -350,6 +356,187 @@ export const MarketplaceInterface: React.FC<{
           </div>
         )}
       </main>
+    </div>
+  );
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MV-E04: VendorLedger — Vendor's transaction history + payout dashboard
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * VendorLedger: displays paginated ledger entries, available balance,
+ * and allows payout request (requires vendor Bearer token in Authorization header).
+ */
+export const VendorLedger: React.FC<{
+  marketplaceId: string;
+  vendorToken: string;
+}> = ({ marketplaceId, vendorToken }) => {
+  const tenantId = marketplaceId;
+  const [entries, setEntries] = useState<LedgerEntry[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [availableKobo, setAvailableKobo] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [payoutLoading, setPayoutLoading] = useState(false);
+
+  const LIMIT = 20;
+
+  const headers = useCallback(() => ({
+    'x-tenant-id': tenantId,
+    Authorization: `Bearer ${vendorToken}`,
+  }), [tenantId, vendorToken]);
+
+  const loadBalance = useCallback(async () => {
+    try {
+      const res = await fetch('/api/multi-vendor/vendor/balance', { headers: headers() });
+      if (!res.ok) return;
+      const json = await res.json() as { success: boolean; data?: { availableKobo: number } };
+      if (json.success) setAvailableKobo(json.data?.availableKobo ?? 0);
+    } catch { /* ignore */ }
+  }, [headers]);
+
+  const loadLedger = useCallback(async (p: number) => {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/multi-vendor/vendor/ledger?page=${p}&limit=${LIMIT}`, { headers: headers() });
+      if (!res.ok) throw new Error('Failed to load ledger');
+      const json = await res.json() as { success: boolean; data?: { entries: LedgerEntry[]; total: number; page: number } };
+      if (json.success) {
+        setEntries(json.data?.entries ?? []);
+        setTotal(json.data?.total ?? 0);
+        setPage(json.data?.page ?? p);
+      }
+    } catch {
+      setMsg('Could not load ledger.');
+    } finally {
+      setLoading(false);
+    }
+  }, [headers]);
+
+  useEffect(() => {
+    loadLedger(1);
+    loadBalance();
+  }, [loadLedger, loadBalance]);
+
+  const handlePayoutRequest = async () => {
+    if (!window.confirm(`Request payout of ₦${((availableKobo ?? 0) / 100).toFixed(2)}?`)) return;
+    setPayoutLoading(true);
+    setMsg(null);
+    try {
+      const res = await fetch('/api/multi-vendor/vendor/payout-request', {
+        method: 'POST',
+        headers: { ...headers(), 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const json = await res.json() as { success: boolean; data?: { payoutReference: string; availableKobo: number }; error?: string };
+      if (json.success) {
+        setMsg(`✓ Payout requested. Reference: ${json.data?.payoutReference}`);
+        await loadBalance();
+        await loadLedger(1);
+      } else {
+        setMsg(`Error: ${json.error ?? 'Unknown error'}`);
+      }
+    } catch {
+      setMsg('Network error — please try again.');
+    } finally {
+      setPayoutLoading(false);
+    }
+  };
+
+  const totalPages = Math.ceil(total / LIMIT);
+
+  const typeColor = (type: string) => {
+    if (type === 'SALE') return '#16a34a';
+    if (type === 'COMMISSION') return '#dc2626';
+    if (type === 'PAYOUT') return '#2563eb';
+    if (type === 'REFUND') return '#f59e0b';
+    return '#374151';
+  };
+
+  return (
+    <div style={{ fontFamily: 'sans-serif', maxWidth: '900px', margin: '0 auto', padding: '1rem' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.75rem' }}>
+        <h2 style={{ margin: 0, fontSize: '1.2rem', color: '#111827' }}>Vendor Ledger</h2>
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          {availableKobo !== null && (
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: '0.72rem', color: '#6b7280' }}>Available Balance</div>
+              <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#16a34a' }}>₦{(availableKobo / 100).toFixed(2)}</div>
+            </div>
+          )}
+          <button
+            onClick={handlePayoutRequest}
+            disabled={payoutLoading || (availableKobo ?? 0) < 500_000}
+            title={availableKobo !== null && availableKobo < 500_000 ? 'Minimum payout is ₦5,000' : 'Request payout'}
+            style={{
+              padding: '0.5rem 1rem', background: payoutLoading || (availableKobo ?? 0) < 500_000 ? '#d1d5db' : '#16a34a',
+              color: '#fff', border: 'none', borderRadius: '6px', cursor: payoutLoading || (availableKobo ?? 0) < 500_000 ? 'not-allowed' : 'pointer',
+              fontWeight: 600, fontSize: '0.85rem',
+            }}
+          >
+            {payoutLoading ? 'Processing…' : 'Request Payout'}
+          </button>
+        </div>
+      </div>
+
+      {msg && (
+        <div role="alert" style={{ padding: '0.5rem 0.75rem', borderRadius: '6px', marginBottom: '0.75rem', fontSize: '0.85rem', background: msg.startsWith('✓') ? '#d1fae5' : '#fee2e2', color: msg.startsWith('✓') ? '#065f46' : '#dc2626' }}>
+          {msg}
+        </div>
+      )}
+
+      {loading ? (
+        <p style={{ textAlign: 'center', color: '#6b7280', padding: '2rem' }}>Loading ledger…</p>
+      ) : entries.length === 0 ? (
+        <p style={{ textAlign: 'center', color: '#6b7280', padding: '2rem' }}>No transactions yet.</p>
+      ) : (
+        <>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+            <thead>
+              <tr style={{ background: '#f9fafb' }}>
+                {['Type', 'Amount', 'Balance', 'Order', 'Description', 'Date'].map((h) => (
+                  <th key={h} style={{ padding: '0.5rem 0.75rem', textAlign: 'left', borderBottom: '2px solid #e5e7eb', fontWeight: 600, color: '#374151', whiteSpace: 'nowrap' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((e) => (
+                <tr key={e.id} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                  <td style={{ padding: '0.5rem 0.75rem' }}>
+                    <span style={{ background: '#f3f4f6', color: typeColor(e.type), padding: '0.1rem 0.4rem', borderRadius: '4px', fontWeight: 600, fontSize: '0.72rem' }}>{e.type}</span>
+                  </td>
+                  <td style={{ padding: '0.5rem 0.75rem', fontWeight: 600, color: typeColor(e.type) }}>
+                    {['COMMISSION', 'PAYOUT', 'REFUND'].includes(e.type) ? '−' : '+'}₦{(e.amountKobo / 100).toFixed(2)}
+                  </td>
+                  <td style={{ padding: '0.5rem 0.75rem', color: '#374151' }}>₦{(e.balanceKobo / 100).toFixed(2)}</td>
+                  <td style={{ padding: '0.5rem 0.75rem', fontFamily: 'monospace', fontSize: '0.72rem', color: '#6b7280', maxWidth: '100px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {e.orderId ? e.orderId.slice(0, 14) + '…' : '—'}
+                  </td>
+                  <td style={{ padding: '0.5rem 0.75rem', color: '#374151', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={e.description}>{e.description}</td>
+                  <td style={{ padding: '0.5rem 0.75rem', color: '#6b7280', whiteSpace: 'nowrap', fontSize: '0.75rem' }}>
+                    {new Date(e.createdAt).toLocaleString('en-NG')}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div style={{ display: 'flex', justifyContent: 'center', gap: '0.5rem', padding: '1rem', alignItems: 'center' }}>
+              <button onClick={() => { loadLedger(page - 1); }} disabled={page <= 1} style={{ padding: '0.3rem 0.6rem', border: '1px solid #d1d5db', borderRadius: '4px', cursor: page <= 1 ? 'not-allowed' : 'pointer', background: '#fff' }}>
+                ← Prev
+              </button>
+              <span style={{ fontSize: '0.82rem', color: '#6b7280' }}>Page {page} of {totalPages} ({total} entries)</span>
+              <button onClick={() => { loadLedger(page + 1); }} disabled={page >= totalPages} style={{ padding: '0.3rem 0.6rem', border: '1px solid #d1d5db', borderRadius: '4px', cursor: page >= totalPages ? 'not-allowed' : 'pointer', background: '#fff' }}>
+                Next →
+              </button>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 };

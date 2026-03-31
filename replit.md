@@ -303,3 +303,45 @@ See `.env.example` for reference:
 - **`src/modules/multi-vendor/api.ts`**: Same wrapper; all 5 call-sites updated: 2× OTP (`rl:otp:{e164}`), 1× checkout (`rl:checkout:{identity}`), 2× search (`rl:search:{ip}`). `_resetOtpRateLimitStore`, `_resetCheckoutRateLimitStore`, `_resetSearchRateLimitStore` preserved.
 
 **Test count: 801 passing (unchanged)**
+
+---
+
+## Phase 7 — Returns, Stock Take, Commission Engine, Vendor Ledger (session March 31 2026)
+
+### T001 — Migration 0006_returns.sql (previously completed)
+- `order_returns` table, `stock_adjustment_log` table, `cashier_id` on orders, defensive `ALTER TABLE` for loyalty/credit columns.
+
+### T002 — pos/api.ts additions
+- **`GET /api/pos/customers/top`**: Returns top 200 customers by `lastPurchaseAt` for Dexie seeding.
+- **`POST /api/pos/orders/:id/return`**: Partial return — validates order status (DELIVERED/COMPLETED), checks quantities ≤ original, restores stock, optionally credits `creditBalanceKobo`, inserts `order_returns` record, publishes `INVENTORY_UPDATED` events.
+- **`POST /api/pos/stock-adjustments`**: Admin-only stock take — reasons: DAMAGE/THEFT/SUPPLIER_SHORT/CORRECTION, logs to `stock_adjustment_log`, publishes `STOCK_ADJUSTED` + `INVENTORY_UPDATED` events.
+- **`PATCH /sessions/:id/close`**: Now includes `cashier_breakdown` (GROUP BY cashier_id) in Z-report JSON.
+- **`POST /checkout`**: Resolves and writes `cashier_id` from the open session (lookup by `session_id`).
+- All new routes use `[POS] route error:` logging prefix.
+
+### T003 — useBackgroundSync.ts + offline/db.ts (previously completed)
+- `OfflineCustomer.loyaltyPoints` field, `syncCustomerCache()` seeds top 200 customers into Dexie after each flush.
+
+### T004 — pos/ui.tsx
+- **Dexie-first customer lookup**: Checks `db.customers` by phone first (works offline), falls back to API.
+- **Recent Orders screen** (`screen === 'orders'`): Paginated table of last 30 orders from `GET /api/pos/orders/recent`. Inline return flow — select order → choose CASH/STORE_CREDIT/EXCHANGE → set quantities → submit to `POST /orders/:id/return`.
+- **Stock Take screen** (`screen === 'stock-take'`): Admin-only table of current products with counted-qty inputs + reason dropdown. Submits only changed rows to `POST /api/pos/stock-adjustments`.
+- Header navigation: Orders tab + Dashboard tab + Stock Take tab (admin-only), all with active-state highlight.
+
+### T005 — multi-vendor/api.ts
+- **`resolveCommissionRate()`**: 4-level priority cascade — (1) vendor-specific `commission_rules` row, (2) category-wide rule, (3) vendor's own `commission_rate` field, (4) platform default 1000 bps (10%). Used in checkout vendor loop.
+- **Vendor ledger entries**: After each child order + settlement write in checkout, inserts `SALE` and `COMMISSION` entries into `vendor_ledger_entries` (running balance). Non-fatal try/catch.
+- **`GET /admin/commission-rules`**: Admin-only list of all rules for tenant (ordered by effectiveFrom DESC).
+- **`POST /admin/commission-rules`**: Admin-only create rule — validates `rateBps` 0–10000, inserts into `commission_rules`.
+- **`GET /vendor/balance`**: Authenticated vendor — computes available balance from ledger SUM.
+- **`GET /vendor/ledger`**: Authenticated vendor — paginated ledger (default 20/page, max 100).
+- **`POST /vendor/payout-request`**: Authenticated vendor — min ₦5,000 balance; writes `PAYOUT` ledger entry; optionally initiates Paystack transfer if `PAYSTACK_SECRET` + `recipient_code` configured.
+
+### T006 — admin/ui.tsx
+- **`CommissionManagement`** component: Loads rules from `/api/multi-vendor/admin/commission-rules`, form to add rule (vendorId, category, rate%, effectiveFrom), table displaying all rules.
+- **`MarketplaceAdminDashboard`**: Now accepts optional `tenantId` prop; includes `CommissionManagement` card.
+
+### T007 — multi-vendor/ui.tsx
+- **`VendorLedger`** component: Takes `marketplaceId` + `vendorToken` props. Loads balance + paginated ledger on mount. Colour-coded entry types (SALE=green, COMMISSION=red, PAYOUT=blue). Request Payout button (disabled below ₦5,000 minimum). Pagination controls.
+
+**Test count: 801/801 passing, TypeScript clean**

@@ -55,6 +55,54 @@ async function kvCheckRL(
   return checkRateLimit(store, key, maxRequests, windowMs);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// MV-E02: COMMISSION ENGINE — Tiered, per-vendor, per-category rules
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve the effective commission rate (basis points) for a given vendor/category.
+ * Priority: 1) vendor+date match → 2) category+date match → 3) default 1000 bps (10%)
+ * Uses `commission_rules` from migration 0003 (columns: tenantId, vendorId, category,
+ * rateBps, effectiveFrom, effectiveUntil).
+ */
+async function resolveCommissionRate(
+  db: D1Database,
+  tenantId: string,
+  vendorId: string,
+  category: string | null,
+  vendorDefaultBps?: number,
+): Promise<number> {
+  const now = new Date().toISOString();
+
+  // 1. Vendor-specific rule from commission_rules table
+  const vendorRule = await db.prepare(
+    `SELECT rateBps FROM commission_rules
+     WHERE tenantId = ? AND vendorId = ?
+       AND (effectiveUntil IS NULL OR effectiveUntil > ?)
+     ORDER BY effectiveFrom DESC LIMIT 1`,
+  ).bind(tenantId, vendorId, now).first<{ rateBps: number }>();
+
+  if (vendorRule?.rateBps != null) return vendorRule.rateBps;
+
+  // 2. Category-wide rule (no vendorId restriction)
+  if (category) {
+    const catRule = await db.prepare(
+      `SELECT rateBps FROM commission_rules
+       WHERE tenantId = ? AND category = ? AND vendorId IS NULL
+         AND (effectiveUntil IS NULL OR effectiveUntil > ?)
+       ORDER BY effectiveFrom DESC LIMIT 1`,
+    ).bind(tenantId, category, now).first<{ rateBps: number }>();
+
+    if (catRule?.rateBps != null) return catRule.rateBps;
+  }
+
+  // 3. Vendor's own commission_rate field (backward-compat with vendors table)
+  if (vendorDefaultBps != null) return vendorDefaultBps;
+
+  // 4. Platform-wide default: 10% (1000 bps)
+  return 1000;
+}
+
 // ── Crypto helpers (same pattern as COM-2 Single-Vendor) ──────────────────────
 
 /** SHA-256 hex digest of OTP string */
@@ -853,11 +901,14 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         'SELECT commission_rate, name, pickupAddress FROM vendors WHERE id = ? AND marketplace_tenant_id = ?'
       ).bind(vendorId, tenantId).first<{ commission_rate: number; name?: string; pickupAddress?: string }>();
 
-      const commissionRate = vendorRow?.commission_rate ?? 1000;
-      const commission = Math.round(group.subtotal * commissionRate / 10000);
-      const payout = group.subtotal - commission;
+      // MV-E02: Resolve commission via rule engine (vendor/category/vendors.commission_rate/default cascade)
+      const firstItemCategory: string | null = (group.items[0] as { category?: string | null } | undefined)?.category ?? null;
+      const vendorDefaultBps = vendorRow?.commission_rate ?? undefined;
+      const rateBps = await resolveCommissionRate(c.env.DB, tenantId!, vendorId, firstItemCategory, vendorDefaultBps);
+      const commissionKobo = Math.round(group.subtotal * rateBps / 10000);
+      const payout = group.subtotal - commissionKobo;
       breakdownMap[vendorId] = {
-        vendor_id: vendorId, subtotal: group.subtotal, commission, payout, commission_rate: commissionRate,
+        vendor_id: vendorId, subtotal: group.subtotal, commission: commissionKobo, payout, commission_rate: rateBps,
         vendorName: vendorRow?.name ?? vendorId,
         ...(vendorRow?.pickupAddress ? { vendorPickupAddress: vendorRow.pickupAddress } : {}),
       };
@@ -945,6 +996,43 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       bd.settlement_id = stlId;
       bd.hold_until = holdUntil;
       bd.hold_days = holdDays;
+
+      // ── MV-E04: Vendor ledger entries (SALE + COMMISSION) ─────────────────
+      // Running balance: read last entry, then apply delta
+      try {
+        const lastEntry = await c.env.DB.prepare(
+          `SELECT balanceKobo FROM vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
+        ).bind(vendorId, tenantId).first<{ balanceKobo: number }>();
+        const prevBalance = lastEntry?.balanceKobo ?? 0;
+
+        // SALE entry: vendor receives (subtotal - commission)
+        const saleEntryId = `vle_sale_${now}_${Math.random().toString(36).slice(2, 9)}`;
+        const balanceAfterSale = prevBalance + bd.payout;
+        await c.env.DB.prepare(
+          `INSERT INTO vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+           VALUES (?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          saleEntryId, tenantId, vendorId,
+          bd.payout, balanceAfterSale, paymentRef,
+          `Sale proceeds for order ${childId} (umbrella: ${mkpOrderId})`,
+          childId, new Date(now).toISOString(),
+        ).run();
+
+        // COMMISSION entry: marketplace deducts commission
+        const commEntryId = `vle_comm_${now}_${Math.random().toString(36).slice(2, 9)}`;
+        const balanceAfterComm = balanceAfterSale - bd.commission;
+        await c.env.DB.prepare(
+          `INSERT INTO vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+           VALUES (?, ?, ?, 'COMMISSION', ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          commEntryId, tenantId, vendorId,
+          bd.commission, balanceAfterComm, paymentRef,
+          `Commission (${bd.commission_rate / 100}%) for order ${childId}`,
+          childId, new Date(now + 1).toISOString(),
+        ).run();
+      } catch (ledgerErr) {
+        console.warn('[MV][checkout] vendor_ledger_entries write failed (non-fatal):', ledgerErr);
+      }
 
       // ── Publish per-vendor delivery request ──────────────────────────────
       const vendorName = bd.vendorName ?? vendorId;
@@ -2265,6 +2353,228 @@ app.get('/search', async (c) => {
       }
     }
     console.error('[MV][search] error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-E02: ADMIN COMMISSION RULES CRUD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /admin/commission-rules — List all commission rules for a tenant (admin only)
+ */
+app.get('/admin/commission-rules', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, tenantId, vendorId, category, rateBps, effectiveFrom, effectiveUntil, createdAt
+       FROM commission_rules WHERE tenantId = ? ORDER BY effectiveFrom DESC`,
+    ).bind(tenantId).all();
+    return c.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /admin/commission-rules — Create a commission rule (admin only)
+ */
+app.post('/admin/commission-rules', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const body = await c.req.json<{
+    vendorId?: string | null; category?: string | null;
+    rateBps: number; effectiveFrom?: string; effectiveUntil?: string | null;
+  }>();
+
+  if (typeof body.rateBps !== 'number' || body.rateBps < 0 || body.rateBps > 10000) {
+    return c.json({ success: false, error: 'rateBps must be between 0 and 10000' }, 400);
+  }
+
+  const id = `cr_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const now = new Date().toISOString();
+  const effectiveFrom = body.effectiveFrom ?? now.slice(0, 10);
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO commission_rules (id, tenantId, vendorId, category, rateBps, effectiveFrom, effectiveUntil, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id, tenantId,
+      body.vendorId ?? null, body.category ?? null,
+      body.rateBps, effectiveFrom,
+      body.effectiveUntil ?? null, now,
+    ).run();
+    return c.json({ success: true, data: { id, rateBps: body.rateBps, effectiveFrom } }, 201);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-E04: VENDOR LEDGER & PAYOUT DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /vendor/ledger?page=&limit= — Paginated ledger for authenticated vendor (MV-E04)
+ */
+app.get('/vendor/ledger', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  if (vendor.tenantId !== tenantId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  const page = Math.max(1, parseInt(c.req.query('page') ?? '1', 10));
+  const limit = Math.min(100, parseInt(c.req.query('limit') ?? '20', 10));
+  const offset = (page - 1) * limit;
+
+  try {
+    const countRow = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM vendor_ledger_entries WHERE vendorId = ? AND tenantId = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ total: number }>();
+    const total = countRow?.total ?? 0;
+
+    const { results: entries } = await c.env.DB.prepare(
+      `SELECT id, type, amountKobo, balanceKobo, reference, description, orderId, createdAt
+       FROM vendor_ledger_entries
+       WHERE vendorId = ? AND tenantId = ?
+       ORDER BY createdAt DESC
+       LIMIT ? OFFSET ?`,
+    ).bind(vendor.vendorId, tenantId, limit, offset).all();
+
+    return c.json({ success: true, data: { entries, total, page, limit } });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /vendor/balance — Available balance for authenticated vendor (MV-E04)
+ */
+app.get('/vendor/balance', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  if (vendor.tenantId !== tenantId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  try {
+    const row = await c.env.DB.prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'SALE' THEN amountKobo ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN type IN ('COMMISSION', 'PAYOUT', 'REFUND') THEN amountKobo ELSE 0 END), 0)
+         AS availableKobo
+       FROM vendor_ledger_entries
+       WHERE vendorId = ? AND tenantId = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ availableKobo: number }>();
+
+    return c.json({ success: true, data: { availableKobo: row?.availableKobo ?? 0, pendingClearanceKobo: 0 } });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /vendor/payout-request — Request payout of available balance (MV-E04)
+ * Minimum ₦5,000 (500,000 kobo). Writes a PAYOUT ledger entry.
+ */
+app.post('/vendor/payout-request', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  if (vendor.tenantId !== tenantId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  const MINIMUM_PAYOUT_KOBO = 500_000; // ₦5,000
+
+  const now = Date.now();
+
+  try {
+    // Compute available balance
+    const balRow = await c.env.DB.prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'SALE' THEN amountKobo ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN type IN ('COMMISSION', 'PAYOUT', 'REFUND') THEN amountKobo ELSE 0 END), 0)
+         AS availableKobo
+       FROM vendor_ledger_entries
+       WHERE vendorId = ? AND tenantId = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ availableKobo: number }>();
+
+    const availableKobo = balRow?.availableKobo ?? 0;
+
+    if (availableKobo < MINIMUM_PAYOUT_KOBO) {
+      return c.json({
+        success: false,
+        error: `Insufficient balance. Minimum payout is ₦${(MINIMUM_PAYOUT_KOBO / 100).toFixed(2)}. Available: ₦${(availableKobo / 100).toFixed(2)}.`,
+        availableKobo,
+        minimumKobo: MINIMUM_PAYOUT_KOBO,
+      }, 422);
+    }
+
+    // Fetch vendor bank details
+    const vendorRow = await c.env.DB.prepare(
+      `SELECT bank_details_json FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ bank_details_json: string | null }>();
+
+    const bankDetails = vendorRow?.bank_details_json
+      ? (() => { try { return JSON.parse(vendorRow.bank_details_json); } catch { return null; } })()
+      : null;
+    const recipientCode = (bankDetails as Record<string, unknown> | null)?.recipient_code as string | undefined;
+
+    const payoutReference = `payout_${now}_${Math.random().toString(36).slice(2, 9)}`;
+    let transferCode: string | null = null;
+
+    // Initiate Paystack transfer if secret and recipient code are configured
+    if (c.env.PAYSTACK_SECRET && recipientCode) {
+      try {
+        const { createPaymentProvider } = await import('@webwaka/core');
+        const provider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+        const transferResult = await provider.initiateTransfer(
+          recipientCode,
+          availableKobo,
+          payoutReference,
+        );
+        transferCode = (transferResult as Record<string, unknown>)?.transfer_code as string ?? null;
+      } catch (transferErr) {
+        console.warn('[MV][payout] Paystack transfer initiation failed:', transferErr);
+      }
+    }
+
+    // Write PAYOUT ledger entry
+    const lastEntry = await c.env.DB.prepare(
+      `SELECT balanceKobo FROM vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
+    ).bind(vendor.vendorId, tenantId).first<{ balanceKobo: number }>();
+    const prevBalance = lastEntry?.balanceKobo ?? 0;
+    const newBalance = prevBalance - availableKobo;
+
+    const payoutEntryId = `vle_payout_${now}_${Math.random().toString(36).slice(2, 9)}`;
+    await c.env.DB.prepare(
+      `INSERT INTO vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+       VALUES (?, ?, ?, 'PAYOUT', ?, ?, ?, ?, NULL, ?)`,
+    ).bind(
+      payoutEntryId, tenantId, vendor.vendorId,
+      availableKobo, newBalance, payoutReference,
+      `Payout of ₦${(availableKobo / 100).toFixed(2)}${transferCode ? ` (transfer: ${transferCode})` : ''}`,
+      new Date(now).toISOString(),
+    ).run();
+
+    return c.json({
+      success: true,
+      data: { payoutReference, transferCode, availableKobo, newBalance },
+    }, 201);
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });

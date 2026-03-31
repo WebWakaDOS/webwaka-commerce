@@ -9,8 +9,8 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import type { CartItem } from './core';
 import { useOfflineCart } from './useOfflineCart';
 import { useBackgroundSync } from './useBackgroundSync';
-import { holdCart, getHeldCarts, restoreHeldCart } from '../../core/offline/db';
-import type { HeldCart } from '../../core/offline/db';
+import { holdCart, getHeldCarts, restoreHeldCart, getCommerceDB } from '../../core/offline/db';
+import type { HeldCart, OfflineCustomer } from '../../core/offline/db';
 import { RequireRole } from '../../components/RequireRole';
 import { useUserContext } from '../../contexts/UserContext';
 
@@ -271,7 +271,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
   // ── Phase 5: Active session / shift ──────────────────────────────────────
   const [activeSession, setActiveSession] = useState<PosSession | null | undefined>(undefined);
-  const [screen, setScreen] = useState<'pos' | 'dashboard'>('pos');
+  const [screen, setScreen] = useState<'pos' | 'dashboard' | 'orders' | 'stock-take'>('pos');
   const [shiftCashierId, setShiftCashierId] = useState('');
   const [shiftCashierName, setShiftCashierName] = useState('');
   const [shiftFloat, setShiftFloat] = useState('');
@@ -285,6 +285,23 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [cameraOpen, setCameraOpen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+
+  // ── Phase 7 (P07): Stock-take modal ──────────────────────────────────────
+  interface StockTakeRow { productId: string; productName: string; systemQty: number; countedQty: string; reason: string }
+  const [stockTakeRows, setStockTakeRows] = useState<StockTakeRow[]>([]);
+  const [stockTakeSubmitting, setStockTakeSubmitting] = useState(false);
+  const [stockTakeMsg, setStockTakeMsg] = useState<string | null>(null);
+
+  // ── Phase 7 (P07): Recent Orders tab ─────────────────────────────────────
+  interface RecentOrder { id: string; order_status: string; total_amount: number; payment_method: string; created_at: string | number; customer_phone?: string; items_json?: string }
+  const [recentOrders, setRecentOrders] = useState<RecentOrder[]>([]);
+  const [recentOrdersLoading, setRecentOrdersLoading] = useState(false);
+  const [recentOrdersError, setRecentOrdersError] = useState<string | null>(null);
+  const [returnOrderId, setReturnOrderId] = useState<string | null>(null);
+  const [returnItems, setReturnItems] = useState<Array<{ productId: string; quantity: number }>>([]);
+  const [returnMethod, setReturnMethod] = useState<'CASH' | 'STORE_CREDIT' | 'EXCHANGE'>('STORE_CREDIT');
+  const [returnMsg, setReturnMsg] = useState<string | null>(null);
+  const [returnSubmitting, setReturnSubmitting] = useState(false);
 
   // ── Phase 6 (P06): Cashier PIN + inactivity lock ─────────────────────────
   const [pinMode, setPinMode] = useState<'open-shift' | 'inactivity' | null>(null);
@@ -495,12 +512,26 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     [setCart, removeFromCart],
   );
 
-  // ── Phase 4: Customer lookup ──────────────────────────────────────────────
+  // ── Phase 4: Customer lookup (P07: Dexie-first, API fallback) ───────────
   const handleCustomerLookup = useCallback(async () => {
     const phone = customerPhone.trim();
     if (!phone) return;
     setCustomerSearching(true);
     try {
+      // 1. Check Dexie cache first (works fully offline)
+      const db = getCommerceDB(tenantId);
+      const offlineMatch: OfflineCustomer | undefined = await db.customers
+        .where('phone').equals(phone)
+        .and((c: OfflineCustomer) => c.tenantId === tenantId)
+        .first();
+      if (offlineMatch) {
+        setCustomerId(offlineMatch.id);
+        setCustomerName(`${offlineMatch.name} (${offlineMatch.loyaltyPoints ?? 0} pts)`);
+        setCustomerSearching(false);
+        return;
+      }
+
+      // 2. Fallback: network API call
       const res = await fetch(`/api/pos/customers/lookup?phone=${encodeURIComponent(phone)}`, {
         headers: { 'x-tenant-id': tenantId },
       });
@@ -514,10 +545,102 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         setCustomerName('Not found — will create on checkout');
         setCustomerId(null);
       }
-    } catch { /* offline */ } finally {
+    } catch { /* offline — Dexie already handled it above */ } finally {
       setCustomerSearching(false);
     }
   }, [customerPhone, tenantId]);
+
+  // ── P07: Load products into StockTake rows ───────────────────────────────
+  const openStockTake = useCallback(() => {
+    const rows = products.slice(0, 20).map((p) => ({
+      productId: p.id,
+      productName: p.name,
+      systemQty: p.quantity,
+      countedQty: String(p.quantity),
+      reason: 'CORRECTION',
+    }));
+    setStockTakeRows(rows);
+    setStockTakeMsg(null);
+    setScreen('stock-take');
+  }, [products]);
+
+  const handleStockTakeSubmit = useCallback(async () => {
+    setStockTakeSubmitting(true);
+    setStockTakeMsg(null);
+    const adjustments = stockTakeRows
+      .filter((r) => parseInt(r.countedQty, 10) !== r.systemQty)
+      .map((r) => ({ productId: r.productId, countedQuantity: parseInt(r.countedQty, 10) || 0, reason: r.reason }));
+    if (adjustments.length === 0) {
+      setStockTakeMsg('No changes detected.');
+      setStockTakeSubmitting(false);
+      return;
+    }
+    try {
+      const res = await fetch('/api/pos/stock-adjustments', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({ adjustments }),
+      });
+      const json = await res.json() as { success: boolean; data?: { adjusted: number }; error?: string };
+      if (json.success) {
+        setStockTakeMsg(`✓ ${json.data?.adjusted ?? adjustments.length} adjustment(s) saved.`);
+      } else {
+        setStockTakeMsg(`Error: ${json.error ?? 'Unknown error'}`);
+      }
+    } catch {
+      setStockTakeMsg('Network error — please try again.');
+    } finally {
+      setStockTakeSubmitting(false);
+    }
+  }, [stockTakeRows, tenantId]);
+
+  // ── P07: Load recent orders ───────────────────────────────────────────────
+  const loadRecentOrders = useCallback(async () => {
+    setRecentOrdersLoading(true);
+    setRecentOrdersError(null);
+    try {
+      const res = await fetch('/api/pos/orders/recent?limit=30', {
+        headers: { 'x-tenant-id': tenantId },
+      });
+      if (!res.ok) throw new Error('Failed to load orders');
+      const json = await res.json() as { success: boolean; data?: RecentOrder[] };
+      if (json.success) setRecentOrders(json.data ?? []);
+    } catch {
+      setRecentOrdersError('Could not load recent orders.');
+    } finally {
+      setRecentOrdersLoading(false);
+    }
+  }, [tenantId]);
+
+  useEffect(() => {
+    if (screen === 'orders') loadRecentOrders();
+  }, [screen, loadRecentOrders]);
+
+  const handleReturnSubmit = useCallback(async () => {
+    if (!returnOrderId || returnItems.length === 0) return;
+    setReturnSubmitting(true);
+    setReturnMsg(null);
+    try {
+      const res = await fetch(`/api/pos/orders/${encodeURIComponent(returnOrderId)}/return`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({ items: returnItems, returnMethod }),
+      });
+      const json = await res.json() as { success: boolean; data?: { returnId: string; creditAmountKobo: number; returnMethod: string }; error?: string };
+      if (json.success) {
+        setReturnMsg(`✓ Return processed. ${json.data?.returnMethod === 'STORE_CREDIT' ? `Credit: ₦${((json.data?.creditAmountKobo ?? 0) / 100).toFixed(2)}` : `Method: ${json.data?.returnMethod}`}`);
+        setReturnOrderId(null);
+        setReturnItems([]);
+        loadRecentOrders();
+      } else {
+        setReturnMsg(`Error: ${json.error ?? 'Unknown error'}`);
+      }
+    } catch {
+      setReturnMsg('Network error — please try again.');
+    } finally {
+      setReturnSubmitting(false);
+    }
+  }, [returnOrderId, returnItems, returnMethod, tenantId, loadRecentOrders]);
 
   // ── Phase 4: Hold / park current cart ─────────────────────────────────────
   const handleHoldCart = useCallback(async () => {
@@ -1000,6 +1123,189 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           >
             {shiftLoading ? 'Opening…' : 'Open Shift'}
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── P07: Recent Orders screen ────────────────────────────────────────────
+  if (screen === 'orders') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
+        <header style={{ padding: '0.75rem 1rem', backgroundColor: '#000', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <h1 style={{ margin: 0, fontSize: '1rem' }}>WebWaka POS — Recent Orders</h1>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: '0.5rem' }}>
+            <button onClick={loadRecentOrders} style={{ padding: '0.3rem 0.6rem', background: '#374151', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.78rem' }}>
+              ↻ Refresh
+            </button>
+            <button onClick={() => setScreen('pos')} style={{ padding: '0.35rem 0.75rem', background: '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}>
+              ← Back to POS
+            </button>
+          </div>
+        </header>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
+          {returnMsg && (
+            <div role="alert" style={{ background: returnMsg.startsWith('✓') ? '#d1fae5' : '#fee2e2', color: returnMsg.startsWith('✓') ? '#065f46' : '#dc2626', padding: '0.5rem 0.75rem', borderRadius: '6px', marginBottom: '0.75rem', fontSize: '0.85rem' }}>
+              {returnMsg}
+            </div>
+          )}
+
+          {/* Return initiation form */}
+          {returnOrderId && (
+            <div style={{ background: '#fff', border: '1px solid #d1d5db', borderRadius: '8px', padding: '1rem', marginBottom: '1rem' }}>
+              <h3 style={{ marginTop: 0, fontSize: '0.9rem' }}>Process Return for {returnOrderId}</h3>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.75rem' }}>
+                {(['CASH', 'STORE_CREDIT', 'EXCHANGE'] as const).map((m) => (
+                  <button key={m} onClick={() => setReturnMethod(m)}
+                    style={{ padding: '0.3rem 0.6rem', background: returnMethod === m ? '#1d4ed8' : '#f3f4f6', color: returnMethod === m ? '#fff' : '#374151', border: '1px solid #d1d5db', borderRadius: '4px', cursor: 'pointer', fontSize: '0.78rem' }}>
+                    {m.replace('_', ' ')}
+                  </button>
+                ))}
+              </div>
+              {returnItems.length > 0 && (
+                <div style={{ marginBottom: '0.5rem', fontSize: '0.8rem', color: '#374151' }}>
+                  {returnItems.map((ri, idx) => (
+                    <div key={idx} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginBottom: '0.25rem' }}>
+                      <span style={{ flex: 1 }}>{ri.productId}</span>
+                      <input type="number" min={1} value={ri.quantity} onChange={(e) => setReturnItems((prev) => prev.map((r, i) => i === idx ? { ...r, quantity: parseInt(e.target.value, 10) || 1 } : r))}
+                        style={{ width: '60px', padding: '0.2rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.78rem' }} />
+                      <button onClick={() => setReturnItems((prev) => prev.filter((_, i) => i !== idx))} style={{ background: 'none', border: 'none', color: '#dc2626', cursor: 'pointer', fontSize: '0.9rem' }}>✕</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                <button onClick={handleReturnSubmit} disabled={returnSubmitting || returnItems.length === 0}
+                  style={{ padding: '0.4rem 0.8rem', background: returnSubmitting || returnItems.length === 0 ? '#d1d5db' : '#dc2626', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem' }}>
+                  {returnSubmitting ? 'Processing…' : 'Submit Return'}
+                </button>
+                <button onClick={() => { setReturnOrderId(null); setReturnItems([]); }}
+                  style={{ padding: '0.4rem 0.8rem', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem' }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {recentOrdersLoading ? (
+            <p style={{ textAlign: 'center', color: '#6b7280' }}>Loading orders…</p>
+          ) : recentOrdersError ? (
+            <p style={{ color: '#dc2626' }}>{recentOrdersError}</p>
+          ) : recentOrders.length === 0 ? (
+            <p style={{ color: '#6b7280', textAlign: 'center' }}>No recent orders found.</p>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+              <thead>
+                <tr style={{ background: '#f9fafb' }}>
+                  {['Order ID', 'Status', 'Total', 'Method', 'Customer', 'Date', 'Actions'].map((h) => (
+                    <th key={h} style={{ padding: '0.5rem 0.75rem', textAlign: 'left', borderBottom: '2px solid #e5e7eb', fontWeight: 600, color: '#374151' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {recentOrders.map((o) => {
+                  const parsedItems: Array<{ product_id: string; quantity: number }> = o.items_json ? (() => { try { return JSON.parse(o.items_json!); } catch { return []; } })() : [];
+                  return (
+                    <tr key={o.id} style={{ borderBottom: '1px solid #e5e7eb', background: returnOrderId === o.id ? '#eff6ff' : 'transparent' }}>
+                      <td style={{ padding: '0.5rem 0.75rem', fontFamily: 'monospace', fontSize: '0.75rem', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={o.id}>{o.id.slice(0, 16)}…</td>
+                      <td style={{ padding: '0.5rem 0.75rem' }}>
+                        <span style={{ background: o.order_status === 'fulfilled' || o.order_status === 'DELIVERED' ? '#d1fae5' : o.order_status === 'voided' ? '#fee2e2' : '#fef3c7', color: '#374151', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.72rem' }}>
+                          {o.order_status}
+                        </span>
+                      </td>
+                      <td style={{ padding: '0.5rem 0.75rem' }}>₦{((o.total_amount ?? 0) / 100).toFixed(2)}</td>
+                      <td style={{ padding: '0.5rem 0.75rem' }}>{o.payment_method}</td>
+                      <td style={{ padding: '0.5rem 0.75rem', fontSize: '0.75rem', color: '#6b7280' }}>{o.customer_phone ?? '—'}</td>
+                      <td style={{ padding: '0.5rem 0.75rem', fontSize: '0.75rem', color: '#6b7280', whiteSpace: 'nowrap' }}>
+                        {new Date(typeof o.created_at === 'number' ? o.created_at : Number(o.created_at)).toLocaleString('en-NG')}
+                      </td>
+                      <td style={{ padding: '0.5rem 0.75rem' }}>
+                        {['fulfilled', 'DELIVERED', 'COMPLETED'].includes(o.order_status) && !returnOrderId && (
+                          <button onClick={() => {
+                            setReturnOrderId(o.id);
+                            setReturnMsg(null);
+                            setReturnItems(parsedItems.map((i) => ({ productId: i.product_id, quantity: 1 })));
+                          }} style={{ padding: '0.25rem 0.5rem', background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', borderRadius: '4px', cursor: 'pointer', fontSize: '0.72rem', whiteSpace: 'nowrap' }}>
+                            Return
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── P07: Stock Take screen ────────────────────────────────────────────────
+  if (screen === 'stock-take') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
+        <header style={{ padding: '0.75rem 1rem', backgroundColor: '#000', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <h1 style={{ margin: 0, fontSize: '1rem' }}>WebWaka POS — Stock Take</h1>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: '0.5rem' }}>
+            <button onClick={handleStockTakeSubmit} disabled={stockTakeSubmitting}
+              style={{ padding: '0.4rem 0.85rem', background: stockTakeSubmitting ? '#6b7280' : '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: stockTakeSubmitting ? 'wait' : 'pointer', fontSize: '0.8rem' }}>
+              {stockTakeSubmitting ? 'Saving…' : 'Save Adjustments'}
+            </button>
+            <button onClick={() => setScreen('pos')} style={{ padding: '0.35rem 0.75rem', background: '#374151', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}>
+              ← Back to POS
+            </button>
+          </div>
+        </header>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
+          {stockTakeMsg && (
+            <div role="alert" style={{ background: stockTakeMsg.startsWith('✓') ? '#d1fae5' : '#fee2e2', color: stockTakeMsg.startsWith('✓') ? '#065f46' : '#dc2626', padding: '0.5rem 0.75rem', borderRadius: '6px', marginBottom: '0.75rem', fontSize: '0.85rem' }}>
+              {stockTakeMsg}
+            </div>
+          )}
+          <p style={{ fontSize: '0.82rem', color: '#6b7280', marginTop: 0 }}>
+            Enter physical counted quantities. Only changed rows are submitted.
+          </p>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+            <thead>
+              <tr style={{ background: '#f9fafb' }}>
+                {['Product', 'System Qty', 'Counted Qty', 'Reason', 'Delta'].map((h) => (
+                  <th key={h} style={{ padding: '0.5rem 0.75rem', textAlign: 'left', borderBottom: '2px solid #e5e7eb', fontWeight: 600, color: '#374151' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {stockTakeRows.map((row, idx) => {
+                const counted = parseInt(row.countedQty, 10);
+                const delta = isNaN(counted) ? 0 : counted - row.systemQty;
+                const changed = !isNaN(counted) && counted !== row.systemQty;
+                return (
+                  <tr key={row.productId} style={{ borderBottom: '1px solid #e5e7eb', background: changed ? (delta < 0 ? '#fff7ed' : '#f0fdf4') : 'transparent' }}>
+                    <td style={{ padding: '0.5rem 0.75rem', fontWeight: 500 }}>{row.productName}</td>
+                    <td style={{ padding: '0.5rem 0.75rem', color: '#6b7280', textAlign: 'center' }}>{row.systemQty}</td>
+                    <td style={{ padding: '0.5rem 0.75rem' }}>
+                      <input type="number" min={0} value={row.countedQty}
+                        onChange={(e) => setStockTakeRows((prev) => prev.map((r, i) => i === idx ? { ...r, countedQty: e.target.value } : r))}
+                        aria-label={`Counted quantity for ${row.productName}`}
+                        style={{ width: '70px', padding: '0.2rem 0.4rem', border: `1px solid ${changed ? (delta < 0 ? '#f59e0b' : '#22c55e') : '#d1d5db'}`, borderRadius: '4px', fontSize: '0.82rem', textAlign: 'center' }} />
+                    </td>
+                    <td style={{ padding: '0.5rem 0.75rem' }}>
+                      <select value={row.reason} onChange={(e) => setStockTakeRows((prev) => prev.map((r, i) => i === idx ? { ...r, reason: e.target.value } : r))}
+                        style={{ padding: '0.2rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.78rem' }}>
+                        {['DAMAGE', 'THEFT', 'SUPPLIER_SHORT', 'CORRECTION'].map((r) => <option key={r} value={r}>{r}</option>)}
+                      </select>
+                    </td>
+                    <td style={{ padding: '0.5rem 0.75rem', fontWeight: changed ? 600 : 400, color: delta < 0 ? '#dc2626' : delta > 0 ? '#16a34a' : '#6b7280', textAlign: 'center' }}>
+                      {changed ? (delta > 0 ? `+${delta}` : String(delta)) : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {stockTakeRows.length === 0 && (
+            <p style={{ textAlign: 'center', color: '#6b7280', padding: '2rem' }}>No products loaded. Return to POS and open Stock Take once products are loaded.</p>
+          )}
         </div>
       </div>
     );
@@ -1529,20 +1835,55 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           </button>
         )}
 
-        {/* Dashboard tab — ADMIN only */}
-        <RequireRole role="ADMIN" userRole={userRole}>
+        {/* Recent Orders tab */}
+        {/* eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion */}
+        {(() => { const s = screen as string; return (
           <button
-            onClick={() => setScreen('dashboard')}
-            aria-label="Open dashboard"
+            onClick={() => setScreen(s === 'orders' ? 'pos' : 'orders')}
+            aria-label="View recent orders and process returns"
             style={{
-              padding: '0.35rem 0.65rem', background: '#374151', color: '#fff',
+              padding: '0.35rem 0.65rem', background: s === 'orders' ? '#1d4ed8' : '#374151', color: '#fff',
               border: 'none', borderRadius: '4px', cursor: 'pointer',
               fontSize: '0.78rem', whiteSpace: 'nowrap',
             }}
           >
-            Dashboard
+            Orders
           </button>
-        </RequireRole>
+        ); })()}
+
+        {/* Dashboard tab — ADMIN only */}
+        {(() => { const s = screen as string; return (
+          <RequireRole role="ADMIN" userRole={userRole}>
+            <button
+              onClick={() => setScreen(s === 'dashboard' ? 'pos' : 'dashboard')}
+              aria-label="Open dashboard"
+              style={{
+                padding: '0.35rem 0.65rem', background: s === 'dashboard' ? '#1d4ed8' : '#374151', color: '#fff',
+                border: 'none', borderRadius: '4px', cursor: 'pointer',
+                fontSize: '0.78rem', whiteSpace: 'nowrap',
+              }}
+            >
+              Dashboard
+            </button>
+          </RequireRole>
+        ); })()}
+
+        {/* Stock Take — ADMIN only */}
+        {(() => { const s = screen as string; return (
+          <RequireRole role="ADMIN" userRole={userRole}>
+            <button
+              onClick={openStockTake}
+              aria-label="Open stock take screen"
+              style={{
+                padding: '0.35rem 0.65rem', background: s === 'stock-take' ? '#1d4ed8' : '#374151', color: '#fff',
+                border: 'none', borderRadius: '4px', cursor: 'pointer',
+                fontSize: '0.78rem', whiteSpace: 'nowrap',
+              }}
+            >
+              Stock Take
+            </button>
+          </RequireRole>
+        ); })()}
 
         {/* Cashier info + Close Shift — Close Shift is ADMIN only */}
         {activeSession && (
