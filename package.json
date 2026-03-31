@@ -28,14 +28,14 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260313.1",
+    "@cloudflare/workers-types": "^4.20260331.1",
     "@playwright/test": "^1.58.2",
     "@types/node": "^25.5.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.7.0",
     "@vitest/coverage-v8": "^2.1.9",
-    "dexie": "^4.4.1",
+    "dexie": "^4.4.2",
     "hono": "^4.12.9",
     "typescript": "^5.9.3",
     "vite": "^6.4.1",
@@ -45,6 +45,7 @@
     "@tanstack/react-virtual": "^3.13.23",
     "@webwaka/core": "file:./packages/webwaka-core",
     "react": "^19.2.4",
-    "react-dom": "^19.2.4"
+    "react-dom": "^19.2.4",
+    "wrangler": "^4.79.0"
   }
 }
