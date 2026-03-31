@@ -127,8 +127,14 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     if (staffRow && staffRow.cashierPinHash && staffRow.cashierPinSalt) {
       // Check lockout
       if (staffRow.pinLockedUntil && Date.now() < parseInt(staffRow.pinLockedUntil, 10)) {
-        const unlockInSec = Math.ceil((parseInt(staffRow.pinLockedUntil, 10) - Date.now()) / 1000);
-        return c.json({ success: false, error: `Account locked. Try again in ${unlockInSec} seconds.` }, 423);
+        const lockedUntilMs = parseInt(staffRow.pinLockedUntil, 10);
+        const unlockInSec = Math.ceil((lockedUntilMs - Date.now()) / 1000);
+        return c.json({
+          success: false,
+          error: 'account_locked',
+          message: `Account locked. Try again in ${unlockInSec} seconds.`,
+          lockedUntil: lockedUntilMs,
+        }, 423);
       }
 
       const pin = body.cashier_pin?.trim();
@@ -165,9 +171,11 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
         const remaining = locked ? 0 : 5 - newAttempts;
         return c.json({
           success: false,
-          error: locked
+          error: 'invalid_pin',
+          message: locked
             ? 'Account locked after 5 failed attempts. Contact your manager.'
             : `Incorrect PIN. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`,
+          attemptsRemaining: remaining,
         }, 401);
       }
 

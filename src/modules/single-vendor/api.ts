@@ -705,10 +705,10 @@ app.post('/auth/login', async (c) => {
     }
   }
 
-  // ── Rate limit: 5 OTP requests per phone per 15 minutes ───────────────────
+  // ── Rate limit: 5 OTP requests per phone per 60 minutes ───────────────────
   const rlKey = `rl:otp:${e164}`;
-  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
-    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 60 * 60 * 1000))) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 60 minutes before trying again.' }, 429);
   }
 
   const otpCode = String(Math.floor(Math.random() * 900000) + 100000);
@@ -796,19 +796,27 @@ app.post('/auth/verify-otp', async (c) => {
   const deviceId = body.deviceId?.trim();
 
   // ── KV OTP path (from /auth/login → WhatsApp MFA flow) ───────────────────
+  // When SESSIONS_KV is configured, the /auth/login flow stores OTPs in KV.
+  // If KV is present but key is not found, the OTP has expired — return otp_expired.
+  // Only fall through to D1 when SESSIONS_KV is not configured (legacy /auth/request-otp env).
   if (c.env.SESSIONS_KV) {
     const kvOtpRaw = await c.env.SESSIONS_KV.get(`otp:sv:${e164}`);
-    if (kvOtpRaw) {
-      try {
-        const kvOtp = JSON.parse(kvOtpRaw) as { hash: string; createdAt: number };
-        const inputHash = await hashOtp(otp);
 
-        if (inputHash !== kvOtp.hash) {
-          return c.json({ success: false, error: 'Incorrect OTP' }, 401);
-        }
+    if (!kvOtpRaw) {
+      // KV configured but key absent — OTP has expired or was never issued via /auth/login
+      return c.json({ success: false, error: 'otp_expired' }, 401);
+    }
 
-        // Valid OTP — delete from KV to prevent reuse
-        await c.env.SESSIONS_KV.delete(`otp:sv:${e164}`);
+    try {
+      const kvOtp = JSON.parse(kvOtpRaw) as { hash: string; createdAt: number };
+      const inputHash = await hashOtp(otp);
+
+      if (inputHash !== kvOtp.hash) {
+        return c.json({ success: false, error: 'invalid_otp' }, 401);
+      }
+
+      // Valid OTP — delete from KV immediately to prevent replay attacks
+      await c.env.SESSIONS_KV.delete(`otp:sv:${e164}`);
 
         const now = Date.now();
         interface CustomerRow { id: string; loyalty_points: number }
@@ -841,13 +849,12 @@ app.post('/auth/verify-otp', async (c) => {
 
         c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
         return c.json({ success: true, data: { token, customer_id: customer.id, phone: e164, loyalty_points: customer.loyalty_points } });
-      } catch (err) {
-        console.error('[SV] KV OTP verify error:', err);
-        return c.json({ success: false, error: 'Internal server error' }, 500);
-      }
+    } catch (err) {
+      console.error('[SV] KV OTP verify error:', err);
+      return c.json({ success: false, error: 'Internal server error' }, 500);
     }
   }
-  // ── D1 OTP path (from /auth/request-otp) ──────────────────────────────────
+  // ── D1 OTP path (from /auth/request-otp) — only reached when SESSIONS_KV is not configured ──
 
   try {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }

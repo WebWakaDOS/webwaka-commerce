@@ -1,0 +1,93 @@
+You are a senior QA engineer performing a complete verification of Phase P06 (Authentication & Security Hardening) in the webwaka-commerce repository.
+
+This phase touches security-critical code. Verify every detail with extra scrutiny. Any authentication bypass, PIN exposure, or missing rate limit is a critical bug.
+
+## Step 1 — Read Everything First
+Read completely:
+- src/modules/pos/api.ts
+- src/modules/pos/ui.tsx
+- src/modules/single-vendor/api.ts
+- src/middleware/auth.ts
+- src/app.tsx
+- migrations/0005_cashier_pin.sql (or equivalent)
+
+## Step 2 — Verify Cashier PIN Schema (P06-T01)
+- [ ] Migration file exists adding PIN fields to staff or users table
+- [ ] cashierPinHash TEXT column exists
+- [ ] cashierPinSalt TEXT column exists
+- [ ] pinLockedUntil TEXT column exists (nullable)
+- [ ] pinFailedAttempts INTEGER NOT NULL DEFAULT 0 column exists
+- [ ] Migration uses ALTER TABLE IF EXISTS or CREATE TABLE — does not fail if table already has the column
+
+## Step 3 — Verify Admin Set-PIN Endpoint (P06-T02)
+- [ ] POST /api/pos/staff/:staffId/set-pin endpoint exists in src/modules/pos/api.ts
+- [ ] Endpoint requires ADMIN role (verify requireRole(['ADMIN']) is applied)
+- [ ] Validates PIN: must be 4-6 digits (numeric only) — rejects alphabetic input
+- [ ] Uses hashPin from @webwaka/core (NOT bcrypt, NOT MD5, NOT plaintext)
+- [ ] Stores { hash, salt } from hashPin result in D1
+- [ ] Resets pinFailedAttempts to 0 on PIN set
+- [ ] Resets pinLockedUntil to NULL on PIN set
+- [ ] CRITICAL CHECK: The raw PIN is NEVER stored, NEVER logged, NEVER included in any response
+
+## Step 4 — Verify PIN Enforcement on Session Open (P06-T03)
+- [ ] In POST /api/pos/sessions: before session creation, staff record is fetched
+- [ ] If pinLockedUntil is in the future: HTTP 423 returned with { error: 'account_locked', lockedUntil }
+- [ ] If cashierPinHash is NULL (PIN not yet set): session is allowed (no enforcement) — verify this branch does not crash
+- [ ] verifyPin from @webwaka/core is called — NOT a manual hash comparison
+- [ ] On invalid PIN: pinFailedAttempts is incremented in D1
+- [ ] On 5th consecutive failure: pinLockedUntil = now + 30 minutes is stored in D1
+- [ ] On lock: SMS notification is sent to manager phone (read from tenantConfig or env)
+- [ ] HTTP 401 returned on invalid PIN with { error: 'invalid_pin', attemptsRemaining }
+- [ ] On valid PIN: pinFailedAttempts is reset to 0, session proceeds
+- [ ] CRITICAL CHECK: The submitted PIN is NEVER stored, NEVER logged, NEVER returned in any response
+
+## Step 5 — Verify PIN Entry UI (P06-T04)
+- [ ] A PinEntryScreen component exists in src/modules/pos/ui.tsx (or a separate file)
+- [ ] Renders a numeric keypad with digits 0-9, delete, and submit
+- [ ] Entered digits displayed as '•' (masked, not visible)
+- [ ] Error message shown on wrong PIN (e.g. 'Invalid PIN' or 'X attempts remaining')
+- [ ] PinEntryScreen is shown before opening a session
+- [ ] After 5 minutes of POS inactivity (no clicks or keypresses): a 'locked' state is set
+- [ ] When locked: PinEntryScreen renders as a full-screen overlay over the POS
+- [ ] The inactivity timer resets on any user interaction (pointer events, keyboard events)
+- [ ] CRITICAL CHECK: The inactivity timer is cleaned up on component unmount (no memory leaks)
+
+## Step 6 — Verify WhatsApp MFA for SV Login (P06-T05)
+- [ ] POST /api/single-vendor/auth/login in src/modules/single-vendor/api.ts: modified to send OTP
+- [ ] OTP is a 6-digit numeric string (not shorter, not longer)
+- [ ] OTP is stored in KV with key 'otp:sv:${phone}' and TTL 600 seconds (10 minutes)
+- [ ] OTP is sent via createSmsProvider(env.TERMII_API_KEY).sendOtp(..., 'whatsapp')
+- [ ] Rate limiting is applied: max 5 OTP sends per phone per 60 minutes using checkRateLimit from @webwaka/core
+- [ ] Trusted device check: if KV key 'trusted_device:sv:${phone}:${deviceId}' exists AND is not expired: JWT is issued directly without OTP (skips step above)
+- [ ] POST /api/single-vendor/auth/verify-otp endpoint exists
+- [ ] verify-otp reads OTP from KV 'otp:sv:${phone}'
+- [ ] verify-otp: if KV key not found: HTTP 401 { error: 'otp_expired' }
+- [ ] verify-otp: if OTP does not match: HTTP 401 { error: 'invalid_otp' }
+- [ ] verify-otp: on success: deletes KV key, issues JWT
+- [ ] verify-otp: if deviceId is in the request body: stores 'trusted_device:sv:${phone}:${deviceId}' in KV with TTL 30 days
+- [ ] CRITICAL CHECK: OTP is compared with constant-time string comparison or the KV value is deleted immediately on first use (prevents timing attacks and replay attacks)
+
+## Step 7 — Verify UserContext and Role-Based UI (P06-T06)
+- [ ] UserContext is created and provided in src/app.tsx (or a dedicated context file)
+- [ ] Context provides: { userId, role, tenantId }
+- [ ] Values come from JWT decoded from sessionStorage — not hardcoded
+- [ ] useUser hook exported and usable in any component
+- [ ] In src/modules/pos/ui.tsx: Dashboard tab is wrapped in RequireRole with role='ADMIN'
+- [ ] Close Shift button is wrapped in RequireRole with role='ADMIN'
+- [ ] Product management controls (add/edit product) are wrapped in RequireRole with role='ADMIN'
+- [ ] A STAFF-role user sees none of the above — verify the conditional renders null or fallback, not a disabled button
+
+## Step 8 — Security Regression Check
+- [ ] Search the entire codebase for any console.log that might print a PIN or OTP — remove immediately
+- [ ] Search for any API response that returns a PIN hash or salt — remove immediately
+- [ ] Verify all PIN-related API endpoints require authentication (no unauthenticated access)
+
+## Step 9 — TypeScript and Tests
+Run: npx tsc --noEmit — fix all errors.
+Run: npm test — fix all failures.
+
+## Step 10 — Fix All Issues
+Fix every issue found.
+
+## Step 11 — Completion Confirmation
+"P06 QA COMPLETE — Cashier PIN hashed with PBKDF2, enforcement on session open verified, lockout after 5 failures confirmed, PinEntryScreen with inactivity lock implemented, WhatsApp MFA with OTP send and verify endpoints working, trusted device skip logic correct, UserContext provides role to all components, STAFF cannot see ADMIN UI. No PIN/OTP leakage. TypeScript clean. Tests passing."
