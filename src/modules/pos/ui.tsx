@@ -286,6 +286,90 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
 
+  // ── Phase 6 (P06): Cashier PIN + inactivity lock ─────────────────────────
+  const [pinMode, setPinMode] = useState<'open-shift' | 'inactivity' | null>(null);
+  const [pinBuffer, setPinBuffer] = useState<string[]>([]);
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [pinLoading, setPinLoading] = useState(false);
+  const inactivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Reset inactivity timer on any user interaction
+  const resetInactivityTimer = useCallback(() => {
+    if (!activeSession) return;
+    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    inactivityTimerRef.current = setTimeout(() => {
+      setPinMode('inactivity');
+      setPinBuffer([]);
+      setPinError(null);
+    }, 5 * 60 * 1000); // 5 minutes
+  }, [activeSession]);
+
+  useEffect(() => {
+    if (!activeSession) {
+      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+      return;
+    }
+    const events = ['click', 'keydown', 'mousemove', 'touchstart'] as const;
+    const onActivity = () => resetInactivityTimer();
+    events.forEach((ev) => window.addEventListener(ev, onActivity, { passive: true }));
+    resetInactivityTimer();
+    return () => {
+      events.forEach((ev) => window.removeEventListener(ev, onActivity));
+      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    };
+  }, [activeSession, resetInactivityTimer]);
+
+  // PIN digit entry handler
+  const handlePinDigit = useCallback((digit: string) => {
+    setPinBuffer((prev) => prev.length < 6 ? [...prev, digit] : prev);
+    setPinError(null);
+  }, []);
+
+  const handlePinDelete = useCallback(() => {
+    setPinBuffer((prev) => prev.slice(0, -1));
+    setPinError(null);
+  }, []);
+
+  // Submit PIN: re-uses POST /sessions — 201 or 409 = PIN ok, 401/423 = error
+  const handlePinSubmit = useCallback(async () => {
+    const pin = pinBuffer.join('');
+    if (pin.length < 4) { setPinError('Enter at least 4 digits'); return; }
+    const cashierId = activeSession?.cashier_id ?? shiftCashierId.trim();
+    const cashierName = activeSession?.cashier_name ?? (shiftCashierName.trim() || undefined);
+    if (!cashierId) { setPinError('Cashier ID not found'); return; }
+
+    setPinLoading(true);
+    setPinError(null);
+    try {
+      const res = await fetch('/api/pos/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({
+          cashier_id: cashierId,
+          cashier_name: cashierName,
+          initial_float_kobo: Math.round(parseFloat(shiftFloat || '0') * 100),
+          cashier_pin: pin,
+        }),
+      });
+      const json = await res.json() as { success: boolean; data?: PosSession; error?: string; session_id?: string };
+
+      if (res.status === 201 && json.success && json.data) {
+        // New session opened via PIN (open-shift mode)
+        setActiveSession(json.data);
+        setPinMode(null);
+        setPinBuffer([]);
+      } else if (res.status === 409) {
+        // Session already open — PIN was correct (inactivity or duplicate open-shift race)
+        setPinMode(null);
+        setPinBuffer([]);
+      } else {
+        setPinError(json.error ?? 'Incorrect PIN');
+        setPinBuffer([]);
+      }
+    } catch { setPinError('Network error. Please try again.'); }
+    finally { setPinLoading(false); }
+  }, [pinBuffer, activeSession, shiftCashierId, shiftCashierName, shiftFloat, tenantId]);
+
   // ── Phase 6: Variant picker modal ────────────────────────────────────────
   const [variantPickerProduct, setVariantPickerProduct] = useState<Product | null>(null);
   const [variantPickerVariants, setVariantPickerVariants] = useState<ProductVariant[]>([]);
@@ -552,31 +636,14 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     if (screen === 'dashboard') loadSessionHistory();
   }, [screen, loadSessionHistory]);
 
-  const handleOpenShift = useCallback(async () => {
+  const handleOpenShift = useCallback(() => {
     if (!shiftCashierId.trim()) { setShiftError('Cashier ID is required'); return; }
-    setShiftLoading(true);
+    // Show PIN entry screen; actual API call is made by handlePinSubmit
     setShiftError(null);
-    try {
-      const res = await fetch('/api/pos/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
-        body: JSON.stringify({
-          cashier_id: shiftCashierId.trim(),
-          cashier_name: shiftCashierName.trim() || undefined,
-          initial_float_kobo: Math.round(parseFloat(shiftFloat || '0') * 100),
-        }),
-      });
-      const json = await res.json() as { success: boolean; data?: PosSession; error?: string };
-      if (res.status === 409) {
-        await loadActiveSession();
-      } else if (res.ok && json.success && json.data) {
-        setActiveSession(json.data);
-      } else {
-        setShiftError(json.error ?? 'Failed to open shift');
-      }
-    } catch { setShiftError('Network error. Please try again.'); }
-    finally { setShiftLoading(false); }
-  }, [shiftCashierId, shiftCashierName, shiftFloat, tenantId, loadActiveSession]);
+    setPinMode('open-shift');
+    setPinBuffer([]);
+    setPinError(null);
+  }, [shiftCashierId]);
 
   const handleCloseShift = useCallback(async () => {
     if (!activeSession) return;
@@ -777,6 +844,94 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     buildPayments, setCart, clearPersistedCart, tenantId, sessionToken,
     discountPctNum, customerId, customerPhone, activeSession,
   ]);
+
+  // ── Phase 6 (P06): PIN overlay — covers any screen when PIN is required ────
+  if (pinMode !== null) {
+    const isInactivity = pinMode === 'inactivity';
+    const dots = Array.from({ length: 6 }, (_, i) => (
+      <span key={i} style={{
+        display: 'inline-block', width: '14px', height: '14px', borderRadius: '50%', margin: '0 6px',
+        background: i < pinBuffer.length ? '#16a34a' : '#d1d5db',
+        transition: 'background 0.15s',
+      }} />
+    ));
+    const keys = ['1','2','3','4','5','6','7','8','9','','0','⌫'] as const;
+    return (
+      <div
+        style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'sans-serif' }}
+        onKeyDown={(e) => {
+          if (/^\d$/.test(e.key)) handlePinDigit(e.key);
+          else if (e.key === 'Backspace') handlePinDelete();
+          else if (e.key === 'Enter') { void handlePinSubmit(); }
+        }}
+        tabIndex={-1}
+      >
+        <div style={{ background: '#fff', borderRadius: '16px', padding: '2rem 1.5rem', width: '320px', textAlign: 'center', boxShadow: '0 8px 32px rgba(0,0,0,0.3)' }}>
+          <div style={{ fontSize: '2rem', marginBottom: '0.25rem' }}>🔐</div>
+          <h2 style={{ margin: '0 0 0.25rem', fontSize: '1.15rem', color: '#111827' }}>
+            {isInactivity ? 'Session Locked' : 'Enter Cashier PIN'}
+          </h2>
+          <p style={{ fontSize: '0.8rem', color: '#6b7280', margin: '0 0 1.5rem' }}>
+            {isInactivity
+              ? 'Re-enter your PIN to resume the session'
+              : `Cashier: ${shiftCashierId.trim()}`}
+          </p>
+
+          {pinError && (
+            <div role="alert" style={{ background: '#fee2e2', color: '#dc2626', borderRadius: '6px', padding: '0.5rem 0.75rem', fontSize: '0.82rem', marginBottom: '1rem' }}>
+              {pinError}
+            </div>
+          )}
+
+          <div style={{ marginBottom: '1.5rem' }}>{dots}</div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', marginBottom: '1rem' }}>
+            {keys.map((k, idx) => k === '' ? (
+              <span key={idx} />
+            ) : (
+              <button
+                key={idx}
+                onClick={() => k === '⌫' ? handlePinDelete() : handlePinDigit(k)}
+                disabled={pinLoading}
+                style={{
+                  padding: '1rem 0', fontSize: k === '⌫' ? '1.2rem' : '1.4rem', fontWeight: 'bold',
+                  background: k === '⌫' ? '#f3f4f6' : '#f9fafb',
+                  border: '1px solid #e5e7eb', borderRadius: '10px', cursor: pinLoading ? 'not-allowed' : 'pointer',
+                  color: '#111827', transition: 'background 0.1s',
+                }}
+              >
+                {k}
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={() => { void handlePinSubmit(); }}
+            disabled={pinLoading || pinBuffer.length < 4}
+            style={{
+              width: '100%', padding: '0.75rem',
+              background: pinLoading || pinBuffer.length < 4 ? '#d1d5db' : '#16a34a',
+              color: '#fff', border: 'none', borderRadius: '8px',
+              fontSize: '1rem', fontWeight: 'bold',
+              cursor: pinLoading || pinBuffer.length < 4 ? 'not-allowed' : 'pointer',
+              marginBottom: '0.5rem',
+            }}
+          >
+            {pinLoading ? 'Verifying…' : 'Confirm PIN'}
+          </button>
+
+          {!isInactivity && (
+            <button
+              onClick={() => { setPinMode(null); setPinBuffer([]); setPinError(null); }}
+              style={{ background: 'none', border: 'none', color: '#6b7280', fontSize: '0.85rem', cursor: 'pointer', textDecoration: 'underline' }}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // ── Phase 5: Session loading spinner ──────────────────────────────────────
   if (activeSession === undefined) {

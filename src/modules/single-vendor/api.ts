@@ -654,6 +654,88 @@ app.get('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
   }
 });
 
+// ── POST /auth/login — WhatsApp MFA login with trusted-device bypass ──────────
+// Flow: (1) check trusted device in KV → issue JWT directly;
+//       (2) otherwise generate OTP, store in KV, send via WhatsApp, return 202.
+app.post('/auth/login', async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{ phone: string; deviceId?: string }>();
+
+  const phone = body.phone?.trim();
+  if (!phone) return c.json({ success: false, error: 'phone is required' }, 400);
+  if (!/^\+234[0-9]{10}$/.test(phone) && !/^0[0-9]{10}$/.test(phone)) {
+    return c.json({ success: false, error: 'Invalid Nigerian phone number. Use E.164 (+234...) or local (0...)' }, 400);
+  }
+
+  const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+  const deviceId = body.deviceId?.trim();
+
+  // ── Trusted device bypass ──────────────────────────────────────────────────
+  if (deviceId && c.env.SESSIONS_KV) {
+    const trustedKey = `trusted_device:sv:${e164}:${deviceId}`;
+    const trusted = await c.env.SESSIONS_KV.get(trustedKey);
+    if (trusted) {
+      // Fetch or create customer record, then issue JWT directly
+      try {
+        const now = Date.now();
+        interface CustomerRow { id: string; loyalty_points: number }
+        let customer = await c.env.DB.prepare(
+          'SELECT id, loyalty_points FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+        ).bind(tenantId, e164).first<CustomerRow>();
+
+        if (!customer) {
+          const cid = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+          await c.env.DB.prepare(
+            `INSERT INTO customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
+          ).bind(cid, tenantId, e164, e164, now, now, now).run();
+          customer = { id: cid, loyalty_points: 0 };
+        }
+
+        const token = await signJwt(
+          { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
+          getJwtSecret(c.env),
+        );
+        c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
+        return c.json({ success: true, data: { token, customer_id: customer.id, phone: e164, trusted_device: true } });
+      } catch (err) {
+        console.error('[SV] trusted device login error:', err);
+        return c.json({ success: false, error: 'Internal server error' }, 500);
+      }
+    }
+  }
+
+  // ── Rate limit: 5 OTP requests per phone per 15 minutes ───────────────────
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  }
+
+  const otpCode = String(Math.floor(Math.random() * 900000) + 100000);
+  const otpHash = await hashOtp(otpCode);
+  const otpTtlSec = 10 * 60; // 10 minutes
+
+  try {
+    if (c.env.SESSIONS_KV) {
+      await c.env.SESSIONS_KV.put(`otp:sv:${e164}`, JSON.stringify({ hash: otpHash, createdAt: Date.now() }), { expirationTtl: otpTtlSec });
+    }
+
+    if (c.env.TERMII_API_KEY) {
+      const sms = createSmsProvider(c.env.TERMII_API_KEY);
+      await sms.sendOtp(
+        e164,
+        `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
+        'whatsapp',
+      );
+    }
+
+    return c.json({ success: true, data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: otpTtlSec, channel: 'whatsapp' } }, 202);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 // ── POST /auth/request-otp — Send 6-digit OTP via Termii (NDPR: phone only) ──
 app.post('/auth/request-otp', async (c) => {
   const tenantId = getTenantId(c);
@@ -700,9 +782,10 @@ app.post('/auth/request-otp', async (c) => {
 });
 
 // ── POST /auth/verify-otp — Verify OTP → JWT cookie (SV-AUTH) ────────────────
+// Checks KV-based OTP (from /auth/login) first, then falls through to D1 (from /auth/request-otp).
 app.post('/auth/verify-otp', async (c) => {
   const tenantId = getTenantId(c);
-  const body = await c.req.json<{ phone: string; otp: string; cart_token?: string }>();
+  const body = await c.req.json<{ phone: string; otp: string; cart_token?: string; deviceId?: string }>();
 
   const phone = body.phone?.trim();
   const otp = body.otp?.trim();
@@ -710,6 +793,61 @@ app.post('/auth/verify-otp', async (c) => {
   if (!/^\d{6}$/.test(otp)) return c.json({ success: false, error: 'OTP must be 6 digits' }, 400);
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+  const deviceId = body.deviceId?.trim();
+
+  // ── KV OTP path (from /auth/login → WhatsApp MFA flow) ───────────────────
+  if (c.env.SESSIONS_KV) {
+    const kvOtpRaw = await c.env.SESSIONS_KV.get(`otp:sv:${e164}`);
+    if (kvOtpRaw) {
+      try {
+        const kvOtp = JSON.parse(kvOtpRaw) as { hash: string; createdAt: number };
+        const inputHash = await hashOtp(otp);
+
+        if (inputHash !== kvOtp.hash) {
+          return c.json({ success: false, error: 'Incorrect OTP' }, 401);
+        }
+
+        // Valid OTP — delete from KV to prevent reuse
+        await c.env.SESSIONS_KV.delete(`otp:sv:${e164}`);
+
+        const now = Date.now();
+        interface CustomerRow { id: string; loyalty_points: number }
+        let customer = await c.env.DB.prepare(
+          'SELECT id, loyalty_points FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+        ).bind(tenantId, e164).first<CustomerRow>();
+
+        if (!customer) {
+          const cid = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+          await c.env.DB.prepare(
+            `INSERT INTO customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
+          ).bind(cid, tenantId, e164, e164, now, now, now).run();
+          customer = { id: cid, loyalty_points: 0 };
+        }
+
+        const token = await signJwt(
+          { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
+          getJwtSecret(c.env),
+        );
+
+        // Store trusted device in KV (30-day TTL)
+        if (deviceId) {
+          await c.env.SESSIONS_KV.put(
+            `trusted_device:sv:${e164}:${deviceId}`,
+            JSON.stringify({ customerId: customer.id, createdAt: now }),
+            { expirationTtl: 30 * 24 * 3600 },
+          );
+        }
+
+        c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
+        return c.json({ success: true, data: { token, customer_id: customer.id, phone: e164, loyalty_points: customer.loyalty_points } });
+      } catch (err) {
+        console.error('[SV] KV OTP verify error:', err);
+        return c.json({ success: false, error: 'Internal server error' }, 500);
+      }
+    }
+  }
+  // ── D1 OTP path (from /auth/request-otp) ──────────────────────────────────
 
   try {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }

@@ -6,7 +6,7 @@
  * Invariants: Nigeria-First (Paystack), Offline-First (sync), Multi-tenancy, PCI-DSS error hygiene
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, updateWithVersionLock, createTaxEngine, checkRateLimit as kvCheckRateLimit } from '@webwaka/core';
+import { getTenantId, requireRole, updateWithVersionLock, createTaxEngine, checkRateLimit as kvCheckRateLimit, hashPin, verifyPin, createSmsProvider } from '@webwaka/core';
 import { checkRateLimit, _createRateLimitStore, generatePayRef } from '../../utils';
 import type { RateLimitStore } from '../../utils';
 import type { Env } from '../../worker';
@@ -110,6 +110,76 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   }
 
   try {
+    // ── PIN verification ──────────────────────────────────────────────────────
+    interface StaffRow {
+      cashierPinHash: string | null;
+      cashierPinSalt: string | null;
+      pinFailedAttempts: number;
+      pinLockedUntil: string | null;
+      manager_phone: string | null;
+    }
+    const staffRow = await c.env.DB.prepare(
+      'SELECT cashierPinHash, cashierPinSalt, pinFailedAttempts, pinLockedUntil, manager_phone FROM staff WHERE id = ? AND tenant_id = ?',
+    )
+      .bind(body.cashier_id.trim(), tenantId)
+      .first<StaffRow>();
+
+    if (staffRow && staffRow.cashierPinHash && staffRow.cashierPinSalt) {
+      // Check lockout
+      if (staffRow.pinLockedUntil && Date.now() < parseInt(staffRow.pinLockedUntil, 10)) {
+        const unlockInSec = Math.ceil((parseInt(staffRow.pinLockedUntil, 10) - Date.now()) / 1000);
+        return c.json({ success: false, error: `Account locked. Try again in ${unlockInSec} seconds.` }, 423);
+      }
+
+      const pin = body.cashier_pin?.trim();
+      if (!pin) {
+        return c.json({ success: false, error: 'PIN is required for this cashier' }, 401);
+      }
+
+      const valid = await verifyPin(pin, staffRow.cashierPinSalt, staffRow.cashierPinHash);
+      const now2 = Date.now();
+
+      if (!valid) {
+        const newAttempts = (staffRow.pinFailedAttempts ?? 0) + 1;
+        const locked = newAttempts >= 5;
+        const lockedUntil = locked ? String(now2 + 30 * 60 * 1000) : null;
+
+        await c.env.DB.prepare(
+          'UPDATE staff SET pinFailedAttempts = ?, pinLockedUntil = ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
+        )
+          .bind(newAttempts, lockedUntil, now2, body.cashier_id.trim(), tenantId)
+          .run();
+
+        if (locked && staffRow.manager_phone && c.env.TERMII_API_KEY) {
+          try {
+            const sms = createSmsProvider(c.env.TERMII_API_KEY);
+            await sms.sendMessage(
+              staffRow.manager_phone,
+              `[WebWaka POS] Cashier ${body.cashier_id.trim()} has been locked after 5 failed PIN attempts. Please unlock in the admin panel.`,
+            );
+          } catch (smsErr) {
+            console.warn('[POS] Manager SMS failed:', smsErr);
+          }
+        }
+
+        const remaining = locked ? 0 : 5 - newAttempts;
+        return c.json({
+          success: false,
+          error: locked
+            ? 'Account locked after 5 failed attempts. Contact your manager.'
+            : `Incorrect PIN. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`,
+        }, 401);
+      }
+
+      // PIN correct — reset attempt counter
+      await c.env.DB.prepare(
+        'UPDATE staff SET pinFailedAttempts = 0, pinLockedUntil = NULL, updated_at = ? WHERE id = ? AND tenant_id = ?',
+      )
+        .bind(Date.now(), body.cashier_id.trim(), tenantId)
+        .run();
+    }
+    // If no staff record or no PIN configured: allow (PIN not yet set up)
+
     // 409 guard: refuse if an open session already exists for this tenant
     const existing = await c.env.DB.prepare(
       "SELECT id FROM pos_sessions WHERE tenant_id = ? AND status = 'open' LIMIT 1",
@@ -154,6 +224,51 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   } catch (err) {
     console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Failed to open session' }, 500);
+  }
+});
+
+// POST /api/pos/staff/:staffId/set-pin — Admin sets or resets a cashier's PIN
+app.post('/staff/:staffId/set-pin', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const staffId = c.req.param('staffId');
+  const body = await c.req.json<{ pin?: string; name?: string; manager_phone?: string }>();
+
+  if (!body.pin || !/^\d{4,6}$/.test(body.pin)) {
+    return c.json({ success: false, error: 'pin must be 4-6 digits' }, 400);
+  }
+
+  const { hash, salt } = await hashPin(body.pin);
+  const now = Date.now();
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO staff (id, tenant_id, name, manager_phone, cashierPinHash, cashierPinSalt, pinFailedAttempts, pinLockedUntil, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         cashierPinHash = excluded.cashierPinHash,
+         cashierPinSalt = excluded.cashierPinSalt,
+         manager_phone = COALESCE(excluded.manager_phone, staff.manager_phone),
+         name = COALESCE(excluded.name, staff.name),
+         pinFailedAttempts = 0,
+         pinLockedUntil = NULL,
+         updated_at = excluded.updated_at`,
+    )
+      .bind(
+        staffId,
+        tenantId,
+        body.name ?? null,
+        body.manager_phone ?? null,
+        hash,
+        salt,
+        now,
+        now,
+      )
+      .run();
+
+    return c.json({ success: true });
+  } catch (err) {
+    console.error('[POS] route error:', err);
+    return c.json({ success: false, error: 'Failed to set PIN' }, 500);
   }
 });
 

@@ -30,8 +30,10 @@ export const jwtAuthMiddleware = coreJwtAuthMiddleware({
     { method: 'GET',  path: '/api/single-vendor/orders/:id/track' },
     { method: 'GET',  path: '/api/single-vendor/shipping/estimate' },
     { method: 'GET',  path: '/api/single-vendor/delivery-zones' },
+    { method: 'POST', path: '/api/single-vendor/auth/login' },
     { method: 'POST', path: '/api/single-vendor/auth/request-otp' },
     { method: 'POST', path: '/api/single-vendor/auth/verify-otp' },
+    { method: 'GET',  path: '/api/single-vendor/orders/:id/delivery-options' },
     // Paystack webhook — signed with HMAC-SHA512, not a JWT-protected route
     { method: 'POST', path: '/api/single-vendor/paystack/webhook' },
     // ── Multi-Vendor: public buyer-facing routes ───────────────────────────────

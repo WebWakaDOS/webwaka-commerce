@@ -16,6 +16,8 @@ export function useUserContext(): UserContextValue {
   return useContext(UserContext);
 }
 
+export const useUser = useUserContext;
+
 export function decodeJwtPayload(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split('.');
