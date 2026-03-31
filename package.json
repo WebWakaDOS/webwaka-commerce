@@ -34,12 +34,12 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.7.0",
-    "@vitest/coverage-v8": "^2.0.0",
-    "dexie": "^4.3.0",
-    "hono": "^4.12.8",
+    "@vitest/coverage-v8": "^2.1.9",
+    "dexie": "^4.4.1",
+    "hono": "^4.12.9",
     "typescript": "^5.9.3",
     "vite": "^6.4.1",
-    "vitest": "^2.0.0"
+    "vitest": "^2.1.9"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.23",
