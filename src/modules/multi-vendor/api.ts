@@ -23,10 +23,11 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms } from '@webwaka/core';
+import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit } from '@webwaka/core';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
+import type { RateLimitStore } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -37,6 +38,23 @@ const otpRateLimitStore = _createRateLimitStore();
 const checkoutRateLimitStore = _createRateLimitStore();
 // Search: 60 requests per IP per minute
 const searchRateLimitStore = _createRateLimitStore();
+
+// KV-backed rate limiter — uses SESSIONS_KV in production; falls back to in-memory store in tests.
+async function kvCheckRL(
+  kv: KVNamespace | undefined,
+  store: RateLimitStore,
+  key: string,
+  maxRequests: number,
+  windowMs: number,
+): Promise<boolean> {
+  if (kv) {
+    const r = await kvCheckRateLimit({ kv, key, maxRequests, windowSeconds: Math.ceil(windowMs / 1000) });
+    return r.allowed;
+  }
+  return checkRateLimit(store, key, maxRequests, windowMs);
+}
+
+void createTaxEngine; // imported for future marketplace VAT computation
 
 // ── Crypto helpers (same pattern as COM-2 Single-Vendor) ──────────────────────
 
@@ -105,8 +123,8 @@ app.post('/auth/vendor-request-otp', async (c) => {
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
 
   // Rate limit: 5 OTP requests per phone per 15 minutes
-  const rlKey = `${tenantId}:otp:${e164}`;
-  if (!checkRateLimit(otpRateLimitStore, rlKey, 5, 15 * 60 * 1000)) {
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
     return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
   }
 
@@ -738,7 +756,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     return c.json({ success: false, error: 'customer_email is required' }, 400);
   }
   const rlCheckout = body.customer_phone ?? body.customer_email ?? 'anon';
-  if (!checkRateLimit(checkoutRateLimitStore, `${tenantId}:checkout:${rlCheckout}`, 10, 60_000)) {
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, checkoutRateLimitStore, `rl:checkout:${rlCheckout}`, 10, 60_000))) {
     return c.json({ success: false, error: 'Too many checkout attempts. Please wait before retrying.' }, 429);
   }
 
@@ -938,8 +956,8 @@ app.post('/vendor-auth/request-otp', async (c) => {
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
 
   // Rate limit: 5 OTP requests per phone per 15 minutes
-  const rlKey = `${tenantId}:otp:${e164}`;
-  if (!checkRateLimit(otpRateLimitStore, rlKey, 5, 15 * 60 * 1000)) {
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
     return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
   }
 
@@ -1200,8 +1218,8 @@ app.get('/catalog', async (c) => {
   const noCache   = c.req.query('nocache') === '1';
 
   if (search) {
-    const searchRlKey = `${tenantId}:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
-    if (!checkRateLimit(searchRateLimitStore, searchRlKey, 60, 60_000)) {
+    const searchRlKey = `rl:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+    if (!(await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, searchRlKey, 60, 60_000))) {
       return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
     }
   }
@@ -2102,8 +2120,8 @@ app.get('/search', async (c) => {
 
   // Rate-limit search requests (60 per IP per minute)
   if (q) {
-    const rlKey = `${tenantId}:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
-    if (!checkRateLimit(searchRateLimitStore, rlKey, 60, 60_000)) {
+    const rlKey = `rl:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+    if (!(await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, rlKey, 60, 60_000))) {
       return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
     }
   }

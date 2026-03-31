@@ -15,14 +15,15 @@ import { Hono } from 'hono';
 import {
   getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms,
   createPaymentProvider, createSmsProvider, updateWithVersionLock, CommerceEvents,
+  createTaxEngine, checkRateLimit as kvCheckRateLimit,
 } from '@webwaka/core';
 import { publishEvent } from '../../core/event-bus';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
+import type { RateLimitStore } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
 
-const VAT_RATE = 0.075;
 const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify';
 const DEFAULT_PAGE_SIZE = 24;
 const MAX_PAGE_SIZE = 100;
@@ -36,6 +37,21 @@ const otpRateLimitStore = _createRateLimitStore();
 const checkoutRateLimitStore = _createRateLimitStore();
 // Search: 60 requests per IP per minute (crawler/scraper mitigation)
 const searchRateLimitStore = _createRateLimitStore();
+
+// KV-backed rate limiter — uses SESSIONS_KV in production; falls back to in-memory store in tests.
+async function kvCheckRL(
+  kv: KVNamespace | undefined,
+  store: RateLimitStore,
+  key: string,
+  maxRequests: number,
+  windowMs: number,
+): Promise<boolean> {
+  if (kv) {
+    const r = await kvCheckRateLimit({ kv, key, maxRequests, windowSeconds: Math.ceil(windowMs / 1000) });
+    return r.allowed;
+  }
+  return checkRateLimit(store, key, maxRequests, windowMs);
+}
 
 // ── Tenant middleware ─────────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
@@ -68,8 +84,8 @@ app.get('/catalog/search', async (c) => {
 
   if (!q) return c.json({ success: false, error: 'Search query (q) is required' }, 400);
 
-  const searchRlKey = `${tenantId}:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
-  if (!checkRateLimit(searchRateLimitStore, searchRlKey, 60, 60_000)) {
+  const searchRlKey = `rl:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, searchRlKey, 60, 60_000))) {
     return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
   }
 
@@ -303,7 +319,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   if (!body.customer_email && !body.customer_phone) return c.json({ success: false, error: 'customer_email or customer_phone required' }, 400);
   if (!body.paystack_reference || body.paystack_reference.trim() === '') return c.json({ success: false, error: 'paystack_reference is required' }, 400);
   const rlPhone = body.customer_phone ?? body.customer_email ?? 'anon';
-  if (!checkRateLimit(checkoutRateLimitStore, `${getTenantId(c) ?? 'x'}:checkout:${rlPhone}`, 10, 60_000)) {
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, checkoutRateLimitStore, `rl:checkout:${rlPhone}`, 10, 60_000))) {
     return c.json({ success: false, error: 'Too many checkout attempts. Please wait before retrying.' }, 429);
   }
   for (const item of body.items) {
@@ -351,7 +367,14 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     }
 
     const afterDiscount = Math.max(0, subtotal - discountKobo);
-    const vatKobo = Math.round(afterDiscount * VAT_RATE);
+    const svTaxConfig = (c.get('tenantConfig' as never) as { taxConfig?: { vatRate: number; vatRegistered: boolean; exemptCategories: string[] } } | undefined)?.taxConfig
+      ?? { vatRate: 0.075, vatRegistered: true, exemptCategories: [] };
+    const { vatKobo } = createTaxEngine(svTaxConfig).compute(
+      body.items.map((item, idx) => ({
+        category: (dbProducts[idx] as { category?: string } | null)?.category ?? 'general',
+        amountKobo: dbProducts[idx]!.price * item.quantity,
+      })).map(li => ({ ...li, amountKobo: Math.round(li.amountKobo * (subtotal > 0 ? afterDiscount / subtotal : 1)) })),
+    );
     const totalAmount = afterDiscount + vatKobo;
 
     const paystackSecret = c.env.PAYSTACK_SECRET ?? '';
@@ -608,8 +631,8 @@ app.post('/auth/request-otp', async (c) => {
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
 
   // Rate limit: 5 OTP requests per phone per 15 minutes
-  const rlKey = `${tenantId}:otp:${e164}`;
-  if (!checkRateLimit(otpRateLimitStore, rlKey, 5, 15 * 60 * 1000)) {
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
     return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
   }
 

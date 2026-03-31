@@ -6,8 +6,9 @@
  * Invariants: Nigeria-First (Paystack), Offline-First (sync), Multi-tenancy, PCI-DSS error hygiene
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, updateWithVersionLock } from '@webwaka/core';
+import { getTenantId, requireRole, updateWithVersionLock, createTaxEngine, checkRateLimit as kvCheckRateLimit } from '@webwaka/core';
 import { checkRateLimit, _createRateLimitStore, generatePayRef } from '../../utils';
+import type { RateLimitStore } from '../../utils';
 import type { Env } from '../../worker';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -17,6 +18,23 @@ const app = new Hono<{ Bindings: Env }>();
 // Exported for test teardown only — do NOT use in production code.
 const _rateLimitStore = _createRateLimitStore();
 export const _resetRateLimitStore = () => _rateLimitStore.clear();
+
+// KV-backed rate limiter — uses SESSIONS_KV in production; falls back to in-memory store in tests.
+async function kvCheckRL(
+  kv: KVNamespace | undefined,
+  store: RateLimitStore,
+  key: string,
+  maxRequests: number,
+  windowMs: number,
+): Promise<boolean> {
+  if (kv) {
+    const r = await kvCheckRateLimit({ kv, key, maxRequests, windowSeconds: Math.ceil(windowMs / 1000) });
+    return r.allowed;
+  }
+  return checkRateLimit(store, key, maxRequests, windowMs);
+}
+
+void createTaxEngine; // imported for future VAT computation in POS checkout
 const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
@@ -515,8 +533,8 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 
   // Rate limit: 10 checkouts/min per session_id (PCI hardening)
   if (body.session_id) {
-    const rateLimitKey = `${tenantId}:${body.session_id}`;
-    if (!checkRateLimit(_rateLimitStore, rateLimitKey, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS)) {
+    const rateLimitKey = `rl:checkout:${tenantId}:${body.session_id}`;
+    if (!(await kvCheckRL(c.env.SESSIONS_KV, _rateLimitStore, rateLimitKey, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS))) {
       return c.json({ success: false, error: 'Too many requests. Please wait before retrying.' }, 429);
     }
   }

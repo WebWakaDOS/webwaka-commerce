@@ -134,6 +134,27 @@ export interface SyncConflict {
   resolvedAt?: number;
 }
 
+// ─── Offline customer cache (P03) ────────────────────────────────────────────
+export interface OfflineCustomer {
+  id: string;
+  tenantId: string;
+  phone?: string;
+  email?: string;
+  name?: string;
+  creditBalanceKobo?: number;
+  updatedAt: number;
+}
+
+// ─── Vendor onboarding state (P03) ───────────────────────────────────────────
+export interface OnboardingState {
+  id?: number;
+  tenantId: string;
+  vendorId: string;
+  step: string;
+  data?: unknown;
+  updatedAt: number;
+}
+
 // ─── Multi-Vendor marketplace product cache (MV Offline-First) ───────────────
 export interface MvProduct {
   id: string;
@@ -180,6 +201,8 @@ export class CommerceOfflineDB extends Dexie {
   wishlists!: Table<OfflineWishlistItem, string>;
   mvProducts!: Table<MvProduct, string>;
   syncConflicts!: Table<SyncConflict, string>; // P0-T02
+  customers!: Table<OfflineCustomer, string>;  // P03
+  onboardingState!: Table<OnboardingState, number>; // P03
 
   constructor(tenantId: string) {
     super(`WebWakaCommerce_${tenantId}`);
@@ -265,6 +288,23 @@ export class CommerceOfflineDB extends Dexie {
       wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
       mvProducts: 'id, tenantId, vendorId, cachedAt',
       syncConflicts: 'id, tenantId, entityType, resolvedAt',
+    });
+
+    // v8 — P03: adds customers + onboardingState stores; extends products index with updatedAt
+    this.version(8).stores({
+      mutations: '++id, tenantId, entityType, entityId, status, timestamp',
+      cartItems: '++id, tenantId, sessionToken, productId',
+      offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
+      products: 'id, tenantId, sku, category, updatedAt',
+      posReceipts: 'id, orderId, tenantId, createdAt',
+      posSessions: 'id, tenantId, status, openedAt',
+      heldCarts: 'id, tenantId, heldAt',
+      storefrontCarts: 'id, tenantId, updatedAt',
+      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      mvProducts: 'id, tenantId, vendorId, cachedAt',
+      syncConflicts: 'id, tenantId, entityType, resolvedAt',
+      customers: 'id, tenantId, phone, updatedAt',
+      onboardingState: '++id, tenantId, vendorId, step, updatedAt',
     });
   }
 }

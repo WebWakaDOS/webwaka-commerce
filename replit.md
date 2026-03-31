@@ -270,3 +270,36 @@ See `.env.example` for reference:
 - **`playwright/pos-full-flow.spec.ts`**: Fixed 2 `string | undefined` TS errors — `match[1]` in `getCartCount` and `getOrderTotal` now uses `match[1] ?? '0'` null coalesce.
 
 **Test count: 801 passing, 0 TypeScript errors (production files), 0 bare catch blocks**
+
+---
+
+## P03 — Schema & Shared UI Foundation (session March 31 2026)
+
+### T001 — D1 Commerce Extension Migrations
+- **`migrations/0003_commerce_extensions.sql`** (new): 17 new tables + 2 `ALTER TABLE` columns on `customers`. Covers: `promotions`, `promo_redemptions`, `delivery_zones`, `order_deliveries`, `cart_sessions`, `cart_items`, `order_reviews`, `marketplace_orders`, `mv_vendor_orders`, `mv_vendor_order_items`, `vendor_payouts`, `vendor_payout_requests`, `vendor_bank_details`, `kv_snapshots`, `sync_log`, `tenant_feature_flags`, `shift_sessions_events`. Adds `loyalty_points` + `opt_in_marketing` to `customers`.
+
+### T002 — Dexie v8 Schema
+- **`src/core/offline/db.ts`**: Version 8 — adds `OfflineCustomer` + `OnboardingState` interfaces; `products` store gains `category` + `barcode` columns; new `customers` table (`id, tenantId, phone, loyaltyPoints, lastSyncedAt, &[tenantId+phone]`); new `onboardingState` table (`&tenantId`).
+
+### T003 — TaxEngine Wiring
+- **`src/modules/pos/api.ts`**: `createTaxEngine` imported; `TaxEngine` instance stored on `PosCore`; wired to checkout flow.
+- **`src/modules/single-vendor/api.ts`**: `createTaxEngine` replaces hardcoded `VAT_RATE * afterDiscount`; tenant `taxConfig` read from middleware context with fallback `{ vatRate: 0.075, vatRegistered: true, exemptCategories: [] }`.
+- **`src/app.tsx`**: `VAT_RATE = 0.075` constant removed; client-side preview total now uses `createTaxEngine(...).compute([...])`.
+- **`src/modules/multi-vendor/api.ts`**: `createTaxEngine` imported (ready for future marketplace VAT extension).
+
+### T004 — UserContext + RequireRole
+- **`src/contexts/UserContext.tsx`** (new): `UserContextValue` interface `{ userId, role, tenantId }`; `UserContext`; `useUserContext()` hook; `decodeJwtPayload()` helper.
+- **`src/components/RequireRole.tsx`** (new): HOC — renders `children` only when `userRole === role` (or role is in array); `fallback` defaults to `null`.
+- **`src/app.tsx`**: `CommerceApp` decodes `ww_user_jwt` from `sessionStorage`, initialises `userContextValue`, wraps entire tree in `<UserContext.Provider>`.
+- **`src/modules/pos/ui.tsx`**: `useUserContext()` at top of `POSInterface`; Dashboard tab button + Close Shift button (POS header) + Close Shift button (dashboard screen) all wrapped in `<RequireRole role="ADMIN" userRole={userRole}>`.
+
+### T005 — ConflictResolver
+- **`src/components/ConflictResolver.tsx`** (new): Polls `db.syncConflicts` (30s interval) for unresolved conflicts per tenant; renders badge button; modal with per-conflict "Accept Server State" (marks `resolvedAt`) and "Retry" (re-queues mutation + marks resolved) actions.
+- **`src/app.tsx`**: `<ConflictResolver tenantId={tenantId} />` rendered in POS status bar area and in `MarketplaceVendorDashboard` authenticated header.
+
+### T006 — KV-Backed Rate Limiter
+- **`src/modules/pos/api.ts`**: `kvCheckRL()` wrapper — uses `@webwaka/core` `checkRateLimit` (KV) in production, falls back to in-memory store in tests. All OTP + checkout rate limit calls updated; key format: `rl:otp:{e164}`, `rl:checkout:{ip}`.
+- **`src/modules/single-vendor/api.ts`**: Same wrapper; OTP key changed to `rl:otp:{e164}`; `_reset*` exports preserved.
+- **`src/modules/multi-vendor/api.ts`**: Same wrapper; all 5 call-sites updated: 2× OTP (`rl:otp:{e164}`), 1× checkout (`rl:checkout:{identity}`), 2× search (`rl:search:{ip}`). `_resetOtpRateLimitStore`, `_resetCheckoutRateLimitStore`, `_resetSearchRateLimitStore` preserved.
+
+**Test count: 801 passing (unchanged)**

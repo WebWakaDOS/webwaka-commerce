@@ -5,9 +5,13 @@
  */
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { createTaxEngine } from '@webwaka/core';
 import { getTranslations, getSupportedLanguages, getLanguageName, formatKoboToNaira, type Language } from './core/i18n';
 import { getCommerceDB, queueMutation, getPendingMutations, toggleWishlistItem, getWishlistItems } from './core/offline/db';
 import { useStorefrontCart } from './modules/single-vendor/useStorefrontCart';
+import { UserContext, decodeJwtPayload } from './contexts/UserContext';
+import type { UserContextValue } from './contexts/UserContext';
+import { ConflictResolver } from './components/ConflictResolver';
 
 // ============================================================
 // TYPES
@@ -393,7 +397,7 @@ const STATE_LGAS: Record<string, string[]> = {
   'Delta': ['Aniocha North','Aniocha South','Bomadi','Burutu','Ethiope East','Ethiope West','Ika North East','Ika South','Isoko North','Isoko South','Ndokwa East','Ndokwa West','Okpe','Oshimili North','Oshimili South','Patani','Sapele','Udu','Ughelli North','Ughelli South','Ukwuani','Uvwie','Warri North','Warri South','Warri South West'],
 };
 
-const VAT_RATE = 0.075; // FIRS 7.5%
+// VAT_RATE constant removed — use createTaxEngine({ vatRate: 0.075, vatRegistered: true, exemptCategories: [] }) instead
 
 declare global {
   interface Window {
@@ -590,7 +594,8 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   // ── Computed totals (client preview — server re-verifies) ─────────────────
   const subtotal = total; // from cart hook (kobo)
   const afterDiscount = Math.max(0, subtotal - promoDiscount);
-  const vatKobo = Math.round(afterDiscount * VAT_RATE);
+  const { vatKobo } = createTaxEngine({ vatRate: 0.075, vatRegistered: true, exemptCategories: [] })
+    .compute([{ category: 'general', amountKobo: afterDiscount }]);
   const grandTotal = afterDiscount + vatKobo + deliveryFeeKobo;
 
   // ── Catalog — paginated, search, category ────────────────────────────────
@@ -3021,9 +3026,12 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
           <div style={{ fontWeight: 700, fontSize: '15px' }}>{vendorName ?? 'My Store'}</div>
           <div style={{ fontSize: '11px', color: '#6b7280' }}>{vendorId}</div>
         </div>
-        <button onClick={handleLogout} style={{ padding: '6px 10px', border: '1px solid #fecaca', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '12px', cursor: 'pointer', fontWeight: 600 }}>
-          Sign Out
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <ConflictResolver tenantId={tenantId} />
+          <button onClick={handleLogout} style={{ padding: '6px 10px', border: '1px solid #fecaca', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '12px', cursor: 'pointer', fontWeight: 600 }}>
+            Sign Out
+          </button>
+        </div>
       </div>
 
       <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', overflowX: 'auto' }}>
@@ -3406,7 +3414,20 @@ export function CommerceApp() {
   const pendingCount = usePendingSync(tenantId);
   const [activeModule, setActiveModule] = useState<Module>('pos');
 
+  const [userContextValue] = useState<UserContextValue>(() => {
+    const jwt = sessionStorage.getItem('ww_user_jwt');
+    if (!jwt) return { userId: '', role: 'STAFF', tenantId };
+    const claims = decodeJwtPayload(jwt);
+    if (!claims) return { userId: '', role: 'STAFF', tenantId };
+    return {
+      userId: String(claims['sub'] ?? claims['user_id'] ?? ''),
+      role: String(claims['role'] ?? 'STAFF'),
+      tenantId: String(claims['tenant_id'] ?? tenantId),
+    };
+  });
+
   return (
+    <UserContext.Provider value={userContextValue}>
     <div
       data-testid="commerce-app"
       style={{
@@ -3415,7 +3436,12 @@ export function CommerceApp() {
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
       }}>
       {/* Status Bar */}
-      <StatusBar isOnline={isOnline} pendingCount={pendingCount} lang={lang} onChangeLang={changeLang} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <StatusBar isOnline={isOnline} pendingCount={pendingCount} lang={lang} onChangeLang={changeLang} />
+        <div style={{ paddingRight: '8px' }}>
+          <ConflictResolver tenantId={tenantId} />
+        </div>
+      </div>
 
       {/* Header */}
       <header style={{
@@ -3446,6 +3472,7 @@ export function CommerceApp() {
       {/* Bottom Navigation */}
       <BottomNav activeModule={activeModule} onSelect={setActiveModule} t={t} />
     </div>
+    </UserContext.Provider>
   );
 }
 

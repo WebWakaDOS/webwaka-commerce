@@ -11,6 +11,8 @@ import { useOfflineCart } from './useOfflineCart';
 import { useBackgroundSync } from './useBackgroundSync';
 import { holdCart, getHeldCarts, restoreHeldCart } from '../../core/offline/db';
 import type { HeldCart } from '../../core/offline/db';
+import { RequireRole } from '../../components/RequireRole';
+import { useUserContext } from '../../contexts/UserContext';
 
 // ─── Thermal receipt print styles (injected globally, stripped on unmount) ────
 const THERMAL_CSS = `
@@ -137,6 +139,9 @@ function getSessionToken(tenantId: string): string {
 }
 
 export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
+  // ── User role from session context ───────────────────────────────────────
+  const { role: userRole } = useUserContext();
+
   // ── Stable session token ─────────────────────────────────────────────────
   const sessionToken = useMemo(() => getSessionToken(tenantId), [tenantId]);
 
@@ -864,13 +869,15 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               ← Back to POS
             </button>
             {activeSession && (
-              <button
-                onClick={handleCloseShift}
-                disabled={shiftLoading}
-                style={{ padding: '0.35rem 0.75rem', background: '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}
-              >
-                {shiftLoading ? '…' : 'Close Shift'}
-              </button>
+              <RequireRole role="ADMIN" userRole={userRole}>
+                <button
+                  onClick={handleCloseShift}
+                  disabled={shiftLoading}
+                  style={{ padding: '0.35rem 0.75rem', background: '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '0.8rem' }}
+                >
+                  {shiftLoading ? '…' : 'Close Shift'}
+                </button>
+              </RequireRole>
             )}
           </div>
         </header>
@@ -1367,37 +1374,41 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           </button>
         )}
 
-        {/* Dashboard tab */}
-        <button
-          onClick={() => setScreen('dashboard')}
-          aria-label="Open dashboard"
-          style={{
-            padding: '0.35rem 0.65rem', background: '#374151', color: '#fff',
-            border: 'none', borderRadius: '4px', cursor: 'pointer',
-            fontSize: '0.78rem', whiteSpace: 'nowrap',
-          }}
-        >
-          Dashboard
-        </button>
+        {/* Dashboard tab — ADMIN only */}
+        <RequireRole role="ADMIN" userRole={userRole}>
+          <button
+            onClick={() => setScreen('dashboard')}
+            aria-label="Open dashboard"
+            style={{
+              padding: '0.35rem 0.65rem', background: '#374151', color: '#fff',
+              border: 'none', borderRadius: '4px', cursor: 'pointer',
+              fontSize: '0.78rem', whiteSpace: 'nowrap',
+            }}
+          >
+            Dashboard
+          </button>
+        </RequireRole>
 
-        {/* Cashier info + Close Shift */}
+        {/* Cashier info + Close Shift — Close Shift is ADMIN only */}
         {activeSession && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', borderLeft: '1px solid #374151', paddingLeft: '0.75rem' }}>
             <span style={{ fontSize: '0.75rem', color: '#86efac', whiteSpace: 'nowrap' }}>
               {activeSession.cashier_name ?? activeSession.cashier_id}
             </span>
-            <button
-              onClick={handleCloseShift}
-              disabled={shiftLoading}
-              aria-label="Close cashier shift"
-              style={{
-                padding: '0.3rem 0.55rem', background: '#7f1d1d', color: '#fff',
-                border: 'none', borderRadius: '4px', cursor: 'pointer',
-                fontSize: '0.72rem', whiteSpace: 'nowrap',
-              }}
-            >
-              {shiftLoading ? '…' : 'End Shift'}
-            </button>
+            <RequireRole role="ADMIN" userRole={userRole}>
+              <button
+                onClick={handleCloseShift}
+                disabled={shiftLoading}
+                aria-label="Close cashier shift"
+                style={{
+                  padding: '0.3rem 0.55rem', background: '#7f1d1d', color: '#fff',
+                  border: 'none', borderRadius: '4px', cursor: 'pointer',
+                  fontSize: '0.72rem', whiteSpace: 'nowrap',
+                }}
+              >
+                {shiftLoading ? '…' : 'End Shift'}
+              </button>
+            </RequireRole>
           </div>
         )}
       </header>

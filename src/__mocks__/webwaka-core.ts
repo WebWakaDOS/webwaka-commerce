@@ -165,6 +165,70 @@ export function createSmsProvider(_apiKey: string): ISmsProvider {
   };
 }
 
+// ── Tax Engine stub ───────────────────────────────────────────────────────────
+
+export interface TaxConfig {
+  vatRate: number;
+  vatRegistered: boolean;
+  exemptCategories: string[];
+}
+
+export interface TaxLineItem {
+  category: string;
+  amountKobo: number;
+}
+
+export interface TaxResult {
+  subtotalKobo: number;
+  vatKobo: number;
+  totalKobo: number;
+  vatBreakdown: { category: string; vatKobo: number }[];
+}
+
+export class TaxEngine {
+  private config: TaxConfig;
+  constructor(config: TaxConfig) { this.config = config; }
+  compute(items: TaxLineItem[]): TaxResult {
+    const { vatRate, vatRegistered, exemptCategories } = this.config;
+    const subtotalKobo = items.reduce((s, i) => s + i.amountKobo, 0);
+    let vatKobo = 0;
+    const vatBreakdown: { category: string; vatKobo: number }[] = [];
+    if (vatRegistered) {
+      for (const item of items) {
+        if (!exemptCategories.includes(item.category)) {
+          const itemVat = Math.round(item.amountKobo * vatRate);
+          vatKobo += itemVat;
+          vatBreakdown.push({ category: item.category, vatKobo: itemVat });
+        }
+      }
+    }
+    return { subtotalKobo, vatKobo, totalKobo: subtotalKobo + vatKobo, vatBreakdown };
+  }
+}
+
+export function createTaxEngine(config: TaxConfig): TaxEngine {
+  return new TaxEngine(config);
+}
+
+// ── KV Rate Limiter stub (mock: always allows) ────────────────────────────────
+
+export interface RateLimitOptions {
+  kv: KVNamespace;
+  key: string;
+  maxRequests: number;
+  windowSeconds: number;
+}
+
+export interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  resetAt: number;
+}
+
+export async function checkRateLimit(_opts: RateLimitOptions): Promise<RateLimitResult> {
+  return { allowed: true, remaining: 999, resetAt: Date.now() + 60_000 };
+}
+
 // ── Commerce Events constants ─────────────────────────────────────────────────
 
 export const CommerceEvents = {
