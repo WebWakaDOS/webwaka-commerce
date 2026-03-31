@@ -12,6 +12,28 @@ export interface InventorySyncPreferences {
   conflict_resolution: 'last_write_wins' | 'manual' | 'version_based';
 }
 
+export interface LoyaltyTier {
+  name: string;
+  minPoints: number;
+  discountBps: number;
+}
+
+export interface LoyaltyConfig {
+  pointsPerHundredKobo: number;
+  redeemRate: number;
+  tiers: LoyaltyTier[];
+}
+
+export const DEFAULT_LOYALTY_CONFIG: LoyaltyConfig = {
+  pointsPerHundredKobo: 1,
+  redeemRate: 100,
+  tiers: [
+    { name: 'BRONZE', minPoints: 0,    discountBps: 0   },
+    { name: 'SILVER', minPoints: 500,  discountBps: 250 },
+    { name: 'GOLD',   minPoints: 2000, discountBps: 500 },
+  ],
+};
+
 export interface TenantConfig {
   tenantId: string;
   marketplaceId?: string; // For scoped vendor tenants in a marketplace
@@ -24,6 +46,7 @@ export interface TenantConfig {
   permissions: Record<string, string[]>;
   featureFlags: Record<string, boolean>;
   inventorySyncPreferences?: InventorySyncPreferences;
+  loyalty?: LoyaltyConfig;
 }
 
 // 2. Module Registry

@@ -372,3 +372,48 @@ See `.env.example` for reference:
 - **Factory suite (3 tests):** all three methods present, defaults to sandbox endpoint, uses production endpoint when specified.
 
 **Test count: 817/817 passing (16 new), TypeScript clean**
+
+## Phase 11 — Promo Engine, Loyalty Tiers, Campaigns, Inventory Sync (session March 31 2026)
+
+### Migration 017 — `migrations/017_p11_promo_engine.sql`
+- Extends `promo_codes`: `promoType`, `minOrderValueKobo`, `maxUsesTotal`, `maxUsesPerCustomer`, `validFrom`, `validUntil`, `productScope`, `usedCount`.
+- New `promo_usage` table: `id, promoId, customerId, tenantId, usedAt`.
+- New `inventory_sync_log` table: `id, tenantId, productId, newQuantity, wishlistNotified, createdAt`.
+
+### TenantConfig — LoyaltyConfig extension (`src/core/tenant/index.ts`)
+- `LoyaltyConfig` type: `pointsPerHundredKobo`, `redeemRate`, `tiers[]` (each with name/minPoints/badge).
+- `DEFAULT_LOYALTY_CONFIG` exports BRONZE/SILVER/GOLD at 0/500/2000 pts (1pt per ₦100 spent, 100pts = ₦1 off).
+- `evaluateLoyaltyTier(points, config)` helper used in POS and SV.
+
+### POS api.ts — Loyalty Redemption at Checkout
+- `POST /checkout` accepts `redeem_points`; validates against `customer_loyalty` table, applies discount in kobo.
+- Step 8 (post-checkout): upserts `customer_loyalty`, syncs `customers.loyalty_points`, evaluates tier.
+- Returns `loyalty_earned`, `loyalty_redeemed`, `loyalty_balance`, `tier` in receipt.
+- `GET /customers/lookup` now also queries `customer_loyalty` for tier alongside `customers.loyalty_points`.
+
+### SV api.ts — Enhanced Promo Engine (7-rule validation)
+- Date window, min order value, total cap, per-customer cap, product scope filter, PERCENTAGE/FIXED/FREE_SHIPPING/BOGO types.
+- `promo_usage` row inserted after every successful promo application.
+- Loyalty earning (non-blocking) runs after checkout.
+
+### MV api.ts — Loyalty Earning + Campaign CRUD
+- Loyalty points earned for each vendor sub-order after marketplace checkout.
+- Campaign endpoints: `POST /admin/campaigns`, `POST /campaigns/:id/opt-in`, `GET /campaigns/active`, `GET /campaigns/:id/products`.
+
+### worker.ts — Campaign Status Cron
+- Hourly cron appended to scheduled handler: DRAFT→ACTIVE when `startDate <= now < endDate`; ACTIVE→ENDED when `endDate <= now`.
+
+### event-bus handlers — Full `handleInventoryUpdated`
+- KV invalidation: increments `catalog_version:{tenantId}` and deletes `catalog:{tenantId}` + `product:{productId}` keys.
+- Back-in-stock: queries `wishlists` for up to 100 affected customers, sends WhatsApp via Termii `sendOtp('whatsapp')`.
+- Audit log inserted to `inventory_sync_log` with `wishlistNotified` count.
+
+### POS UI — Loyalty Display + Redeem Option (`src/modules/pos/ui.tsx`)
+- Customer lookup sets `customerLoyaltyPoints`, `customerLoyaltyTier` state.
+- Loyalty badge shown inline (BRONZE/SILVER/GOLD with matching colours) after customer is found.
+- "Redeem pts" number input visible only when customer has points > 0; capped at their balance.
+- `redeem_points` included in checkout body; `customer_phone` always passed when set.
+- Receipt expanded: shows pts redeemed (red), pts earned (green), new balance, and tier.
+- All loyalty state cleared on hold, checkout, and receipt dismiss.
+
+**TypeScript clean, Vite starts with no errors.**

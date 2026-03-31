@@ -101,6 +101,9 @@ interface ReceiptData {
   issued_at?: number;
   items?: unknown[];
   loyalty_earned?: number;
+  loyalty_redeemed?: number;
+  loyalty_balance?: number;
+  tier?: string;
 }
 
 type PaymentMode = 'cash' | 'card' | 'transfer' | 'split' | 'cod' | 'agency_banking';
@@ -267,6 +270,10 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [customerPhone, setCustomerPhone] = useState('');
   const [customerSearching, setCustomerSearching] = useState(false);
   const [heldCarts, setHeldCarts] = useState<HeldCart[]>([]);
+  // ── P11: Loyalty tier system ──────────────────────────────────────────────
+  const [customerLoyaltyPoints, setCustomerLoyaltyPoints] = useState(0);
+  const [customerLoyaltyTier, setCustomerLoyaltyTier] = useState('BRONZE');
+  const [redeemPointsInput, setRedeemPointsInput] = useState('');
   const productGridRef = useRef<HTMLDivElement>(null);
 
   // ── Phase 5: Active session / shift ──────────────────────────────────────
@@ -527,7 +534,9 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         .first();
       if (offlineMatch) {
         setCustomerId(offlineMatch.id);
-        setCustomerName(`${offlineMatch.name} (${offlineMatch.loyaltyPoints ?? 0} pts)`);
+        setCustomerLoyaltyPoints(offlineMatch.loyaltyPoints ?? 0);
+        setCustomerLoyaltyTier('BRONZE');
+        setCustomerName(`${offlineMatch.name}`);
         setCustomerSearching(false);
         return;
       }
@@ -537,14 +546,18 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         headers: { 'x-tenant-id': tenantId },
       });
       if (res.ok) {
-        const json = (await res.json()) as { success: boolean; data: { id: string; name: string; loyalty_points: number } };
+        const json = (await res.json()) as { success: boolean; data: { id: string; name: string; loyalty_points: number; tier?: string } };
         if (json.success) {
           setCustomerId(json.data.id);
-          setCustomerName(`${json.data.name} (${json.data.loyalty_points} pts)`);
+          setCustomerLoyaltyPoints(json.data.loyalty_points ?? 0);
+          setCustomerLoyaltyTier(json.data.tier ?? 'BRONZE');
+          setCustomerName(`${json.data.name}`);
         }
       } else if (res.status === 404) {
         setCustomerName('Not found — will create on checkout');
         setCustomerId(null);
+        setCustomerLoyaltyPoints(0);
+        setCustomerLoyaltyTier('BRONZE');
       }
     } catch { /* offline — Dexie already handled it above */ } finally {
       setCustomerSearching(false);
@@ -695,6 +708,9 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       setCustomerId(null);
       setCustomerName(null);
       setCustomerPhone('');
+      setCustomerLoyaltyPoints(0);
+      setCustomerLoyaltyTier('BRONZE');
+      setRedeemPointsInput('');
       const updated = await getHeldCarts(tenantId);
       setHeldCarts(updated);
     } catch { /* no-op */ }
@@ -915,6 +931,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     }
 
     try {
+      const redeemPts = parseInt(redeemPointsInput, 10);
       const res = await fetch('/api/pos/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
@@ -929,7 +946,8 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           session_id: activeSession?.id ?? sessionToken,
           ...(discountPctNum > 0 && { discount_pct: discountPctNum }),
           ...(customerId && { customer_id: customerId }),
-          ...(customerPhone.trim() && !customerId && { customer_phone: customerPhone.trim() }),
+          ...(customerPhone.trim() && { customer_phone: customerPhone.trim() }),
+          ...(redeemPts > 0 && customerPhone.trim() && { redeem_points: redeemPts }),
           include_vat: true,
         }),
       });
@@ -987,13 +1005,16 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       setCustomerId(null);
       setCustomerName(null);
       setCustomerPhone('');
+      setCustomerLoyaltyPoints(0);
+      setCustomerLoyaltyTier('BRONZE');
+      setRedeemPointsInput('');
     } catch {
       setCheckoutError('Network error. Check connection and retry.');
     }
   }, [
     cart, isOnline, paymentMode, splitLegsValid, splitLegsTotal, totalAmount,
     buildPayments, setCart, clearPersistedCart, tenantId, sessionToken,
-    discountPctNum, customerId, customerPhone, activeSession,
+    discountPctNum, customerId, customerPhone, activeSession, redeemPointsInput,
   ]);
 
   // ── Phase 6 (P06): PIN overlay — covers any screen when PIN is required ────
@@ -1600,14 +1621,31 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
           <hr className="receipt-divider" style={{ border: 'none', borderTop: '1px dashed #ccc', margin: '0.75rem 0' }} />
 
-          {receipt.loyalty_earned != null && receipt.loyalty_earned > 0 && (
+          {(receipt.loyalty_earned != null || receipt.loyalty_redeemed != null) && (
             <div
               aria-live="polite"
-              style={{ marginTop: '0.5rem', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px', padding: '0.4rem 0.6rem', textAlign: 'center' }}
+              style={{ marginTop: '0.5rem', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px', padding: '0.45rem 0.7rem' }}
             >
-              <span style={{ fontWeight: 700, color: '#16a34a', fontSize: '0.82rem' }}>
-                +{receipt.loyalty_earned} loyalty point{receipt.loyalty_earned !== 1 ? 's' : ''} earned!
-              </span>
+              {receipt.loyalty_redeemed != null && receipt.loyalty_redeemed > 0 && (
+                <div style={{ fontSize: '0.78rem', color: '#dc2626', marginBottom: '0.15rem' }}>
+                  -{receipt.loyalty_redeemed} pts redeemed
+                </div>
+              )}
+              {receipt.loyalty_earned != null && receipt.loyalty_earned > 0 && (
+                <div style={{ fontWeight: 700, color: '#16a34a', fontSize: '0.82rem', textAlign: 'center' }}>
+                  +{receipt.loyalty_earned} loyalty point{receipt.loyalty_earned !== 1 ? 's' : ''} earned!
+                </div>
+              )}
+              {receipt.loyalty_balance != null && (
+                <div style={{ fontSize: '0.72rem', color: '#374151', marginTop: '0.1rem', textAlign: 'center' }}>
+                  Balance: <strong>{receipt.loyalty_balance} pts</strong>
+                  {receipt.tier && (
+                    <span style={{ marginLeft: '0.4rem', fontWeight: 600, color: receipt.tier === 'GOLD' ? '#b45309' : receipt.tier === 'SILVER' ? '#64748b' : '#78350f' }}>
+                      · {receipt.tier}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -2234,14 +2272,40 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               </button>
             </div>
             {customerName && (
-              <div
-                aria-live="polite"
-                style={{
-                  marginTop: '0.25rem', fontSize: '0.72rem',
-                  color: customerId ? '#16a34a' : '#6b7280',
-                }}
-              >
-                {customerId ? `✓ ${customerName}` : customerName}
+              <div aria-live="polite" style={{ marginTop: '0.25rem' }}>
+                <div style={{ fontSize: '0.72rem', color: customerId ? '#16a34a' : '#6b7280' }}>
+                  {customerId ? `✓ ${customerName}` : customerName}
+                </div>
+                {customerId && customerLoyaltyPoints >= 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', marginTop: '0.2rem' }}>
+                    <span style={{
+                      fontSize: '0.68rem', fontWeight: 600,
+                      padding: '0.1rem 0.35rem', borderRadius: '999px',
+                      background: customerLoyaltyTier === 'GOLD' ? '#fef9c3' : customerLoyaltyTier === 'SILVER' ? '#f1f5f9' : '#fef3c7',
+                      color: customerLoyaltyTier === 'GOLD' ? '#854d0e' : customerLoyaltyTier === 'SILVER' ? '#475569' : '#92400e',
+                      border: `1px solid ${customerLoyaltyTier === 'GOLD' ? '#fde047' : customerLoyaltyTier === 'SILVER' ? '#cbd5e1' : '#fcd34d'}`,
+                    }}>
+                      {customerLoyaltyTier === 'GOLD' ? '🥇' : customerLoyaltyTier === 'SILVER' ? '🥈' : '🟤'} {customerLoyaltyTier}
+                    </span>
+                    <span style={{ fontSize: '0.68rem', color: '#6b7280' }}>{customerLoyaltyPoints} pts</span>
+                  </div>
+                )}
+                {customerId && customerLoyaltyPoints > 0 && (
+                  <div style={{ marginTop: '0.3rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                    <label style={{ fontSize: '0.68rem', color: '#374151', whiteSpace: 'nowrap' }}>Redeem pts:</label>
+                    <input
+                      type="number" min="0" max={customerLoyaltyPoints} step="1"
+                      placeholder="0"
+                      value={redeemPointsInput}
+                      onChange={(e) => setRedeemPointsInput(e.target.value)}
+                      aria-label="Points to redeem"
+                      style={{ width: '60px', padding: '0.15rem 0.3rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.72rem', textAlign: 'right' }}
+                    />
+                    <span style={{ fontSize: '0.66rem', color: '#9ca3af' }}>
+                      (≡ ₦{((parseInt(redeemPointsInput || '0', 10)) * 1).toFixed(0)})
+                    </span>
+                  </div>
+                )}
               </div>
             )}
             {heldCarts.length > 0 && (

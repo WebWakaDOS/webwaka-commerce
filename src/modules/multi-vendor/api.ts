@@ -30,6 +30,12 @@ import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
 import type { RateLimitStore } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
+import { DEFAULT_LOYALTY_CONFIG, type LoyaltyConfig } from '../../core/tenant/index';
+
+function evaluateLoyaltyTierMv(points: number, cfg: LoyaltyConfig): string {
+  const sorted = [...cfg.tiers].sort((a, b) => b.minPoints - a.minPoints);
+  return sorted.find((t) => points >= t.minPoints)?.name ?? 'BRONZE';
+}
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -1138,6 +1144,39 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       }).catch(() => { /* non-fatal */ });
     }
 
+    // ── Award loyalty points to buyer (POS-E10, non-blocking) ────────────────
+    void (async () => {
+      try {
+        const mvLoyaltyCfg = (c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty ?? DEFAULT_LOYALTY_CONFIG;
+        const mvLoyaltyEarned = Math.floor(subtotal / 10000) * mvLoyaltyCfg.pointsPerHundredKobo;
+        if (mvLoyaltyEarned <= 0) return;
+        const phone = body.customer_phone ?? '';
+        if (!phone) return;
+        const custRow = await c.env.DB.prepare(
+          'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+        ).bind(tenantId, phone).first<{ id: string }>();
+        if (!custRow) return;
+        const existing = await c.env.DB.prepare(
+          'SELECT id, points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?'
+        ).bind(tenantId, custRow.id).first<{ id: string; points: number }>();
+        const prevPts = existing?.points ?? 0;
+        const newPts = prevPts + mvLoyaltyEarned;
+        const newTierMv = evaluateLoyaltyTierMv(newPts, mvLoyaltyCfg);
+        if (existing) {
+          await c.env.DB.prepare(
+            'UPDATE customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
+          ).bind(newPts, newTierMv, new Date(now).toISOString(), tenantId, custRow.id).run();
+        } else {
+          const lid = `loy_mv_${now}_${Math.random().toString(36).slice(2, 9)}`;
+          await c.env.DB.prepare(
+            'INSERT OR IGNORE INTO customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
+          ).bind(lid, tenantId, custRow.id, mvLoyaltyEarned, evaluateLoyaltyTierMv(mvLoyaltyEarned, mvLoyaltyCfg), new Date(now).toISOString()).run();
+        }
+      } catch { /* non-fatal */ }
+    })();
+
+    const mvLoyaltyEarnedFinal = Math.floor(subtotal / 10000) * ((c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty?.pointsPerHundredKobo ?? DEFAULT_LOYALTY_CONFIG.pointsPerHundredKobo);
+
     return c.json({
       success: true,
       data: {
@@ -1150,6 +1189,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         vendor_count: vendorCount,
         vendor_breakdown: breakdownMap,
         vendor_sub_order_ids: vendorSubOrderIds,
+        loyalty_earned: mvLoyaltyEarnedFinal,
       },
     }, 201);
   } catch (err) {
@@ -3135,6 +3175,144 @@ app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMI
     console.error('[MV] admin/disputes/resolve error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P11 — MARKETPLACE CAMPAIGNS (MV-E10)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /admin/campaigns — Create a marketplace-wide discount campaign (admin only)
+ * Body: { name, discountType, discountValue, startDate, endDate }
+ */
+app.post('/admin/campaigns', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Invalid admin key' }, 403);
+  }
+  const body = await c.req.json<{
+    name: string;
+    discountType: 'PERCENTAGE' | 'FIXED';
+    discountValue: number;
+    startDate: string;
+    endDate: string;
+  }>();
+  if (!body.name?.trim()) return c.json({ success: false, error: 'name is required' }, 400);
+  if (!['PERCENTAGE', 'FIXED'].includes(body.discountType)) return c.json({ success: false, error: 'discountType must be PERCENTAGE or FIXED' }, 400);
+  if (typeof body.discountValue !== 'number' || body.discountValue <= 0) return c.json({ success: false, error: 'discountValue must be a positive number' }, 400);
+  if (!body.startDate || !body.endDate) return c.json({ success: false, error: 'startDate and endDate are required' }, 400);
+  if (body.startDate >= body.endDate) return c.json({ success: false, error: 'startDate must be before endDate' }, 400);
+
+  const now = Date.now();
+  const id = `cmp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+  await c.env.DB.prepare(
+    `INSERT INTO marketplace_campaigns (id, tenantId, name, discountType, discountValue, startDate, endDate, status, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?)`
+  ).bind(id, tenantId, body.name.trim(), body.discountType, body.discountValue, body.startDate, body.endDate, new Date(now).toISOString()).run();
+
+  return c.json({ success: true, data: { id, name: body.name.trim(), status: 'DRAFT' } }, 201);
+});
+
+/**
+ * POST /campaigns/:id/opt-in — Vendor opts products into a campaign
+ * Body: { productIds?: string[] }
+ * Requires vendor JWT
+ */
+app.post('/campaigns/:id/opt-in', async (c) => {
+  const tenantId = getTenantId(c);
+  const campaignId = c.req.param('id');
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const body = await c.req.json<{ productIds?: string[] }>();
+  const productIds = Array.isArray(body.productIds) ? body.productIds : [];
+
+  const campaign = await c.env.DB.prepare(
+    'SELECT id, status FROM marketplace_campaigns WHERE id = ? AND tenantId = ?'
+  ).bind(campaignId, tenantId).first<{ id: string; status: string }>();
+  if (!campaign) return c.json({ success: false, error: 'Campaign not found' }, 404);
+  if (campaign.status === 'ENDED') return c.json({ success: false, error: 'Campaign has ended' }, 422);
+
+  await c.env.DB.prepare(
+    'INSERT OR REPLACE INTO campaign_vendor_opt_ins (campaignId, vendorId, productIds) VALUES (?, ?, ?)'
+  ).bind(campaignId, vendor.vendorId, productIds.length > 0 ? JSON.stringify(productIds) : null).run();
+
+  return c.json({ success: true, data: { campaignId, vendorId: vendor.vendorId, productCount: productIds.length || 'all' } });
+});
+
+/**
+ * GET /campaigns/active — List active campaigns with participating vendors
+ */
+app.get('/campaigns/active', async (c) => {
+  const tenantId = getTenantId(c);
+  const rows = await c.env.DB.prepare(
+    `SELECT c.id, c.name, c.discountType, c.discountValue, c.startDate, c.endDate, c.status,
+            json_group_array(o.vendorId) as participatingVendors
+     FROM marketplace_campaigns c
+     LEFT JOIN campaign_vendor_opt_ins o ON c.id = o.campaignId
+     WHERE c.tenantId = ? AND c.status = 'ACTIVE'
+     GROUP BY c.id
+     ORDER BY c.startDate DESC`
+  ).bind(tenantId).all<{ id: string; name: string; discountType: string; discountValue: number; startDate: string; endDate: string; status: string; participatingVendors: string }>();
+
+  const data = (rows.results ?? []).map((r) => ({
+    ...r,
+    participatingVendors: (() => {
+      try { const v = JSON.parse(r.participatingVendors) as string[]; return v.filter(Boolean); } catch { return []; }
+    })(),
+  }));
+
+  return c.json({ success: true, data });
+});
+
+/**
+ * GET /campaigns/:id/products — Products from opted-in vendors with campaign discount applied
+ */
+app.get('/campaigns/:id/products', async (c) => {
+  const tenantId = getTenantId(c);
+  const campaignId = c.req.param('id');
+
+  const campaign = await c.env.DB.prepare(
+    'SELECT id, name, discountType, discountValue, status FROM marketplace_campaigns WHERE id = ? AND tenantId = ?'
+  ).bind(campaignId, tenantId).first<{ id: string; name: string; discountType: string; discountValue: number; status: string }>();
+  if (!campaign) return c.json({ success: false, error: 'Campaign not found' }, 404);
+
+  const optIns = await c.env.DB.prepare(
+    'SELECT vendorId, productIds FROM campaign_vendor_opt_ins WHERE campaignId = ?'
+  ).bind(campaignId).all<{ vendorId: string; productIds: string | null }>();
+
+  const results: Array<{
+    productId: string; productName: string; vendorId: string; originalPriceKobo: number;
+    campaignPriceKobo: number; discountType: string; discountValue: number;
+  }> = [];
+
+  for (const optIn of optIns.results ?? []) {
+    let scopeIds: string[] | null = null;
+    try { if (optIn.productIds) scopeIds = JSON.parse(optIn.productIds) as string[]; } catch { /* no-op */ }
+
+    const whereClause = scopeIds
+      ? `AND id IN (${scopeIds.map(() => '?').join(',')})`
+      : '';
+    const bindings: (string | null)[] = [tenantId, optIn.vendorId, ...(scopeIds ?? [])];
+
+    const products = await c.env.DB.prepare(
+      `SELECT id, name, price FROM products WHERE tenant_id = ? AND vendor_id = ? AND is_active = 1 AND deleted_at IS NULL ${whereClause} LIMIT 50`
+    ).bind(...bindings).all<{ id: string; name: string; price: number }>();
+
+    for (const p of products.results ?? []) {
+      const discountKobo = campaign.discountType === 'PERCENTAGE'
+        ? Math.round(p.price * campaign.discountValue / 100)
+        : Math.min(campaign.discountValue, p.price);
+      results.push({
+        productId: p.id, productName: p.name, vendorId: optIn.vendorId,
+        originalPriceKobo: p.price, campaignPriceKobo: Math.max(0, p.price - discountKobo),
+        discountType: campaign.discountType, discountValue: campaign.discountValue,
+      });
+    }
+  }
+
+  return c.json({ success: true, data: { campaign, products: results } });
 });
 
 export { app as multiVendorRouter };

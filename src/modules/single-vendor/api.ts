@@ -23,6 +23,12 @@ import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
 import type { RateLimitStore } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
+import { DEFAULT_LOYALTY_CONFIG, type LoyaltyConfig } from '../../core/tenant/index';
+
+function evaluateLoyaltyTier(points: number, cfg: LoyaltyConfig): string {
+  const sorted = [...cfg.tiers].sort((a, b) => b.minPoints - a.minPoints);
+  return sorted.find((t) => points >= t.minPoints)?.name ?? 'BRONZE';
+}
 
 const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify';
 const DEFAULT_PAGE_SIZE = 24;
@@ -347,23 +353,88 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     const subtotal = body.items.reduce((s, item, idx) => s + dbProducts[idx]!.price * item.quantity, 0);
 
     let discountKobo = 0;
-    let promoRow: { id: string; discount_type: string; discount_value: number } | null = null;
+    let freeShipping = false;
+    interface SvPromoRow { id: string; discount_type: string; discount_value: number; promoType: string | null }
+    let promoRow: SvPromoRow | null = null;
 
     if (body.promo_code && body.promo_code.trim() !== '') {
-      interface PromoRow { id: string; code: string; discount_type: string; discount_value: number; min_order_kobo: number; max_uses: number; current_uses: number; expires_at: number | null; is_active: number }
+      interface EnhancedPromoRow {
+        id: string; code: string; discount_type: string; discount_value: number;
+        min_order_kobo: number; max_uses: number; current_uses: number;
+        expires_at: number | null; is_active: number;
+        promoType: string | null; minOrderValueKobo: number | null;
+        maxUsesTotal: number | null; maxUsesPerCustomer: number | null;
+        validFrom: string | null; validUntil: string | null;
+        productScope: string | null; usedCount: number;
+      }
       const promo = await c.env.DB.prepare(
-        `SELECT id, code, discount_type, discount_value, min_order_kobo, max_uses, current_uses, expires_at, is_active
+        `SELECT id, code, discount_type, discount_value, min_order_kobo, max_uses, current_uses, expires_at, is_active,
+                promoType, minOrderValueKobo, maxUsesTotal, maxUsesPerCustomer, validFrom, validUntil, productScope, usedCount
          FROM promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
-      ).bind(tenantId, body.promo_code.toUpperCase().trim()).first<PromoRow>();
+      ).bind(tenantId, body.promo_code.toUpperCase().trim()).first<EnhancedPromoRow>();
 
       if (!promo) return c.json({ success: false, error: 'Promo code not found' }, 422);
       if (!promo.is_active) return c.json({ success: false, error: 'Promo code is not active' }, 422);
-      if (promo.expires_at && promo.expires_at < Date.now()) return c.json({ success: false, error: 'Promo code has expired' }, 422);
-      if (promo.max_uses > 0 && promo.current_uses >= promo.max_uses) return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
-      if (subtotal < promo.min_order_kobo) return c.json({ success: false, error: 'Minimum order required for this promo code' }, 422);
 
-      discountKobo = computeDiscount(promo.discount_type, promo.discount_value, subtotal);
-      promoRow = { id: promo.id, discount_type: promo.discount_type, discount_value: promo.discount_value };
+      // 1. Date window check (validFrom / validUntil)
+      const nowIso = new Date(Date.now()).toISOString();
+      if (promo.validFrom && nowIso < promo.validFrom) return c.json({ success: false, error: 'Promo code is not yet active' }, 422);
+      if (promo.validUntil && nowIso > promo.validUntil) return c.json({ success: false, error: 'Promo code has expired' }, 422);
+      if (promo.expires_at && promo.expires_at < Date.now()) return c.json({ success: false, error: 'Promo code has expired' }, 422);
+
+      // 2. Minimum order value
+      const minOrder = promo.minOrderValueKobo ?? promo.min_order_kobo;
+      if (subtotal < minOrder) return c.json({ success: false, error: `Minimum order of ₦${(minOrder / 100).toFixed(2)} required for this promo code` }, 422);
+
+      // 3. Total usage cap
+      const usageCap = promo.maxUsesTotal ?? (promo.max_uses > 0 ? promo.max_uses : null);
+      const usedSoFar = promo.usedCount > 0 ? promo.usedCount : promo.current_uses;
+      if (usageCap !== null && usedSoFar >= usageCap) return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
+
+      // 4. Per-customer usage cap
+      if (promo.maxUsesPerCustomer !== null && promo.maxUsesPerCustomer > 0) {
+        const promoCustomerKey = body.customer_phone ?? body.customer_email ?? '';
+        if (promoCustomerKey) {
+          const usageRow = await c.env.DB.prepare(
+            'SELECT COUNT(*) as cnt FROM promo_usage WHERE promoId = ? AND customerId = ? AND tenantId = ?'
+          ).bind(promo.id, promoCustomerKey, tenantId).first<{ cnt: number }>();
+          if ((usageRow?.cnt ?? 0) >= promo.maxUsesPerCustomer) {
+            return c.json({ success: false, error: 'You have already used this promo code the maximum number of times' }, 422);
+          }
+        }
+      }
+
+      // 5 & 6. Compute discount by promoType (extended types + backward compat)
+      const effectiveType = promo.promoType ?? promo.discount_type;
+
+      if (effectiveType === 'FREE_SHIPPING') {
+        freeShipping = true;
+        discountKobo = 0;
+      } else if (effectiveType === 'BOGO') {
+        // For each qualifying item pair, the cheaper unit is free (unit price × floor(qty/2))
+        let bogoScope: string[] | null = null;
+        try { bogoScope = promo.productScope ? (JSON.parse(promo.productScope) as string[]) : null; } catch { /* no-op */ }
+        let bogoDiscount = 0;
+        for (let i = 0; i < body.items.length; i++) {
+          const item = body.items[i]!;
+          if (bogoScope && !bogoScope.includes(item.product_id)) continue;
+          const pairsQty = Math.floor(item.quantity / 2);
+          bogoDiscount += pairsQty * (dbProducts[i]?.price ?? item.price);
+        }
+        discountKobo = Math.min(bogoDiscount, subtotal);
+      } else {
+        // Scope-filtered discount (PERCENTAGE / FIXED / pct / flat)
+        let applicableAmount = subtotal;
+        if (promo.productScope) {
+          let scopeIds: string[] = [];
+          try { scopeIds = JSON.parse(promo.productScope) as string[]; } catch { /* no-op */ }
+          applicableAmount = body.items.reduce((s, item, idx) =>
+            scopeIds.includes(item.product_id) ? s + (dbProducts[idx]?.price ?? item.price) * item.quantity : s, 0);
+        }
+        discountKobo = computeDiscount(effectiveType, promo.discount_value, applicableAmount);
+      }
+
+      promoRow = { id: promo.id, discount_type: promo.discount_type, discount_value: promo.discount_value, promoType: effectiveType };
     }
 
     const afterDiscount = Math.max(0, subtotal - discountKobo);
@@ -485,12 +556,54 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     if (promoRow) {
       stmts.push(
         c.env.DB.prepare(
-          'UPDATE promo_codes SET current_uses = current_uses + 1, updated_at = ? WHERE id = ? AND tenant_id = ?'
+          'UPDATE promo_codes SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ? WHERE id = ? AND tenant_id = ?'
         ).bind(now, promoRow.id, tenantId)
       );
     }
 
     await c.env.DB.batch(stmts);
+
+    // ── Track promo usage per customer (non-fatal) ────────────────────────────
+    if (promoRow) {
+      const promoCustomerKey = body.customer_phone ?? body.customer_email ?? '';
+      if (promoCustomerKey) {
+        const puId = `pu_${now}_${Math.random().toString(36).slice(2, 9)}`;
+        c.env.DB.prepare(
+          'INSERT OR IGNORE INTO promo_usage (id, promoId, customerId, tenantId, usedAt) VALUES (?, ?, ?, ?, ?)'
+        ).bind(puId, promoRow.id, promoCustomerKey, tenantId, new Date(now).toISOString()).run().catch(() => {});
+      }
+    }
+
+    // ── Award loyalty points in customer_loyalty table (POS-E10, non-blocking) ─
+    void (async () => {
+      try {
+        const svLoyaltyCfg = (c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty ?? DEFAULT_LOYALTY_CONFIG;
+        const svLoyaltyEarned = Math.floor(totalAmount / 10000) * svLoyaltyCfg.pointsPerHundredKobo;
+        if (svLoyaltyEarned <= 0) return;
+        const phone = body.customer_phone ?? '';
+        if (!phone) return;
+        const custRow = await c.env.DB.prepare(
+          'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+        ).bind(tenantId, phone).first<{ id: string }>();
+        if (!custRow) return;
+        const existing = await c.env.DB.prepare(
+          'SELECT id, points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?'
+        ).bind(tenantId, custRow.id).first<{ id: string; points: number }>();
+        const prevPts = existing?.points ?? 0;
+        const newPts = prevPts + svLoyaltyEarned;
+        const newTier = evaluateLoyaltyTier(newPts, svLoyaltyCfg);
+        if (existing) {
+          await c.env.DB.prepare(
+            'UPDATE customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
+          ).bind(newPts, newTier, new Date(now).toISOString(), tenantId, custRow.id).run();
+        } else {
+          const lid = `loy_sv_${now}_${Math.random().toString(36).slice(2, 9)}`;
+          await c.env.DB.prepare(
+            'INSERT OR IGNORE INTO customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
+          ).bind(lid, tenantId, custRow.id, svLoyaltyEarned, evaluateLoyaltyTier(svLoyaltyEarned, svLoyaltyCfg), new Date(now).toISOString()).run();
+        }
+      } catch { /* non-fatal */ }
+    })();
 
     // ── Publish delivery request via CF Queues (P05-T1) ───────────────────
     const svTenantCfg = c.get('tenantConfig' as never) as { storeAddress?: unknown } | undefined;
@@ -511,12 +624,15 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       },
     }).catch(() => { /* non-fatal: logistics system retries on CF Queues */ });
 
+    const svLoyaltyEarnedFinal = Math.floor(totalAmount / 10000) * ((c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty?.pointsPerHundredKobo ?? DEFAULT_LOYALTY_CONFIG.pointsPerHundredKobo);
     return c.json({
       success: true,
       data: {
         id: orderId, subtotal, discount_kobo: discountKobo, vat_kobo: vatKobo,
         total_amount: totalAmount, payment_reference: body.paystack_reference,
         payment_status: 'paid', order_status: 'confirmed', items_count: body.items.length,
+        ...(freeShipping ? { free_shipping: true } : {}),
+        loyalty_earned: svLoyaltyEarnedFinal,
       },
     }, 201);
   } catch (err) {
@@ -1390,8 +1506,9 @@ app.patch('/admin/reviews/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), as
 });
 
 export function computeDiscount(discountType: string, discountValue: number, subtotalKobo: number): number {
-  if (discountType === 'flat') return Math.min(discountValue, subtotalKobo);
-  if (discountType === 'pct') return Math.round((subtotalKobo * discountValue) / 100);
+  if (discountType === 'flat' || discountType === 'FIXED') return Math.min(discountValue, subtotalKobo);
+  if (discountType === 'pct' || discountType === 'PERCENTAGE') return Math.round((subtotalKobo * discountValue) / 100);
+  // FREE_SHIPPING and BOGO are handled at checkout level with full item context
   return 0;
 }
 

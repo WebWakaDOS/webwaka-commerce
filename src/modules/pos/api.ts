@@ -11,6 +11,12 @@ import { checkRateLimit, _createRateLimitStore, generatePayRef } from '../../uti
 import type { RateLimitStore } from '../../utils';
 import type { Env } from '../../worker';
 import { publishEvent } from '../../core/event-bus';
+import { DEFAULT_LOYALTY_CONFIG, type LoyaltyConfig } from '../../core/tenant/index';
+
+function evaluateLoyaltyTier(points: number, cfg: LoyaltyConfig): string {
+  const sorted = [...cfg.tiers].sort((a, b) => b.minPoints - a.minPoints);
+  return sorted.find((t) => points >= t.minPoints)?.name ?? 'BRONZE';
+}
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -495,14 +501,21 @@ app.get('/customers/lookup', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
       'SELECT id, name, phone, loyalty_points, total_spend FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
     ).bind(tenantId, phone).first<{ id: string; name: string | null; phone: string; loyalty_points: number; total_spend: number }>();
     if (!customer) return c.json({ success: false, error: 'Customer not found' }, 404);
+
+    // Fetch tier from customer_loyalty table (P11)
+    const loyaltyRow = await c.env.DB.prepare(
+      'SELECT points, tier FROM customer_loyalty WHERE tenantId = ? AND customerId = ?'
+    ).bind(tenantId, customer.id).first<{ points: number; tier: string }>();
+
     return c.json({
       success: true,
       data: {
         id: customer.id,
         name: customer.name ?? customer.phone,
         phone: customer.phone,
-        loyalty_points: customer.loyalty_points ?? 0,
+        loyalty_points: loyaltyRow?.points ?? customer.loyalty_points ?? 0,
         total_spend: customer.total_spend ?? 0,
+        tier: loyaltyRow?.tier ?? 'BRONZE',
       },
     });
   } catch (err) {
@@ -663,6 +676,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     customer_email?: string;
     customer_phone?: string;
     discount?: number;
+    redeem_points?: number;
   }>();
 
   // Normalize: accept line_items or items (backward compat)
@@ -751,7 +765,36 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 
     // Step 3 — Compute totals (all in kobo — Nigeria-First invariant)
     const subtotal = lineItems.reduce((s, i) => s + i.price * i.quantity, 0);
-    const discount = body.discount ?? 0;
+    const baseDiscount = body.discount ?? 0;
+
+    // Loyalty redemption (POS-E10): validate and compute kobo discount
+    const loyaltyCfg = (c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)
+      ?.loyalty ?? DEFAULT_LOYALTY_CONFIG;
+    let loyaltyDiscountKobo = 0;
+    let redeemCustomerId: string | null = null;
+    let currentLoyaltyPoints = 0;
+
+    if (body.redeem_points && body.redeem_points > 0 && body.customer_phone) {
+      const custRow = await c.env.DB.prepare(
+        'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+      ).bind(tenantId, body.customer_phone).first<{ id: string }>();
+      if (custRow) {
+        redeemCustomerId = custRow.id;
+        const loyRow = await c.env.DB.prepare(
+          'SELECT points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?',
+        ).bind(tenantId, custRow.id).first<{ points: number }>();
+        currentLoyaltyPoints = loyRow?.points ?? 0;
+        const toRedeem = Math.min(body.redeem_points, currentLoyaltyPoints);
+        // 1 point = ₦1 = 100 kobo (with default redeemRate=100)
+        loyaltyDiscountKobo = Math.floor(toRedeem * (100 / loyaltyCfg.redeemRate)) * 100;
+        const maxAllowed = subtotal - baseDiscount;
+        if (loyaltyDiscountKobo > maxAllowed) {
+          return c.json({ success: false, error: 'Redeem points discount exceeds order total' }, 400);
+        }
+      }
+    }
+
+    const discount = baseDiscount + loyaltyDiscountKobo;
     const total = subtotal - discount;
 
     // Step 4 — Validate payment amounts when payments[] is provided
@@ -847,15 +890,53 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 
     await c.env.DB.batch([insertStmt]);
 
-    // Step 8 — Award loyalty points if customer phone provided (non-blocking)
-    // Rate: 1 point per ₦100 spent (10,000 kobo = 1 point)
-    const loyaltyEarned = Math.floor(total / 10000);
-    if (body.customer_phone && loyaltyEarned > 0) {
-      c.env.DB.prepare(
-        `UPDATE customers
-         SET loyalty_points = loyalty_points + ?, total_spend = total_spend + ?, updated_at = ?
-         WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL`,
-      ).bind(loyaltyEarned, total, now, tenantId, body.customer_phone).run().catch(() => {});
+    // Step 8 — Award loyalty points (POS-E10 tier system, non-blocking)
+    // Rate is tenant-configurable; default 1 point per ₦100 (10,000 kobo)
+    const loyaltyEarned = Math.floor(total / 10000) * loyaltyCfg.pointsPerHundredKobo;
+    const pointsRedeemed = body.redeem_points && redeemCustomerId ? Math.min(body.redeem_points, currentLoyaltyPoints) : 0;
+
+    let loyaltyBalance = 0;
+    let loyaltyTier = 'BRONZE';
+
+    if (body.customer_phone) {
+      // Fire-and-forget — non-blocking
+      void (async () => {
+        try {
+          const custId = redeemCustomerId ?? (await c.env.DB.prepare(
+            'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+          ).bind(tenantId, body.customer_phone).first<{ id: string }>())?.id;
+          if (!custId) return;
+
+          const existing = await c.env.DB.prepare(
+            'SELECT id, points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?',
+          ).bind(tenantId, custId).first<{ id: string; points: number }>();
+
+          const prevPoints = existing?.points ?? 0;
+          const newPoints = Math.max(0, prevPoints - pointsRedeemed + loyaltyEarned);
+          const newTier = evaluateLoyaltyTier(newPoints, loyaltyCfg);
+
+          if (existing) {
+            await c.env.DB.prepare(
+              'UPDATE customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?',
+            ).bind(newPoints, newTier, new Date(now).toISOString(), tenantId, custId).run();
+          } else {
+            const lid = `loy_${now}_${crypto.randomUUID().slice(0, 8)}`;
+            await c.env.DB.prepare(
+              'INSERT OR IGNORE INTO customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+            ).bind(lid, tenantId, custId, Math.max(0, loyaltyEarned), evaluateLoyaltyTier(loyaltyEarned, loyaltyCfg), new Date(now).toISOString()).run();
+          }
+
+          // Keep customers.loyalty_points in sync (backward compat)
+          await c.env.DB.prepare(
+            'UPDATE customers SET loyalty_points = loyalty_points + ?, total_spend = total_spend + ?, updated_at = ? WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+          ).bind(loyaltyEarned - pointsRedeemed, total, now, tenantId, body.customer_phone).run();
+        } catch { /* non-fatal */ }
+      })();
+
+      // Compute return values synchronously from current known state
+      const netBalance = Math.max(0, currentLoyaltyPoints - pointsRedeemed + loyaltyEarned);
+      loyaltyBalance = netBalance;
+      loyaltyTier = evaluateLoyaltyTier(netBalance, loyaltyCfg);
     }
 
     // Step 9 — Return receipt
@@ -872,6 +953,9 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
           payments: resolvedPayments,
           ...(payRef ? { payment_reference: payRef } : {}),
           loyalty_earned: loyaltyEarned,
+          loyalty_redeemed: pointsRedeemed,
+          loyalty_balance: loyaltyBalance,
+          tier: loyaltyTier,
         },
       },
       201,

@@ -16,24 +16,85 @@ import type { WebWakaEvent } from '../index';
 import { registerHandler, clearHandlers, publishEvent } from '../index';
 import { CommerceEvents, createSmsProvider, createKycProvider } from '@webwaka/core';
 
-// ─── Handler: inventory.updated → invalidate catalog KV cache ────────────────
+// ─── Handler: inventory.updated → invalidate catalog KV + back-in-stock alerts ─
 
 export async function handleInventoryUpdated(
-  event: WebWakaEvent<{ productId?: string; tenantId?: string }>,
+  event: WebWakaEvent<{ productId?: string; tenantId?: string; newQuantity?: number }>,
   env: Env,
 ): Promise<void> {
   const tenantId = event.tenantId;
+  const productId = event.payload?.productId;
+  const newQuantity = event.payload?.newQuantity;
   if (!tenantId) return;
 
-  // KV cache invalidation — version-counter approach.
-  // Increment the tenant's catalog version; the MV catalog route includes this
-  // version in its cache key, so all stale entries become un-hittable instantly.
-  // Old entries expire naturally via their TTL (60 s).
+  // 1. KV cache invalidation (three keys)
   if (env.CATALOG_CACHE) {
+    // Increment catalog version so stale cache entries become un-hittable
     const versionKey = `catalog_version:${tenantId}`;
-    await env.CATALOG_CACHE.put(versionKey, String(Date.now()), {
-      expirationTtl: 86400, // 24 h; a new version is written on every update anyway
-    });
+    await env.CATALOG_CACHE.put(versionKey, String(Date.now()), { expirationTtl: 86400 });
+
+    // Delete specific product and catalog cache keys
+    if (productId) {
+      await Promise.allSettled([
+        env.CATALOG_CACHE.delete(`catalog:${tenantId}`),
+        env.CATALOG_CACHE.delete(`product:${productId}`),
+      ]);
+    }
+  }
+
+  // 2. Back-in-stock WhatsApp notifications for wishlist customers
+  if (productId && typeof newQuantity === 'number' && newQuantity > 0 && env.DB) {
+    try {
+      // Fetch wishlist customers for this product
+      const wishlistRows = await env.DB.prepare(
+        'SELECT customer_id FROM wishlists WHERE tenant_id = ? AND product_id = ? LIMIT 100'
+      ).bind(tenantId, productId).all<{ customer_id: string }>();
+
+      if ((wishlistRows.results?.length ?? 0) === 0) {
+        // No wishlist entries; log and return
+        await env.DB.prepare(
+          'INSERT OR IGNORE INTO inventory_sync_log (id, tenantId, productId, newQuantity, wishlistNotified, createdAt) VALUES (?, ?, ?, ?, 0, ?)'
+        ).bind(`isl_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`, tenantId, productId, newQuantity, new Date().toISOString()).run().catch(() => {});
+        return;
+      }
+
+      // Fetch product name
+      const productRow = await env.DB.prepare(
+        'SELECT name FROM products WHERE id = ? AND tenant_id = ?'
+      ).bind(productId, tenantId).first<{ name: string }>();
+      const productName = productRow?.name ?? 'A product';
+      const storeUrl = `https://${tenantId}.webwaka.ng/`;
+
+      let notifiedCount = 0;
+      for (const row of wishlistRows.results ?? []) {
+        try {
+          const custRow = await env.DB.prepare(
+            'SELECT phone FROM customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
+          ).bind(row.customer_id, tenantId).first<{ phone: string }>();
+          if (!custRow?.phone) continue;
+
+          if (env.TERMII_API_KEY) {
+            const smsProvider = createSmsProvider(env.TERMII_API_KEY);
+            await smsProvider.sendOtp(
+              custRow.phone,
+              `Good news! ${productName} is back in stock. Shop now: ${storeUrl}`,
+              'whatsapp',
+            ).catch(() => {});
+          }
+          notifiedCount++;
+        } catch { /* non-fatal per customer */ }
+      }
+
+      // 3. Audit log
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO inventory_sync_log (id, tenantId, productId, newQuantity, wishlistNotified, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(
+        `isl_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        tenantId, productId, newQuantity, notifiedCount, new Date().toISOString()
+      ).run().catch(() => {});
+    } catch (err) {
+      console.error('[handleInventoryUpdated] back-in-stock error:', err);
+    }
   }
 }
 

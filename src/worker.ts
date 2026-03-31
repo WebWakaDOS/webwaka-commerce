@@ -544,5 +544,31 @@ export default {
     } catch (err) {
       console.error('[cron] Vendor scoring error:', err);
     }
+
+    // ── Campaign status transitions (DRAFT→ACTIVE, ACTIVE→ENDED) ─────────────
+    // Runs every cron invocation (hourly); uses ISO date strings matching D1 storage.
+    try {
+      const nowIso = new Date().toISOString();
+
+      const activateResult = await env.DB.prepare(
+        `UPDATE marketplace_campaigns
+         SET status = 'ACTIVE'
+         WHERE startDate <= ? AND endDate > ? AND status = 'DRAFT'`
+      ).bind(nowIso, nowIso).run();
+      if (activateResult.meta?.changes ?? 0 > 0) {
+        console.log(`[cron] Activated ${activateResult.meta?.changes ?? 0} campaign(s)`);
+      }
+
+      const endResult = await env.DB.prepare(
+        `UPDATE marketplace_campaigns
+         SET status = 'ENDED'
+         WHERE endDate <= ? AND status = 'ACTIVE'`
+      ).bind(nowIso).run();
+      if (endResult.meta?.changes ?? 0 > 0) {
+        console.log(`[cron] Ended ${endResult.meta?.changes ?? 0} campaign(s)`);
+      }
+    } catch (err) {
+      console.error('[cron] Campaign status transition error:', err);
+    }
   },
 };
