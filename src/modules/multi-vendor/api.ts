@@ -23,7 +23,8 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit } from '@webwaka/core';
+import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents } from '@webwaka/core';
+import { publishEvent } from '../../core/event-bus';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
@@ -436,7 +437,7 @@ app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
   }
   const tenantId = getTenantId(c);
   const id = c.req.param('id');
-  const body = await c.req.json<{ status?: string; commission_rate?: number }>();
+  const body = await c.req.json<{ status?: string; commission_rate?: number; pickupAddress?: unknown }>();
 
   const validStatuses = ['pending', 'active', 'suspended'];
   if (body.status && !validStatuses.includes(body.status)) {
@@ -451,13 +452,17 @@ app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
 
     if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
 
+    const pickupJson = body.pickupAddress !== undefined
+      ? JSON.stringify(body.pickupAddress)
+      : null;
     await c.env.DB.prepare(
       `UPDATE vendors
        SET status = COALESCE(?, status),
            commission_rate = COALESCE(?, commission_rate),
+           pickupAddress = COALESCE(?, pickupAddress),
            updated_at = ?
        WHERE id = ? AND marketplace_tenant_id = ?`
-    ).bind(body.status ?? null, body.commission_rate ?? null, now, id, tenantId).run();
+    ).bind(body.status ?? null, body.commission_rate ?? null, pickupJson, now, id, tenantId).run();
 
     return c.json({ success: true, data: { id, ...body, updated_at: now } });
   } catch (err) {
@@ -745,6 +750,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     payment_method: string;
     payment_reference?: string;
     ndpr_consent: boolean;
+    shipping_address?: { state: string; lga: string; street: string };
   }>();
 
   if (!body.items?.length) {
@@ -825,17 +831,22 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     const breakdownMap: Record<string, {
       vendor_id: string; subtotal: number; commission: number; payout: number; commission_rate: number;
       settlement_id?: string; hold_until?: number; hold_days?: number;
+      vendorName?: string; vendorPickupAddress?: string;
     }> = {};
 
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const vendorRow = await c.env.DB.prepare(
-        'SELECT commission_rate FROM vendors WHERE id = ? AND marketplace_tenant_id = ?'
-      ).bind(vendorId, tenantId).first<{ commission_rate: number }>();
+        'SELECT commission_rate, name, pickupAddress FROM vendors WHERE id = ? AND marketplace_tenant_id = ?'
+      ).bind(vendorId, tenantId).first<{ commission_rate: number; name?: string; pickupAddress?: string }>();
 
       const commissionRate = vendorRow?.commission_rate ?? 1000;
       const commission = Math.round(group.subtotal * commissionRate / 10000);
       const payout = group.subtotal - commission;
-      breakdownMap[vendorId] = { vendor_id: vendorId, subtotal: group.subtotal, commission, payout, commission_rate: commissionRate };
+      breakdownMap[vendorId] = {
+        vendor_id: vendorId, subtotal: group.subtotal, commission, payout, commission_rate: commissionRate,
+        vendorName: vendorRow?.name ?? vendorId,
+        ...(vendorRow?.pickupAddress ? { vendorPickupAddress: vendorRow.pickupAddress } : {}),
+      };
     }
 
     // ── Insert marketplace_orders umbrella ───────────────────────────────────
@@ -920,6 +931,29 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       bd.settlement_id = stlId;
       bd.hold_until = holdUntil;
       bd.hold_days = holdDays;
+
+      // ── Publish per-vendor delivery request ──────────────────────────────
+      const vendorName = bd.vendorName ?? vendorId;
+      const rawPickup = bd.vendorPickupAddress;
+      const pickupAddr = rawPickup
+        ? (() => { try { return JSON.parse(rawPickup); } catch { return rawPickup; } })()
+        : null;
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_dlv_${now}_${Math.random().toString(36).slice(2, 9)}`,
+        tenantId: tenantId!,
+        type: CommerceEvents.ORDER_READY_DELIVERY,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          orderId: childId,
+          tenantId,
+          sourceModule: 'multi-vendor',
+          vendorId,
+          pickupAddress: pickupAddr,
+          deliveryAddress: body.shipping_address ?? null,
+          itemsSummary: `${group.items.length} item(s) from ${vendorName}`,
+        },
+      }).catch(() => { /* non-fatal */ });
     }
 
     return c.json({

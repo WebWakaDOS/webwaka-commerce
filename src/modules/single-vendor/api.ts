@@ -492,6 +492,25 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
 
     await c.env.DB.batch(stmts);
 
+    // ── Publish delivery request via CF Queues (P05-T1) ───────────────────
+    const svTenantCfg = c.get('tenantConfig' as never) as { storeAddress?: unknown } | undefined;
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_dlv_${Date.now()}`,
+      tenantId: tenantId!,
+      type: CommerceEvents.ORDER_READY_DELIVERY,
+      sourceModule: 'single-vendor',
+      timestamp: Date.now(),
+      payload: {
+        orderId,
+        tenantId,
+        sourceModule: 'single-vendor',
+        pickupAddress: svTenantCfg?.storeAddress ?? null,
+        deliveryAddress: body.delivery_address ?? null,
+        itemsSummary: `${body.items.length} item(s)`,
+        weightKg: undefined,
+      },
+    }).catch(() => { /* non-fatal: logistics system retries on CF Queues */ });
+
     return c.json({
       success: true,
       data: {
@@ -503,6 +522,24 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   } catch (err) {
     console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /orders/:id/delivery-options — Return logistics quotes from KV (P05-T2) ─
+// Must be BEFORE /orders/:id to prevent ":id" from matching sub-paths
+app.get('/orders/:id/delivery-options', async (c) => {
+  const orderId = c.req.param('id');
+  try {
+    const raw = c.env.CATALOG_CACHE
+      ? await c.env.CATALOG_CACHE.get(`delivery_options:${orderId}`)
+      : null;
+    if (!raw) {
+      return c.json({ success: true, data: { quotes: [], pending: true } });
+    }
+    const quotes = JSON.parse(raw) as unknown;
+    return c.json({ success: true, data: { quotes, pending: false } });
+  } catch {
+    return c.json({ success: true, data: { quotes: [], pending: true } });
   }
 });
 

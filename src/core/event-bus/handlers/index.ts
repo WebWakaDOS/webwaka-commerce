@@ -14,7 +14,7 @@
 import type { Env } from '../../../worker';
 import type { WebWakaEvent } from '../index';
 import { registerHandler, clearHandlers } from '../index';
-import { CommerceEvents } from '@webwaka/core';
+import { CommerceEvents, createSmsProvider } from '@webwaka/core';
 
 // ─── Handler: inventory.updated → invalidate catalog KV cache ────────────────
 
@@ -177,48 +177,99 @@ export async function handleDeliveryBookingConfirmed(
   void estimated_delivery;
 }
 
-// ─── Handler: delivery.status.updated → map logistics status to fulfilment ────
+// ─── Handler: delivery.quote → store quotes in KV for frontend (P05-T2) ──────
+
+export async function handleDeliveryQuote(
+  event: WebWakaEvent<{ orderId?: string; quotes?: unknown }>,
+  env: Env,
+): Promise<void> {
+  const { orderId, quotes } = event.payload;
+  if (!orderId || quotes === undefined) return;
+
+  if (env.CATALOG_CACHE) {
+    await env.CATALOG_CACHE.put(
+      `delivery_options:${orderId}`,
+      JSON.stringify(quotes),
+      { expirationTtl: 3600 },
+    );
+  }
+}
+
+// ─── Handler: delivery.status_changed → update order status + notify (P05-T4) ─
 
 export async function handleDeliveryStatusUpdated(
   event: WebWakaEvent<{
-    vendor_order_id: string;
-    logistics_status: string;
+    orderId: string;
+    tenantId: string;
+    status: string;
+    trackingUrl?: string;
+    provider?: string;
+    estimatedDelivery?: string;
   }>,
   env: Env,
 ): Promise<void> {
-  const { vendor_order_id, logistics_status } = event.payload;
-  if (!vendor_order_id) return;
+  const { orderId, tenantId, status, trackingUrl, provider, estimatedDelivery } = event.payload;
+  if (!orderId || !tenantId || !status) return;
 
-  const fulfilmentStatusMap: Record<string, string> = {
-    picked_up: 'shipped',
-    in_transit: 'shipped',
-    out_for_delivery: 'shipped',
-    delivered: 'delivered',
-    failed_delivery: 'pending',
-    returned: 'cancelled',
+  // Map canonical logistics status → internal order status
+  const statusMap: Record<string, string> = {
+    PICKED_UP: 'PROCESSING',
+    IN_TRANSIT: 'SHIPPED',
+    OUT_FOR_DELIVERY: 'OUT_FOR_DELIVERY',
+    DELIVERED: 'DELIVERED',
+    FAILED: 'DELIVERY_FAILED',
+    RETURNED: 'RETURNED',
   };
 
-  const fulfilmentStatus = fulfilmentStatusMap[logistics_status];
-  if (!fulfilmentStatus) return;
+  const mappedStatus = statusMap[status];
+  if (!mappedStatus) return;
 
   const now = Date.now();
 
-  if (fulfilmentStatus === 'delivered') {
+  // 1. Update order status in D1
+  try {
     await env.DB.prepare(
-      `UPDATE vendor_orders
-       SET fulfilment_status = 'delivered', delivered_at = ?, updated_at = ?
+      `UPDATE orders
+       SET order_status = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ?`,
-    )
-      .bind(now, now, vendor_order_id, event.tenantId)
-      .run();
-  } else {
-    await env.DB.prepare(
-      `UPDATE vendor_orders
-       SET fulfilment_status = ?, updated_at = ?
-       WHERE id = ? AND tenant_id = ?`,
-    )
-      .bind(fulfilmentStatus, now, vendor_order_id, event.tenantId)
-      .run();
+    ).bind(mappedStatus, now, orderId, tenantId).run();
+  } catch {
+    // Non-fatal — order may belong to another module's table
+  }
+
+  // 2. Fetch customer phone for WhatsApp notification
+  let customerPhone: string | null = null;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT customer_phone FROM orders WHERE id = ? AND tenant_id = ?`,
+    ).bind(orderId, tenantId).first<{ customer_phone: string | null }>();
+    customerPhone = row?.customer_phone ?? null;
+  } catch { /* non-fatal */ }
+
+  // 3. Send WhatsApp notification via SMS provider
+  if (customerPhone && env.TERMII_API_KEY) {
+    const messageMap: Record<string, string> = {
+      PICKED_UP: `Your order has been picked up by ${provider ?? 'our delivery partner'}. Track here: ${trackingUrl ?? 'N/A'}`,
+      IN_TRANSIT: `Your order is in transit. Estimated delivery: ${estimatedDelivery ?? 'soon'}`,
+      OUT_FOR_DELIVERY: 'Your order is out for delivery today! Please be available.',
+      DELIVERED: 'Your order has been delivered! Thank you for shopping with us.',
+      FAILED: 'Delivery attempt failed. We will retry. Contact support if you need help.',
+      RETURNED: 'Your order has been returned. A refund will be processed shortly.',
+    };
+    const message = messageMap[status];
+    if (message) {
+      try {
+        const sms = createSmsProvider(env.TERMII_API_KEY);
+        await sms.sendOtp(customerPhone, message, 'whatsapp');
+      } catch { /* non-fatal: SMS failure must not block order processing */ }
+    }
+  }
+
+  // 4. Invalidate order KV cache
+  if (env.CATALOG_CACHE) {
+    try {
+      await env.CATALOG_CACHE.delete(`order:${orderId}`);
+    } catch { /* non-fatal */ }
   }
 }
 
@@ -256,10 +307,17 @@ export function registerAllHandlers(env: Env): void {
       estimated_delivery?: number;
     }>, env),
   );
-  registerHandler('delivery.status.updated', (event) =>
+  registerHandler(CommerceEvents.DELIVERY_QUOTE, (event) =>
+    handleDeliveryQuote(event as WebWakaEvent<{ orderId?: string; quotes?: unknown }>, env),
+  );
+  registerHandler(CommerceEvents.DELIVERY_STATUS, (event) =>
     handleDeliveryStatusUpdated(event as WebWakaEvent<{
-      vendor_order_id: string;
-      logistics_status: string;
+      orderId: string;
+      tenantId: string;
+      status: string;
+      trackingUrl?: string;
+      provider?: string;
+      estimatedDelivery?: string;
     }>, env),
   );
 }
