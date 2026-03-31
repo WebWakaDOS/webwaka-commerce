@@ -20,6 +20,17 @@
 
 import type { Context, MiddlewareHandler, Next } from 'hono';
 
+export * from './tax';
+export * from './payment';
+export * from './sms';
+export * from './sms/termii';
+export * from './rate-limit';
+export * from './optimistic-lock';
+export * from './pin';
+export * from './kyc';
+export * from './ai';
+export * from './events';
+
 // ─── Base64URL helpers ────────────────────────────────────────────────────────
 
 function b64urlEncode(bytes: Uint8Array): string {
@@ -250,67 +261,7 @@ export function jwtAuthMiddleware(opts: JwtAuthOptions = {}): MiddlewareHandler 
   };
 }
 
-// ─── Termii SMS ───────────────────────────────────────────────────────────────
-
-export interface TermiiSendSmsOptions {
-  to: string;
-  message: string;
-  apiKey: string;
-  channel?: 'generic' | 'dnd' | 'whatsapp';
-  from?: string;
-}
-
-export interface TermiiSendSmsResult {
-  success: boolean;
-  messageId?: string;
-  error?: string;
-}
-
-/**
- * Send an SMS via Termii API (Nigeria-first, Africa-ready).
- * Production endpoint: https://api.ng.termii.com/api/sms/send
- * Docs: https://developers.termii.com/
- *
- * [NGN-1] Termii is the primary SMS provider for Nigeria. For other
- *         African markets, add a provider abstraction on top of this util.
- */
-export async function sendTermiiSms(opts: TermiiSendSmsOptions): Promise<TermiiSendSmsResult> {
-  const { to, message, apiKey, channel = 'generic', from = 'WebWaka' } = opts;
-
-  try {
-    const res = await fetch('https://api.ng.termii.com/api/sms/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        to,
-        from,
-        sms: message,
-        type: 'plain',
-        channel,
-        api_key: apiKey,
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => 'unknown');
-      console.error(`[sendTermiiSms] HTTP ${res.status}: ${errText}`);
-      return { success: false, error: `HTTP ${res.status}` };
-    }
-
-    const data = (await res.json()) as {
-      code?: string;
-      message_id?: string;
-      message?: string;
-    };
-
-    const success = data.code === 'ok' || data.message === 'Successfully Sent';
-    return {
-      success,
-      ...(data.message_id != null ? { messageId: data.message_id } : {}),
-      ...(!success ? { error: data.message ?? 'Unknown error' } : {}),
-    };
-  } catch (err) {
-    console.error('[sendTermiiSms] Network error:', err);
-    return { success: false, error: 'Network error' };
-  }
-}
+// ─── Termii SMS (re-exported from ./sms/termii — enhanced P01 version) ────────
+// TermiiSendSmsOptions, TermiiSendSmsResult, and sendTermiiSms are provided via:
+//   export * from './sms/termii'
+// which is declared in the barrel exports above.

@@ -1,0 +1,116 @@
+You are implementing Phase P02 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase fixes critical production bugs that are live issues: a payment-charge-with-no-refund race condition, stock overselling under concurrent load, broken offline product hydration, and stub event handlers that do nothing. These must be fixed before any new features are built.
+
+Read the following files fully before starting:
+- src/modules/single-vendor/api.ts
+- src/modules/single-vendor/core.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/multi-vendor/ui.tsx
+- src/modules/pos/ui.tsx
+- src/modules/pos/useBackgroundSync.ts
+- src/core/offline/db.ts
+- src/core/sync/server.ts
+- src/core/event-bus/handlers/index.ts
+- src/core/tenant/index.ts
+
+Confirm @webwaka/core package version is 1.2.0 before starting. All imports from @webwaka/core must use the new exports from Phase P01.
+
+## Governance
+- Every D1 UPDATE to inventory/stock must use updateWithVersionLock from @webwaka/core
+- Every payment refund must use createPaymentProvider from @webwaka/core
+- Every SMS/WhatsApp message must use createSmsProvider from @webwaka/core
+- Every event type string must use CommerceEvents constants from @webwaka/core
+- No in-memory data can substitute for KV or D1 in production paths
+- tenantId must be on every DB query
+
+## Tasks to implement in order:
+
+### TASK 1 — Delete Legacy Tenant Resolver
+In src/core/tenant/index.ts:
+- Identify and remove the legacy mock/in-memory tenant resolver (the one NOT backed by Cloudflare KV)
+- Keep only createTenantResolverMiddleware (the KV-backed one)
+- Search the entire codebase for all imports of the deleted resolver and update them to use createTenantResolverMiddleware
+- Add a comment block at the top of tenant/index.ts: "Only KV-backed tenant resolution is permitted. Do not add mock resolvers."
+
+### TASK 2 — Fix: Offline Product Hydration in POS (POS-E01)
+Step A — Check src/core/offline/db.ts:
+If a 'products' table does not exist in the Dexie schema, add it to the next version:
+.version(N+1).stores({ ...previousStores, products: 'id, tenantId, sku, category, updatedAt' })
+
+Step B — In src/modules/pos/useBackgroundSync.ts:
+After a successful mutation flush, call a new function syncProductCache(tenantId):
+- Fetch GET /api/pos/products?tenantId={tenantId}
+- Upsert all returned products into Dexie 'products' table using db.table('products').bulkPut(products)
+
+Step C — In src/modules/pos/ui.tsx in the fetchProducts function:
+Check navigator.onLine first:
+- If offline: read from db.table('products').where('tenantId').equals(tenantId).toArray() and setProducts(cached) if non-empty; set offlineMode state to true
+- If online: proceed with existing network fetch; upsert result into Dexie after fetch
+Add a visible "Offline Mode" indicator badge in the status bar when offlineMode is true.
+
+### TASK 3 — Fix: Post-Payment Auto-Refund in SV Checkout (SV-E01)
+In src/modules/single-vendor/api.ts, in the checkout handler:
+After Paystack payment is verified (verifyCharge returns success: true) and before the success response:
+- Execute the stock deduction batch in D1
+- Check if any deduction had meta.changes === 0 (stock was unavailable)
+- If stock failed:
+a. Import createPaymentProvider from @webwaka/core
+b. Call provider.initiateRefund(reference)
+c. Publish a PAYMENT_REFUNDED event using CommerceEvents.PAYMENT_REFUNDED
+d. Import createSmsProvider from @webwaka/core
+e. Send customer a WhatsApp message: "Your order could not be fulfilled due to stock unavailability. A full refund has been initiated."
+f. Return HTTP 409 with { error: 'stock_unavailable', refundInitiated: true }
+- If stock succeeded: continue with order creation as before
+
+### TASK 4 — Fix: Optimistic Locking on Inventory Updates (SV-E02)
+In src/modules/single-vendor/api.ts and src/modules/single-vendor/core.ts:
+- Find every UPDATE statement that modifies product quantity
+- Replace each one with updateWithVersionLock from @webwaka/core
+- The caller must pass the expectedVersion from the product record read earlier in the request
+- On conflict (result.conflict === true): return HTTP 409 with { error: 'inventory_conflict', retry: true }
+
+Apply the same fix in src/modules/multi-vendor/api.ts for all vendor product quantity updates.
+
+### TASK 5 — Fix: Multi-Terminal Stock Sync Locking (POS-E08)
+In src/core/sync/server.ts, in the mutation processing loop:
+For mutations of type 'pos.checkout':
+- For each item in the mutation payload, do NOT simply insert the order
+- Instead, call updateWithVersionLock to deduct stock atomically
+- Pass item.knownVersion as the expectedVersion (ensure the client sends this in the mutation payload)
+- If the lock returns conflict: push to a conflicts[] array
+- After processing all mutations, return conflicts[] in the response so the client can surface them
+
+### TASK 6 — Fix: FTS5 Search in MV Frontend (MV-E01)
+In src/modules/multi-vendor/ui.tsx:
+- Find the code that loops through vendors to fetch products individually
+- Remove that loop entirely
+- Replace with a single fetch call to GET /api/multi-vendor/search?q={query}&tenantId={tenantId}&category={category}
+- The search endpoint must use FTS5 in the MV API: SELECT ... FROM products_fts WHERE products_fts MATCH ? AND tenantId = ?
+- Verify this endpoint exists in src/modules/multi-vendor/api.ts; if not, create it
+- Add loading state and empty state handling in the UI
+
+### TASK 7 — Fix: Complete All Stub Event Handlers
+In src/core/event-bus/handlers/index.ts, implement the three stub handlers:
+
+handleOrderCreated: INSERT a row into platform_order_log (id, tenantId, orderId, sourceModule, createdAt). If this table does not exist, create a migration file migrations/0002_stubs.sql with CREATE TABLE IF NOT EXISTS platform_order_log (id TEXT PRIMARY KEY, tenantId TEXT NOT NULL, orderId TEXT NOT NULL, sourceModule TEXT NOT NULL, createdAt TEXT NOT NULL).
+
+handleShiftClosed: Query orders table for the sessionId from the event payload. Compute: COUNT(*) as totalOrders, SUM(totalKobo) as revenueKobo, AVG(totalKobo) as avgOrderKobo. INSERT into shift_analytics table. Create this table in the same migration if it doesn't exist.
+
+handleVendorKycSubmitted: INSERT a row into kyc_review_queue (id, tenantId, vendorId, submittedAt, status: 'PENDING'). Create this table in the migration if it doesn't exist. Note: Full automated KYC comes in Phase P08/P09. For now, just queue for manual review.
+
+### TASK 8 — Remove Mock Payment Processor from Production Path
+In src/modules/single-vendor/core.ts:
+- Find the MockPaymentProcessor or any mock/fake payment processing logic
+- Move it to src/modules/single-vendor/__mocks__/payment.ts
+- In the original core.ts, replace it with createPaymentProvider from @webwaka/core, accepting the secret key as a parameter
+- Ensure no production code paths use the mock
+
+## Verification
+After completing all tasks:
+1. TypeScript type-check: npx tsc --noEmit
+2. Run existing test suite: npm test
+3. Manually verify: add a product with quantity 1 to the SV cart, attempt two simultaneous checkouts, confirm second returns 409
+4. Apply migration 0002_stubs.sql to development: wrangler d1 execute webwaka-commerce-db --file=migrations/0002_stubs.sql --env staging
+5. Verify MV product search works with a keyword query
+```
