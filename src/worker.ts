@@ -570,5 +570,56 @@ export default {
     } catch (err) {
       console.error('[cron] Campaign status transition error:', err);
     }
+
+    // ── Daily vendor analytics snapshot (MV-E15) ──────────────────────────────
+    // Aggregates each vendor's daily revenue/orders from orders table.
+    // Run daily via cron trigger; idempotent via INSERT OR REPLACE.
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const dayStart = new Date(today).getTime();
+      const dayEnd = dayStart + 24 * 60 * 60 * 1000 - 1;
+
+      const { results: activeVendors } = await env.DB.prepare(
+        `SELECT id, marketplace_tenant_id AS tenantId FROM vendors WHERE status = 'active'`
+      ).all<{ id: string; tenantId: string }>();
+
+      for (const v of activeVendors ?? []) {
+        const row = await env.DB.prepare(
+          `SELECT
+             COUNT(*)                                AS orderCount,
+             COALESCE(SUM(total_amount), 0)          AS revenueKobo,
+             COUNT(DISTINCT customer_id)             AS customerCount,
+             (SELECT COUNT(DISTINCT customer_id)
+              FROM orders
+              WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid'
+                AND customer_id IN (
+                  SELECT customer_id FROM orders
+                  WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid'
+                    AND created_at < ?
+                )
+             )                                       AS repeatBuyerCount
+           FROM orders
+           WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid'
+             AND created_at >= ? AND created_at <= ?`
+        ).bind(
+          v.id, v.tenantId, v.id, v.tenantId, dayStart,
+          v.id, v.tenantId, dayStart, dayEnd,
+        ).first<{ orderCount: number; revenueKobo: number; customerCount: number; repeatBuyerCount: number }>();
+
+        if (!row) continue;
+        const avgOrderValue = row.orderCount > 0 ? Math.round(row.revenueKobo / row.orderCount) : 0;
+        const analyticsId = `vda_${v.id}_${today}`;
+
+        await env.DB.prepare(
+          `INSERT OR REPLACE INTO vendor_daily_analytics
+             (id, vendorId, tenantId, date, revenueKobo, orderCount, avgOrderValueKobo, repeatBuyerCount)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(analyticsId, v.id, v.tenantId, today, row.revenueKobo, row.orderCount, avgOrderValue, row.repeatBuyerCount).run();
+      }
+
+      console.log(`[cron] Vendor analytics snapshot complete for ${(activeVendors ?? []).length} vendors on ${today}`);
+    } catch (err) {
+      console.error('[cron] Vendor analytics error:', err);
+    }
   },
 };

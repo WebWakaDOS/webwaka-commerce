@@ -456,6 +456,84 @@ const DisputeManagement: React.FC<{ tenantId: string; adminKey: string }> = ({ t
   );
 };
 
+// ── ThemeEditor — Storefront Branding (SV-E09 / P12) ─────────────────────────
+const ThemeEditor: React.FC<{ tenantId: string; adminKey: string }> = ({ tenantId, adminKey }) => {
+  const [primaryColor, setPrimaryColor] = useState('#2563eb');
+  const [accentColor, setAccentColor] = useState('#16a34a');
+  const [fontFamily, setFontFamily] = useState('Inter, system-ui, sans-serif');
+  const [heroImageUrl, setHeroImageUrl] = useState('');
+  const [announcementBar, setAnnouncementBar] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const handleSave = async () => {
+    setSaving(true);
+    setMsg('');
+    try {
+      const res = await fetch('/api/single-vendor/admin/tenant/branding', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-tenant-id': tenantId,
+          'x-admin-key': adminKey,
+          'x-role': 'TENANT_ADMIN',
+        },
+        body: JSON.stringify({ primaryColor, accentColor, fontFamily, heroImageUrl, announcementBar }),
+      });
+      const json = await res.json() as { success: boolean; error?: string };
+      setMsg(json.success ? '✓ Theme saved' : `Error: ${json.error ?? 'Unknown'}`);
+    } catch (e) {
+      setMsg(`Error: ${String(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const inputStyle = { width: '100%', padding: '6px 10px', border: '1px solid #e2e8f0', borderRadius: '4px', fontSize: '13px', boxSizing: 'border-box' as const, marginBottom: '10px' };
+  const labelStyle = { fontSize: '12px', color: '#374151', fontWeight: 600 as const, display: 'block' as const, marginBottom: '2px' };
+
+  return (
+    <div>
+      {msg && (
+        <div style={{ padding: '6px 10px', borderRadius: '4px', marginBottom: '10px', fontSize: '13px', background: msg.startsWith('Error') ? '#fee2e2' : '#d1fae5', color: msg.startsWith('Error') ? '#dc2626' : '#065f46' }}>
+          {msg}
+        </div>
+      )}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 16px' }}>
+        <div>
+          <label style={labelStyle}>Primary Colour</label>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+            <input type="color" value={primaryColor} onChange={(e) => setPrimaryColor(e.target.value)} style={{ width: '36px', height: '32px', padding: '0', border: '1px solid #e2e8f0', borderRadius: '4px', cursor: 'pointer' }} />
+            <input type="text" value={primaryColor} onChange={(e) => setPrimaryColor(e.target.value)} style={{ ...inputStyle, marginBottom: 0, flex: 1 }} placeholder="#2563eb" />
+          </div>
+        </div>
+        <div>
+          <label style={labelStyle}>Accent Colour</label>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+            <input type="color" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} style={{ width: '36px', height: '32px', padding: '0', border: '1px solid #e2e8f0', borderRadius: '4px', cursor: 'pointer' }} />
+            <input type="text" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} style={{ ...inputStyle, marginBottom: 0, flex: 1 }} placeholder="#16a34a" />
+          </div>
+        </div>
+      </div>
+      <label style={labelStyle}>Font Family</label>
+      <input type="text" value={fontFamily} onChange={(e) => setFontFamily(e.target.value)} style={inputStyle} placeholder="Inter, system-ui, sans-serif" />
+      <label style={labelStyle}>Hero Image URL</label>
+      <input type="url" value={heroImageUrl} onChange={(e) => setHeroImageUrl(e.target.value)} style={inputStyle} placeholder="https://cdn.example.com/hero.jpg" />
+      <label style={labelStyle}>Announcement Bar</label>
+      <input type="text" value={announcementBar} onChange={(e) => setAnnouncementBar(e.target.value)} style={inputStyle} placeholder="Free delivery on orders above ₦10,000!" />
+
+      <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginTop: '4px' }}>
+        <Button onClick={handleSave} primary>{saving ? 'Saving…' : 'Save Theme'}</Button>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <div style={{ width: '16px', height: '16px', borderRadius: '4px', backgroundColor: primaryColor, border: '1px solid #e2e8f0' }} />
+          <div style={{ width: '16px', height: '16px', borderRadius: '4px', backgroundColor: accentColor, border: '1px solid #e2e8f0' }} />
+          <span style={{ fontSize: '11px', color: '#64748b', fontFamily: fontFamily }}>Aa — {fontFamily.split(',')[0]?.trim()}</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantConfig; tenantId?: string; adminKey?: string }> = ({ user, config, tenantId = 'default', adminKey = '' }) => {
   return (
     <div style={{ padding: '20px', maxWidth: '900px', margin: '0 auto', fontFamily: 'system-ui, sans-serif' }}>
@@ -512,6 +590,10 @@ export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantCon
 
       <Card title="Dispute Management (MV-E08)">
         <DisputeManagement tenantId={tenantId} adminKey={adminKey} />
+      </Card>
+
+      <Card title="Storefront Theme Editor (SV-E09)">
+        <ThemeEditor tenantId={tenantId} adminKey={adminKey} />
       </Card>
     </div>
   );

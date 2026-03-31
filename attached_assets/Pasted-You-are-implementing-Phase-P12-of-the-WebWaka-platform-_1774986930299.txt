@@ -1,0 +1,108 @@
+You are implementing Phase P12 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase implements product discovery, merchant customisation tools, and vendor analytics.
+
+Read the following files fully before starting:
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/multi-vendor/ui.tsx
+- src/modules/admin/ui.tsx
+- src/core/tenant/index.ts
+- src/worker.ts
+
+## Tasks:
+
+### TASK 1 — Rich Product Attributes (SV-E06)
+In src/modules/single-vendor/api.ts:
+POST /api/single-vendor/products/:id/attributes: INSERT into product_attributes { id, tenantId, productId, attributeName, attributeValue, createdAt }
+GET /api/single-vendor/products/:id/attributes: SELECT * FROM product_attributes WHERE productId = ? AND tenantId = ?
+Include attribute values in the product detail response and in FTS5 product search index (re-index when attributes change).
+
+Apply same endpoints to src/modules/multi-vendor/api.ts.
+
+In admin product form: add a dynamic attribute section. Category-specific attribute templates stored in TENANT_CONFIG KV.
+
+### TASK 2 — Wishlist (SV-E11)
+In src/modules/single-vendor/api.ts:
+POST /api/single-vendor/wishlist: INSERT OR IGNORE into wishlists { id, tenantId, customerId, productId, createdAt }
+DELETE /api/single-vendor/wishlist/:productId: DELETE FROM wishlists WHERE tenantId = ? AND customerId = ? AND productId = ?
+GET /api/single-vendor/wishlist: SELECT products.* FROM wishlists JOIN products ON wishlists.productId = products.id WHERE wishlists.customerId = ? AND wishlists.tenantId = ?
+
+In SV storefront UI: add a heart icon on product cards. Toggling adds/removes from wishlist. Unauthenticated users: store in localStorage as webwaka_wishlist_{tenantId} array of productIds. On login: POST /api/single-vendor/wishlist for each stored ID and clear localStorage.
+
+### TASK 3 — Storefront Branding Customisation (SV-E09)
+Extend the TenantConfig type in src/core/tenant/index.ts:
+branding?: {
+primaryColor: string;
+accentColor: string;
+fontFamily: string;
+heroImageUrl?: string;
+announcementBar?: string;
+}
+
+In the SV storefront React component: read tenantConfig.branding. Inject a <style> tag into the document head:
+:root { --color-primary: {primaryColor}; --color-accent: {accentColor}; --font-family: {fontFamily}; }
+
+In src/modules/admin/ui.tsx: add a Theme Editor section:
+- Color pickers for primary and accent colors
+- Font family selector (Inter, Roboto, Open Sans, Lato)
+- Hero image URL input
+- Announcement bar text input
+- Live preview panel showing how the storefront looks
+- "Save Theme" button: PUT /api/admin/tenant/branding — updates TENANT_CONFIG KV
+
+### TASK 4 — Vendor Storefront Customisation (MV-E13)
+Create migration 0010_vendor_branding.sql:
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS branding TEXT; -- JSON: { logoUrl, bannerUrl, primaryColor, tagline }
+Apply migration.
+
+In src/modules/multi-vendor/api.ts add PATCH /api/multi-vendor/vendor/branding (requireRole: VENDOR):
+Body: { logoUrl, bannerUrl, primaryColor, tagline }
+UPDATE vendors SET branding = json(?) WHERE id = ? AND tenantId = ?
+
+In MV vendor store page: read vendor.branding and apply CSS variables scoped to [data-vendor-id="${vendorId}"].
+
+### TASK 5 — Autocomplete Search (SV-E19, MV)
+In src/modules/single-vendor/api.ts add GET /api/single-vendor/search/suggest?q=:
+SELECT DISTINCT name FROM products WHERE tenantId = ? AND name LIKE ? AND deletedAt IS NULL LIMIT 5
+Return { suggestions: string[] }
+
+In SV storefront search input: debounce 300ms, call suggest endpoint after 2 characters, render dropdown below input. Handle keyboard navigation (arrow keys, enter, escape).
+
+Apply same pattern to src/modules/multi-vendor/api.ts: GET /api/multi-vendor/search/suggest?q=
+
+### TASK 6 — WhatsApp Order Tracking Messages (SV-E12)
+Ensure handleDeliveryStatusUpdated in src/core/event-bus/handlers/index.ts sends the correct message for each status:
+PICKED_UP: "Your order #{orderId} has been picked up. Track it here: {trackingUrl}"
+IN_TRANSIT: "Your order is in transit. Estimated arrival: {estimatedDelivery}"
+OUT_FOR_DELIVERY: "Your order is out for delivery today! Please be available."
+DELIVERED: "Your order has been delivered! Enjoyed your purchase? Leave a review: {storeUrl}/reviews/{orderId}"
+FAILED: "Delivery attempt failed for order #{orderId}. We will retry. Contact us if you need help."
+RETURNED: "Your order #{orderId} was returned. A refund will be processed within 3-5 business days."
+
+### TASK 7 — Vendor Analytics Dashboard (MV-E15)
+Create migration 0011_vendor_analytics.sql:
+CREATE TABLE IF NOT EXISTS vendor_daily_analytics (id TEXT PRIMARY KEY, vendorId TEXT NOT NULL, tenantId TEXT NOT NULL, date TEXT NOT NULL, revenueKobo INTEGER NOT NULL DEFAULT 0, orderCount INTEGER NOT NULL DEFAULT 0, avgOrderValueKobo INTEGER NOT NULL DEFAULT 0, repeatBuyerCount INTEGER NOT NULL DEFAULT 0, UNIQUE(vendorId, tenantId, date));
+Apply migration.
+
+In src/worker.ts scheduled handler (daily cron):
+For each active vendor in each tenant:
+INSERT OR REPLACE INTO vendor_daily_analytics SELECT vendorId, tenantId, DATE('now'), SUM(totalKobo), COUNT(*), CAST(AVG(totalKobo) AS INTEGER), 0 FROM vendor_orders WHERE DATE(createdAt) = DATE('now') AND tenantId = ? GROUP BY vendorId
+
+Add GET /api/multi-vendor/vendor/analytics?days=30 (requireRole: VENDOR):
+Return { revenueTrend: [{date, revenueKobo}], topProducts: [...], avgOrderValue, totalOrders }
+Backed by a JOIN query on vendor_daily_analytics and vendor_order_items.
+
+In MV vendor dashboard: render analytics as:
+- Revenue sparkline (SVG path element drawing revenue over time — no external chart library)
+- Top 5 products table with revenue and units sold
+- KPI cards: Total Revenue, Avg Order Value, Total Orders, Repeat Buyer Rate
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Apply all migrations to staging
+4. Manual test: customise SV storefront colour to red, verify it renders with red primary colour
+5. Manual test: search for a product by first 3 letters, verify autocomplete dropdown appears
+6. Manual test: check vendor analytics dashboard shows correct revenue for today
+```

@@ -1629,6 +1629,142 @@ app.post('/paystack/webhook', async (c) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// P12 — PRODUCT DISCOVERY & BRANDING (SV-E06, SV-E11, SV-E09, SV-E19)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /search/suggest — Autocomplete suggestions (SV-E19) ──────────────────
+// Must be declared BEFORE /search/:id routes to avoid param capture
+app.get('/search/suggest', async (c) => {
+  const tenantId = getTenantId(c);
+  const q = c.req.query('q')?.trim();
+  if (!q || q.length < 2) return c.json({ success: true, data: { suggestions: [] } });
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT DISTINCT name FROM products
+       WHERE tenant_id = ? AND name LIKE ? AND deleted_at IS NULL AND is_active = 1
+       LIMIT 5`
+    ).bind(tenantId, `${q}%`).all<{ name: string }>();
+    return c.json({ success: true, data: { suggestions: (results ?? []).map((r) => r.name) } });
+  } catch (err) {
+    console.error('[SV][search/suggest] error:', err);
+    return c.json({ success: true, data: { suggestions: [] } });
+  }
+});
+
+// ── POST /products/:id/attributes — Add/update attribute (SV-E06) ─────────────
+app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const body = await c.req.json<{ attributeName: string; attributeValue: string }>();
+
+  if (!body.attributeName?.trim()) return c.json({ success: false, error: 'attributeName is required' }, 400);
+  if (!body.attributeValue?.trim()) return c.json({ success: false, error: 'attributeValue is required' }, 400);
+
+  const now = new Date().toISOString();
+  const id = `attr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tenantId, productId, attributeName)
+       DO UPDATE SET attributeValue = excluded.attributeValue`
+    ).bind(id, tenantId, productId, body.attributeName.trim(), body.attributeValue.trim(), now).run();
+
+    // Re-index FTS5: append attribute values to the product's description field
+    try {
+      const { results: attrs } = await c.env.DB.prepare(
+        'SELECT attributeName, attributeValue FROM product_attributes WHERE tenantId = ? AND productId = ?'
+      ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
+
+      const attrText = attrs.map((a) => `${a.attributeName}: ${a.attributeValue}`).join(' ');
+
+      const product = await c.env.DB.prepare(
+        'SELECT rowid, name, description, category, sku FROM products WHERE id = ? AND tenant_id = ?'
+      ).bind(productId, tenantId).first<{ rowid: number; name: string; description: string | null; category: string | null; sku: string }>();
+
+      if (product) {
+        const fullDesc = [product.description, attrText].filter(Boolean).join(' ');
+        await c.env.DB.batch([
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(products_fts, rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES ('delete', ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, product.description ?? '', product.category ?? '', product.sku),
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, fullDesc, product.category ?? '', product.sku),
+        ]);
+      }
+    } catch {
+      // FTS re-index is non-fatal
+    }
+
+    return c.json({ success: true, data: { id, productId, attributeName: body.attributeName.trim(), attributeValue: body.attributeValue.trim() } }, 201);
+  } catch (err) {
+    console.error('[SV][products/attributes] POST error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /products/:id/attributes — List product attributes (SV-E06) ───────────
+app.get('/products/:id/attributes', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, attributeName, attributeValue, createdAt FROM product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+    ).bind(tenantId, productId).all<{ id: string; attributeName: string; attributeValue: string; createdAt: string }>();
+
+    return c.json({ success: true, data: { productId, attributes: results ?? [] } });
+  } catch (err) {
+    console.error('[SV][products/attributes] GET error:', err);
+    return c.json({ success: true, data: { productId, attributes: [] } });
+  }
+});
+
+// ── PUT /admin/tenant/branding — Save storefront theme (SV-E09) ───────────────
+app.put('/admin/tenant/branding', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Invalid admin key' }, 403);
+  }
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    primaryColor?: string;
+    accentColor?: string;
+    fontFamily?: string;
+    heroImageUrl?: string;
+    announcementBar?: string;
+  }>();
+
+  try {
+    const existing = await c.env.TENANT_CONFIG.get(`tenant:${tenantId}`, 'json') as Record<string, unknown> | null;
+    if (!existing) return c.json({ success: false, error: 'Tenant not found' }, 404);
+
+    const currentBranding = (existing.branding as Record<string, unknown>) ?? {};
+    const updatedBranding = {
+      ...currentBranding,
+      ...(body.primaryColor !== undefined ? { primaryColor: body.primaryColor } : {}),
+      ...(body.accentColor !== undefined ? { accentColor: body.accentColor } : {}),
+      ...(body.fontFamily !== undefined ? { fontFamily: body.fontFamily } : {}),
+      ...(body.heroImageUrl !== undefined ? { heroImageUrl: body.heroImageUrl } : {}),
+      ...(body.announcementBar !== undefined ? { announcementBar: body.announcementBar } : {}),
+    };
+
+    const updatedConfig = { ...existing, branding: updatedBranding };
+    await c.env.TENANT_CONFIG.put(`tenant:${tenantId}`, JSON.stringify(updatedConfig));
+
+    return c.json({ success: true, data: { tenantId, branding: updatedBranding } });
+  } catch (err) {
+    console.error('[SV][admin/tenant/branding] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 export { app as singleVendorRouter };
 
 /**

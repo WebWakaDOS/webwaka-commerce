@@ -595,13 +595,14 @@ export async function handleDeliveryStatusUpdated(
 
   // 3. Send WhatsApp notification via SMS provider
   if (customerPhone && env.TERMII_API_KEY) {
+    const storeUrl = `https://${tenantId}.webwaka.ng`;
     const messageMap: Record<string, string> = {
-      PICKED_UP: `Your order has been picked up by ${provider ?? 'our delivery partner'}. Track here: ${trackingUrl ?? 'N/A'}`,
-      IN_TRANSIT: `Your order is in transit. Estimated delivery: ${estimatedDelivery ?? 'soon'}`,
+      PICKED_UP: `Your order #${orderId} has been picked up. Track it here: ${trackingUrl ?? `${storeUrl}/track/${orderId}`}`,
+      IN_TRANSIT: `Your order is in transit. Estimated arrival: ${estimatedDelivery ?? 'soon'}`,
       OUT_FOR_DELIVERY: 'Your order is out for delivery today! Please be available.',
-      DELIVERED: 'Your order has been delivered! Thank you for shopping with us.',
-      FAILED: 'Delivery attempt failed. We will retry. Contact support if you need help.',
-      RETURNED: 'Your order has been returned. A refund will be processed shortly.',
+      DELIVERED: `Your order has been delivered! Enjoyed your purchase? Leave a review: ${storeUrl}/reviews/${orderId}`,
+      FAILED: `Delivery attempt failed for order #${orderId}. We will retry. Contact us if you need help.`,
+      RETURNED: `Your order #${orderId} was returned. A refund will be processed within 3-5 business days.`,
     };
     const message = messageMap[status];
     if (message) {

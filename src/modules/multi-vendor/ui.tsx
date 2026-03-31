@@ -45,6 +45,8 @@ export const MarketplaceInterface: React.FC<{
   // ── Search / filter state ─────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
 
   // ── Load products via single catalog search call (P02-MV-E01) ─────────────
   const loadProducts = useCallback(async (signal?: AbortSignal, q = '', category = '') => {
@@ -134,6 +136,22 @@ export const MarketplaceInterface: React.FC<{
     loadProducts(controller.signal, searchQuery, categoryFilter);
     return () => controller.abort();
   }, [loadProducts, searchQuery, categoryFilter]);
+
+  // ── Autocomplete suggestions (SV-E19 / P12) ───────────────────────────────
+  useEffect(() => {
+    if (!searchQuery || searchQuery.length < 2) { setSuggestions([]); return; }
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/multi-vendor/search/suggest?q=${encodeURIComponent(searchQuery)}`, {
+          headers: { 'x-tenant-id': tenantId },
+        });
+        const json = await res.json() as { success: boolean; data?: { suggestions: string[] } };
+        setSuggestions(json.data?.suggestions ?? []);
+        setShowSuggestions(true);
+      } catch { setSuggestions([]); }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery, tenantId]);
 
   // ── Cart operations ────────────────────────────────────────────────────────
 
@@ -248,14 +266,36 @@ export const MarketplaceInterface: React.FC<{
 
       {/* Search & filter bar */}
       <div style={{ padding: '0.75rem 1rem', backgroundColor: '#fff', borderBottom: '1px solid #e5e7eb', display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
-        <input
-          type="search"
-          placeholder="Search products…"
-          value={searchQuery}
-          onChange={e => setSearchQuery(e.target.value)}
-          style={{ flex: 1, minWidth: '180px', padding: '0.5rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.95rem' }}
-          aria-label="Search products"
-        />
+        <div style={{ position: 'relative', flex: 1, minWidth: '180px' }}>
+          <input
+            type="search"
+            placeholder="Search products…"
+            value={searchQuery}
+            onChange={e => { setSearchQuery(e.target.value); setShowSuggestions(true); }}
+            onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
+            onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
+            style={{ width: '100%', padding: '0.5rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.95rem', boxSizing: 'border-box' }}
+            aria-label="Search products"
+            aria-autocomplete="list"
+            aria-expanded={showSuggestions && suggestions.length > 0}
+          />
+          {showSuggestions && suggestions.length > 0 && (
+            <ul role="listbox" style={{ position: 'absolute', top: '100%', left: 0, right: 0, backgroundColor: '#fff', border: '1px solid #d1d5db', borderRadius: '0 0 6px 6px', margin: 0, padding: 0, listStyle: 'none', zIndex: 50, boxShadow: '0 4px 12px rgba(0,0,0,0.1)', maxHeight: '200px', overflowY: 'auto' }}>
+              {suggestions.map((s) => (
+                <li
+                  key={s}
+                  role="option"
+                  onClick={() => { setSearchQuery(s); setShowSuggestions(false); }}
+                  style={{ padding: '0.5rem 0.75rem', cursor: 'pointer', fontSize: '0.9rem', borderBottom: '1px solid #f3f4f6' }}
+                  onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#f0f9ff')}
+                  onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+                >
+                  {s}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
         <input
           type="text"
           placeholder="Category filter"
@@ -559,6 +599,155 @@ export const VendorLedger: React.FC<{
           )}
         </>
       )}
+    </div>
+  );
+};
+
+// ── VendorAnalyticsDashboard — MV-E15 ─────────────────────────────────────────
+interface DayRow { date: string; revenueKobo: number; orderCount: number; avgOrderValueKobo: number; }
+interface TopProduct { product_id: string; name: string; units_sold: number; revenue_kobo: number; }
+interface AnalyticsData {
+  revenueTrend: DayRow[];
+  topProducts: TopProduct[];
+  totalRevenue: number;
+  totalOrders: number;
+  avgOrderValue: number;
+  days: number;
+}
+
+export const VendorAnalyticsDashboard: React.FC<{ vendorToken: string; tenantId: string; days?: number }> = ({ vendorToken, tenantId, days = 30 }) => {
+  const [data, setData] = useState<AnalyticsData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    setLoading(true);
+    fetch(`/api/multi-vendor/vendor/analytics?days=${days}`, {
+      headers: { 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}` },
+    })
+      .then((r) => r.json() as Promise<{ success: boolean; data?: AnalyticsData; error?: string }>)
+      .then((j) => { if (j.success && j.data) setData(j.data); else setErr(j.error ?? 'Failed'); })
+      .catch((e) => setErr(String(e)))
+      .finally(() => setLoading(false));
+  }, [vendorToken, tenantId, days]);
+
+  if (loading) return <p style={{ textAlign: 'center', color: '#6b7280', padding: '2rem' }}>Loading analytics…</p>;
+  if (err) return <p style={{ color: '#dc2626', padding: '1rem' }}>{err}</p>;
+  if (!data) return null;
+
+  const maxRev = Math.max(...data.revenueTrend.map((d) => d.revenueKobo), 1);
+
+  return (
+    <div style={{ fontFamily: 'sans-serif', padding: '1rem', maxWidth: '900px', margin: '0 auto' }}>
+      <h3 style={{ margin: '0 0 1rem', fontSize: '1.1rem' }}>Analytics — Last {data.days} Days</h3>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '1.5rem' }}>
+        {[
+          { label: 'Total Revenue', value: `₦${(data.totalRevenue / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`, color: '#16a34a' },
+          { label: 'Total Orders', value: data.totalOrders.toString(), color: '#2563eb' },
+          { label: 'Avg Order Value', value: `₦${(data.avgOrderValue / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`, color: '#7c3aed' },
+        ].map((kpi) => (
+          <div key={kpi.label} style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '1rem', textAlign: 'center' }}>
+            <div style={{ fontSize: '0.75rem', color: '#6b7280', marginBottom: '0.25rem' }}>{kpi.label}</div>
+            <div style={{ fontSize: '1.5rem', fontWeight: 700, color: kpi.color }}>{kpi.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {data.revenueTrend.length > 0 && (
+        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '1rem', marginBottom: '1.5rem' }}>
+          <h4 style={{ margin: '0 0 0.75rem', fontSize: '0.9rem', color: '#374151' }}>Daily Revenue</h4>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '3px', height: '80px' }}>
+            {data.revenueTrend.map((d) => (
+              <div key={d.date} title={`${d.date}: ₦${(d.revenueKobo / 100).toFixed(0)}`} style={{ flex: 1, background: '#2563eb', borderRadius: '2px 2px 0 0', height: `${Math.round((d.revenueKobo / maxRev) * 100)}%`, minHeight: d.revenueKobo > 0 ? '4px' : '0', transition: 'height 0.2s' }} />
+            ))}
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px', fontSize: '0.65rem', color: '#9ca3af' }}>
+            <span>{data.revenueTrend[0]?.date}</span>
+            <span>{data.revenueTrend[data.revenueTrend.length - 1]?.date}</span>
+          </div>
+        </div>
+      )}
+
+      {data.topProducts.length > 0 && (
+        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '1rem' }}>
+          <h4 style={{ margin: '0 0 0.75rem', fontSize: '0.9rem', color: '#374151' }}>Top Products</h4>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+            <thead>
+              <tr style={{ background: '#f9fafb' }}>
+                {['Product', 'Units Sold', 'Revenue'].map((h) => (
+                  <th key={h} style={{ padding: '0.4rem 0.6rem', textAlign: 'left', borderBottom: '2px solid #e5e7eb', color: '#374151', fontWeight: 600 }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {data.topProducts.map((p) => (
+                <tr key={p.product_id} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                  <td style={{ padding: '0.4rem 0.6rem' }}>{p.name}</td>
+                  <td style={{ padding: '0.4rem 0.6rem', color: '#2563eb', fontWeight: 600 }}>{p.units_sold}</td>
+                  <td style={{ padding: '0.4rem 0.6rem', color: '#16a34a', fontWeight: 600 }}>₦{(p.revenue_kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── VendorBrandingEditor — MV-E13 ─────────────────────────────────────────────
+export const VendorBrandingEditor: React.FC<{ vendorToken: string; tenantId: string }> = ({ vendorToken, tenantId }) => {
+  const [logoUrl, setLogoUrl] = useState('');
+  const [bannerUrl, setBannerUrl] = useState('');
+  const [primaryColor, setPrimaryColor] = useState('#000000');
+  const [tagline, setTagline] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const handleSave = async () => {
+    setSaving(true);
+    setMsg('');
+    try {
+      const res = await fetch('/api/multi-vendor/vendor/branding', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}` },
+        body: JSON.stringify({ logoUrl: logoUrl || null, bannerUrl: bannerUrl || null, primaryColor, tagline: tagline || null }),
+      });
+      const json = await res.json() as { success: boolean; error?: string };
+      setMsg(json.success ? '✓ Branding updated' : `Error: ${json.error ?? 'Unknown'}`);
+    } catch (e) {
+      setMsg(`Error: ${String(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const inputStyle = { width: '100%', padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.9rem', boxSizing: 'border-box' as const, marginBottom: '12px' };
+  const labelStyle = { fontSize: '0.8rem', color: '#374151', fontWeight: 600 as const, display: 'block' as const, marginBottom: '4px' };
+
+  return (
+    <div style={{ maxWidth: '480px', padding: '1rem' }}>
+      <h3 style={{ margin: '0 0 1rem', fontSize: '1rem' }}>My Store Branding</h3>
+      {msg && (
+        <div style={{ padding: '8px 12px', borderRadius: '6px', marginBottom: '12px', fontSize: '0.85rem', background: msg.startsWith('Error') ? '#fee2e2' : '#d1fae5', color: msg.startsWith('Error') ? '#dc2626' : '#065f46' }}>
+          {msg}
+        </div>
+      )}
+      <label style={labelStyle}>Logo URL</label>
+      <input type="url" value={logoUrl} onChange={(e) => setLogoUrl(e.target.value)} style={inputStyle} placeholder="https://cdn.example.com/logo.png" />
+      <label style={labelStyle}>Banner URL</label>
+      <input type="url" value={bannerUrl} onChange={(e) => setBannerUrl(e.target.value)} style={inputStyle} placeholder="https://cdn.example.com/banner.jpg" />
+      <label style={labelStyle}>Primary Colour</label>
+      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '12px' }}>
+        <input type="color" value={primaryColor} onChange={(e) => setPrimaryColor(e.target.value)} style={{ width: '36px', height: '32px', padding: 0, border: '1px solid #d1d5db', borderRadius: '4px', cursor: 'pointer' }} />
+        <input type="text" value={primaryColor} onChange={(e) => setPrimaryColor(e.target.value)} style={{ ...inputStyle, marginBottom: 0, flex: 1 }} placeholder="#000000" />
+      </div>
+      <label style={labelStyle}>Tagline</label>
+      <input type="text" value={tagline} onChange={(e) => setTagline(e.target.value)} style={inputStyle} placeholder="Quality products, delivered fast" />
+      <button onClick={handleSave} disabled={saving} style={{ padding: '0.5rem 1.25rem', background: saving ? '#d1d5db' : '#2563eb', color: '#fff', border: 'none', borderRadius: '6px', cursor: saving ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.9rem' }}>
+        {saving ? 'Saving…' : 'Save Branding'}
+      </button>
     </div>
   );
 };

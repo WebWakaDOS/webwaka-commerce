@@ -416,4 +416,4 @@ See `.env.example` for reference:
 - Receipt expanded: shows pts redeemed (red), pts earned (green), new balance, and tier.
 - All loyalty state cleared on hold, checkout, and receipt dismiss.
 
-**TypeScript clean (0 errors across all 18 test files and production source), 828/828 tests passing.**
+**TypeScript clean (0 errors across all 18 test files and production source), 828/828 tests passing. P12 complete.**

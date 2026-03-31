@@ -34,14 +34,22 @@ export const DEFAULT_LOYALTY_CONFIG: LoyaltyConfig = {
   ],
 };
 
+export interface StorefrontBranding {
+  primaryColor: string;
+  accentColor?: string;
+  fontFamily?: string;
+  logoUrl?: string;
+  heroImageUrl?: string;
+  announcementBar?: string;
+}
+
 export interface TenantConfig {
   tenantId: string;
   marketplaceId?: string; // For scoped vendor tenants in a marketplace
   domain: string;
   enabledModules: string[];
-  branding: {
-    primaryColor: string;
-    logoUrl: string;
+  branding: StorefrontBranding & {
+    logoUrl: string; // kept for backward compat
   };
   permissions: Record<string, string[]>;
   featureFlags: Record<string, boolean>;

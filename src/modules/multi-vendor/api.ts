@@ -3315,6 +3315,193 @@ app.get('/campaigns/:id/products', async (c) => {
   return c.json({ success: true, data: { campaign, products: results } });
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// P12 — PRODUCT DISCOVERY, VENDOR BRANDING & ANALYTICS (MV-E13, MV-E15, SV-E06, SV-E19)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /search/suggest — Autocomplete suggestions (SV-E19 / MV) ─────────────
+app.get('/search/suggest', async (c) => {
+  const tenantId = getTenantId(c);
+  const q = c.req.query('q')?.trim();
+  if (!q || q.length < 2) return c.json({ success: true, data: { suggestions: [] } });
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT DISTINCT name FROM products
+       WHERE tenant_id = ? AND name LIKE ? AND deleted_at IS NULL AND is_active = 1
+       LIMIT 5`
+    ).bind(tenantId, `${q}%`).all<{ name: string }>();
+    return c.json({ success: true, data: { suggestions: (results ?? []).map((r) => r.name) } });
+  } catch (err) {
+    console.error('[MV][search/suggest] error:', err);
+    return c.json({ success: true, data: { suggestions: [] } });
+  }
+});
+
+// ── POST /products/:id/attributes — Add/update attribute (SV-E06 / MV) ────────
+app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const body = await c.req.json<{ attributeName: string; attributeValue: string }>();
+
+  if (!body.attributeName?.trim()) return c.json({ success: false, error: 'attributeName is required' }, 400);
+  if (!body.attributeValue?.trim()) return c.json({ success: false, error: 'attributeValue is required' }, 400);
+
+  const now = new Date().toISOString();
+  const id = `attr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tenantId, productId, attributeName)
+       DO UPDATE SET attributeValue = excluded.attributeValue`
+    ).bind(id, tenantId, productId, body.attributeName.trim(), body.attributeValue.trim(), now).run();
+
+    // Re-index FTS5 with attribute values appended to description
+    try {
+      const { results: attrs } = await c.env.DB.prepare(
+        'SELECT attributeName, attributeValue FROM product_attributes WHERE tenantId = ? AND productId = ?'
+      ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
+
+      const attrText = attrs.map((a) => `${a.attributeName}: ${a.attributeValue}`).join(' ');
+      const product = await c.env.DB.prepare(
+        'SELECT rowid, name, description, category, sku FROM products WHERE id = ? AND tenant_id = ?'
+      ).bind(productId, tenantId).first<{ rowid: number; name: string; description: string | null; category: string | null; sku: string }>();
+
+      if (product) {
+        const fullDesc = [product.description, attrText].filter(Boolean).join(' ');
+        await c.env.DB.batch([
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(products_fts, rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES ('delete', ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, product.description ?? '', product.category ?? '', product.sku),
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, fullDesc, product.category ?? '', product.sku),
+        ]);
+      }
+    } catch {
+      // FTS re-index is non-fatal
+    }
+
+    return c.json({ success: true, data: { id, productId, attributeName: body.attributeName.trim(), attributeValue: body.attributeValue.trim() } }, 201);
+  } catch (err) {
+    console.error('[MV][products/attributes] POST error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /products/:id/attributes — List product attributes ────────────────────
+app.get('/products/:id/attributes', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, attributeName, attributeValue, createdAt FROM product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+    ).bind(tenantId, productId).all<{ id: string; attributeName: string; attributeValue: string; createdAt: string }>();
+
+    return c.json({ success: true, data: { productId, attributes: results ?? [] } });
+  } catch (err) {
+    console.error('[MV][products/attributes] GET error:', err);
+    return c.json({ success: true, data: { productId, attributes: [] } });
+  }
+});
+
+// ── PATCH /vendor/branding — Vendor updates their storefront branding (MV-E13) ─
+app.patch('/vendor/branding', async (c) => {
+  const tenantId = getTenantId(c);
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const body = await c.req.json<{
+    logoUrl?: string;
+    bannerUrl?: string;
+    primaryColor?: string;
+    tagline?: string;
+  }>();
+
+  const branding = {
+    logoUrl: body.logoUrl ?? null,
+    bannerUrl: body.bannerUrl ?? null,
+    primaryColor: body.primaryColor ?? null,
+    tagline: body.tagline ?? null,
+  };
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE vendors SET branding = json(?) WHERE id = ? AND marketplace_tenant_id = ?`
+    ).bind(JSON.stringify(branding), vendor.vendorId, tenantId).run();
+
+    return c.json({ success: true, data: { vendorId: vendor.vendorId, branding } });
+  } catch (err) {
+    console.error('[MV][vendor/branding] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /vendor/analytics?days= — Vendor analytics dashboard (MV-E15) ─────────
+app.get('/vendor/analytics', async (c) => {
+  const tenantId = getTenantId(c);
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const days = Math.min(Math.max(1, Number(c.req.query('days') ?? 30)), 90);
+
+  try {
+    // Revenue trend from vendor_daily_analytics
+    const { results: trend } = await c.env.DB.prepare(
+      `SELECT date, revenueKobo, orderCount, avgOrderValueKobo
+       FROM vendor_daily_analytics
+       WHERE vendorId = ? AND tenantId = ?
+         AND date >= DATE('now', ?)
+       ORDER BY date ASC`
+    ).bind(vendor.vendorId, tenantId, `-${days} days`).all<{
+      date: string; revenueKobo: number; orderCount: number; avgOrderValueKobo: number;
+    }>();
+
+    // Aggregated KPIs
+    const totalRevenue = (trend ?? []).reduce((s, r) => s + r.revenueKobo, 0);
+    const totalOrders = (trend ?? []).reduce((s, r) => s + r.orderCount, 0);
+    const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
+
+    // Top 5 products by revenue (last N days from vendor_orders / order_items join)
+    const { results: topProducts } = await c.env.DB.prepare(
+      `SELECT oi.product_id, oi.product_name AS name,
+              SUM(oi.quantity)     AS units_sold,
+              SUM(oi.total_price)  AS revenue_kobo
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE o.vendor_id = ? AND o.tenant_id = ?
+         AND o.payment_status = 'paid'
+         AND o.created_at >= ?
+       GROUP BY oi.product_id, oi.product_name
+       ORDER BY revenue_kobo DESC
+       LIMIT 5`
+    ).bind(vendor.vendorId, tenantId, Date.now() - days * 24 * 60 * 60 * 1000).all<{
+      product_id: string; name: string; units_sold: number; revenue_kobo: number;
+    }>();
+
+    return c.json({
+      success: true,
+      data: {
+        revenueTrend: trend ?? [],
+        topProducts: topProducts ?? [],
+        totalRevenue,
+        totalOrders,
+        avgOrderValue,
+        repeatBuyerCount: 0,
+        days,
+      },
+    });
+  } catch (err) {
+    console.error('[MV][vendor/analytics] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 export { app as multiVendorRouter };
 
 /**
