@@ -1826,6 +1826,145 @@ app.put('/admin/tenant/branding', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), 
   }
 });
 
+// ── SV-E14: Subscriptions CRUD ────────────────────────────────────────────────
+
+// POST /subscriptions — create a recurring order subscription
+app.post('/subscriptions', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{ productId: string; frequencyDays: number; paystackToken: string }>();
+  if (!body.productId || !body.frequencyDays || !body.paystackToken) {
+    return c.json({ success: false, error: 'productId, frequencyDays, paystackToken required' }, 400);
+  }
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+  const product = await c.env.DB.prepare(
+    'SELECT name, price FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+  ).bind(body.productId, tenantId).first<{ name: string; price: number }>();
+  if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const nextCharge = new Date();
+  nextCharge.setDate(nextCharge.getDate() + body.frequencyDays);
+  const subId = `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+  await c.env.DB.prepare(
+    `INSERT INTO subscriptions (id, tenantId, customerId, productId, frequencyDays, nextChargeDate, paystackToken, status, productName)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
+  ).bind(subId, tenantId, customerId, body.productId, body.frequencyDays, nextCharge.toISOString().slice(0, 10), body.paystackToken, product.name).run();
+
+  return c.json({ success: true, data: { id: subId, status: 'ACTIVE', nextChargeDate: nextCharge.toISOString().slice(0, 10) } }, 201);
+});
+
+// PATCH /subscriptions/:id — pause, resume, or cancel a subscription
+app.patch('/subscriptions/:id', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const id = c.req.param('id');
+  const { status } = await c.req.json<{ status: 'PAUSED' | 'ACTIVE' | 'CANCELLED' }>();
+  const validStatuses = ['PAUSED', 'ACTIVE', 'CANCELLED'];
+  if (!validStatuses.includes(status)) return c.json({ success: false, error: 'status must be PAUSED, ACTIVE, or CANCELLED' }, 400);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+
+  const result = await c.env.DB.prepare(
+    `UPDATE subscriptions SET status = ? WHERE id = ? AND tenantId = ? AND customerId = ?`,
+  ).bind(status, id, tenantId, customerId).run();
+
+  if ((result.meta?.changes ?? 0) === 0) return c.json({ success: false, error: 'Subscription not found or not owned by you' }, 404);
+  return c.json({ success: true, data: { id, status } });
+});
+
+// GET /subscriptions — list customer subscriptions
+app.get('/subscriptions', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  const { results } = await c.env.DB.prepare(
+    `SELECT s.id, s.productId, s.productName, s.frequencyDays, s.nextChargeDate, s.status,
+            s.retryCount, p.price_kobo AS priceKobo
+     FROM subscriptions s LEFT JOIN products p ON p.id = s.productId AND p.tenant_id = s.tenantId
+     WHERE s.tenantId = ? AND s.customerId = ? ORDER BY s.createdAt DESC`,
+  ).bind(tenantId, customerId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { subscriptions: results ?? [] } });
+});
+
+// ── SV-E18: NDPR Data Export and Deletion ─────────────────────────────────────
+
+// POST /account/export — rate-limited once per 30 days; returns all customer data as JSON
+app.post('/account/export', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+  // Rate limit: once per 30 days
+  const rlKey = `ndpr_export:${tenantId}:${customerId}`;
+  const allowed = await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, rlKey, 1, 30 * 24 * 60 * 60 * 1000);
+  if (!allowed) return c.json({ success: false, error: 'Data export is limited to once every 30 days' }, 429);
+
+  const [profile, orders, wishlist, loyalty, subscriptions] = await Promise.all([
+    c.env.DB.prepare(`SELECT id, name, phone, email, createdAt FROM customers WHERE id = ? AND tenant_id = ?`).bind(customerId, tenantId).first(),
+    c.env.DB.prepare(`SELECT id, total_amount, order_status, payment_status, created_at FROM orders WHERE customer_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT 100`).bind(customerId, tenantId).all(),
+    c.env.DB.prepare(`SELECT productId, createdAt FROM wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
+    c.env.DB.prepare(`SELECT points, tier, updatedAt FROM customer_loyalty WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).first(),
+    c.env.DB.prepare(`SELECT id, productName, frequencyDays, nextChargeDate, status FROM subscriptions WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
+  ]);
+
+  return c.json({
+    success: true,
+    data: {
+      exportedAt: new Date().toISOString(),
+      profile,
+      orders: orders.results ?? [],
+      wishlist: wishlist.results ?? [],
+      loyalty,
+      subscriptions: subscriptions.results ?? [],
+    },
+  });
+});
+
+// DELETE /account — NDPR soft-delete: anonymise PII, cancel active subscriptions
+app.delete('/account', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+  const customer = await c.env.DB.prepare(
+    `SELECT phone FROM customers WHERE id = ? AND tenant_id = ? AND deletedAt IS NULL`,
+  ).bind(customerId, tenantId).first<{ phone: string }>();
+  if (!customer) return c.json({ success: false, error: 'Account not found' }, 404);
+
+  // Send farewell SMS before nulling phone
+  if (customer.phone && c.env.TERMII_API_KEY) {
+    const sms = createSmsProvider(c.env.TERMII_API_KEY, 'WebWaka');
+    await sms.sendMessage(customer.phone, 'Your WebWaka account and personal data have been deleted as requested. Your order history is retained for merchant accounting.').catch(() => {});
+  }
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE customers SET name = 'Deleted User', phone = ?, email = NULL, deletedAt = ? WHERE id = ? AND tenant_id = ?`,
+    ).bind(`deleted_${customerId}`, new Date().toISOString(), customerId, tenantId),
+    c.env.DB.prepare(`DELETE FROM wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId),
+    c.env.DB.prepare(`UPDATE subscriptions SET status = 'CANCELLED' WHERE customerId = ? AND tenantId = ? AND status = 'ACTIVE'`).bind(customerId, tenantId),
+  ]);
+
+  return c.json({ success: true, data: { message: 'Account deleted. Order history retained for merchant accounting.' } });
+});
+
+// ── POS-E12: Payment status poll (transfer confirmation) ──────────────────────
+app.get('/payment-status', async (c) => {
+  const reference = c.req.query('reference');
+  if (!reference) return c.json({ success: false, error: 'reference query param required' }, 400);
+  const confirmed = await c.env.SESSIONS_KV?.get(`transfer_confirmed:${reference}`).catch(() => null);
+  return c.json({ success: true, data: { confirmed: confirmed === '1', reference } });
+});
+
+// ── SV-E17: COD with Deposit — returns deposit amount for COD orders ──────────
+app.post('/checkout/cod-deposit', async (c) => {
+  const tenantId = getTenantId(c);
+  const { subtotalKobo } = await c.req.json<{ subtotalKobo: number }>();
+  const tc = c.get('tenantConfig' as never) as { codDepositPercent?: number } | undefined;
+  const pct = tc?.codDepositPercent ?? 20;
+  const depositKobo = Math.round(subtotalKobo * pct / 100);
+  return c.json({ success: true, data: { depositPercent: pct, depositKobo, remainingKobo: subtotalKobo - depositKobo } });
+});
+
 export { app as singleVendorRouter };
 
 /**

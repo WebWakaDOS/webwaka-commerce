@@ -337,8 +337,19 @@ app.patch(
       const totalSales = salesSummary?.total_sales_kobo ?? 0;
       const cashSales = salesSummary?.cash_sales_kobo ?? 0;
       const orderCount = salesSummary?.order_count ?? 0;
-      // Cash variance: cash collected vs opening float (spec: sales - float)
-      const cashVarianceKobo = cashSales - session.initial_float_kobo;
+
+      // ── POS-E19: Expense deduction from expected cash balance ─────────────
+      const expenseSummary = await c.env.DB.prepare(
+        `SELECT COALESCE(SUM(amountKobo), 0) as totalExpensesKobo,
+                json_group_array(json_object('category',category,'amountKobo',amountKobo,'note',COALESCE(note,''))) as breakdown
+         FROM session_expenses WHERE sessionId = ? AND tenantId = ?`,
+      ).bind(id, tenantId).first<{ totalExpensesKobo: number; breakdown: string }>();
+      const totalExpensesKobo = expenseSummary?.totalExpensesKobo ?? 0;
+      let expenseBreakdown: unknown[] = [];
+      try { expenseBreakdown = JSON.parse(expenseSummary?.breakdown ?? '[]'); } catch { expenseBreakdown = []; }
+
+      // Cash variance: cash collected vs opening float minus expenses
+      const cashVarianceKobo = cashSales - session.initial_float_kobo - totalExpensesKobo;
 
       // ── Cashier-level breakdown (POS-E11) ────────────────────────────────
       const cashierBreakdownResult = await c.env.DB.prepare(
@@ -366,6 +377,8 @@ app.patch(
         total_sales_kobo: totalSales,
         cash_sales_kobo: cashSales,
         order_count: orderCount,
+        total_expenses_kobo: totalExpensesKobo,
+        expense_breakdown: expenseBreakdown,
         cash_variance_kobo: cashVarianceKobo,
         cashier_breakdown: cashierBreakdown,
       };
@@ -1474,6 +1487,260 @@ app.post('/stock-adjustments', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), asy
     console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Failed to process stock adjustments' }, 500);
   }
+});
+
+// ── POS-E19: Cash Drawer Expense Tracking ────────────────────────────────────
+
+// POST /expenses — log an expense against an open session
+app.post(
+  '/expenses',
+  requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
+  async (c) => {
+    const tenantId = getTenantId(c);
+    const body = await c.req.json<{ sessionId: string; amountKobo: number; category: string; note?: string }>();
+    if (!body.sessionId || !body.amountKobo || !body.category) {
+      return c.json({ success: false, error: 'sessionId, amountKobo, category required' }, 400);
+    }
+    const session = await c.env.DB.prepare(
+      `SELECT id FROM pos_sessions WHERE id = ? AND tenant_id = ? AND status = 'open'`,
+    ).bind(body.sessionId, tenantId).first<{ id: string }>();
+    if (!session) return c.json({ success: false, error: 'Open session not found' }, 404);
+
+    const expId = `exp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    await c.env.DB.prepare(
+      `INSERT INTO session_expenses (id, tenantId, sessionId, amountKobo, category, note) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).bind(expId, tenantId, body.sessionId, body.amountKobo, body.category, body.note ?? null).run();
+
+    return c.json({ success: true, data: { id: expId, amountKobo: body.amountKobo, category: body.category } }, 201);
+  },
+);
+
+// GET /expenses/:sessionId — list expenses for a session
+app.get(
+  '/expenses/:sessionId',
+  requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
+  async (c) => {
+    const tenantId = getTenantId(c);
+    const sessionId = c.req.param('sessionId');
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, amountKobo, category, note, createdAt FROM session_expenses WHERE sessionId = ? AND tenantId = ? ORDER BY createdAt`,
+    ).bind(sessionId, tenantId).all<Record<string, unknown>>();
+    const total = (results ?? []).reduce((s, r) => s + ((r.amountKobo as number) ?? 0), 0);
+    return c.json({ success: true, data: { expenses: results ?? [], totalExpensesKobo: total } });
+  },
+);
+
+// ── POS-E13: Product Bundles ──────────────────────────────────────────────────
+
+// POST /bundles — create a bundle with component items
+app.post(
+  '/bundles',
+  requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
+  async (c) => {
+    const tenantId = getTenantId(c);
+    const body = await c.req.json<{
+      name: string;
+      description?: string;
+      priceKobo: number;
+      items: Array<{ productId: string; quantity: number }>;
+    }>();
+    if (!body.name || !body.priceKobo || !body.items?.length) {
+      return c.json({ success: false, error: 'name, priceKobo, items required' }, 400);
+    }
+
+    const bundleId = `bndl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const stmts = [
+      c.env.DB.prepare(
+        `INSERT INTO product_bundles (id, tenantId, name, description, priceKobo) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(bundleId, tenantId, body.name, body.description ?? null, body.priceKobo),
+      ...body.items.map(it =>
+        c.env.DB.prepare(
+          `INSERT INTO bundle_items (id, bundleId, productId, quantity) VALUES (?, ?, ?, ?)`,
+        ).bind(`bi_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, bundleId, it.productId, it.quantity),
+      ),
+    ];
+    await c.env.DB.batch(stmts);
+
+    return c.json({ success: true, data: { id: bundleId, name: body.name, priceKobo: body.priceKobo } }, 201);
+  },
+);
+
+// GET /bundles — list active bundles with components
+app.get('/bundles', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  const { results: bundles } = await c.env.DB.prepare(
+    `SELECT b.id, b.name, b.description, b.priceKobo, b.active FROM product_bundles b WHERE b.tenantId = ? AND b.active = 1 ORDER BY b.name`,
+  ).bind(tenantId).all<{ id: string; name: string; description: string | null; priceKobo: number; active: number }>();
+
+  const bundlesWithItems = await Promise.all(
+    (bundles ?? []).map(async (b) => {
+      const { results: items } = await c.env.DB.prepare(
+        `SELECT bi.productId, bi.quantity, p.name FROM bundle_items bi
+         LEFT JOIN products p ON p.id = bi.productId AND p.tenant_id = ?
+         WHERE bi.bundleId = ?`,
+      ).bind(tenantId, b.id).all<{ productId: string; quantity: number; name: string | null }>();
+      return { ...b, items: items ?? [] };
+    }),
+  );
+
+  return c.json({ success: true, data: { bundles: bundlesWithItems } });
+});
+
+// ── POS-E14: Supplier and PO Management ──────────────────────────────────────
+
+// GET /suppliers
+app.get('/suppliers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, name, phone, email, address, createdAt FROM suppliers WHERE tenantId = ? ORDER BY name`,
+  ).bind(tenantId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { suppliers: results ?? [] } });
+});
+
+// POST /suppliers
+app.post('/suppliers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{ name: string; phone?: string; email?: string; address?: string }>();
+  if (!body.name) return c.json({ success: false, error: 'name required' }, 400);
+  const id = `sup_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  await c.env.DB.prepare(
+    `INSERT INTO suppliers (id, tenantId, name, phone, email, address) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(id, tenantId, body.name, body.phone ?? null, body.email ?? null, body.address ?? null).run();
+  return c.json({ success: true, data: { id, name: body.name } }, 201);
+});
+
+// GET /purchase-orders
+app.get('/purchase-orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const { results } = await c.env.DB.prepare(
+    `SELECT po.id, po.supplierId, po.status, po.expectedDelivery, po.createdAt, po.receivedAt, s.name AS supplierName
+     FROM purchase_orders po LEFT JOIN suppliers s ON s.id = po.supplierId AND s.tenantId = po.tenantId
+     WHERE po.tenantId = ? ORDER BY po.createdAt DESC LIMIT 100`,
+  ).bind(tenantId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { purchaseOrders: results ?? [] } });
+});
+
+// POST /purchase-orders
+app.post('/purchase-orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    supplierId: string;
+    expectedDelivery?: string;
+    items: Array<{ productId: string; quantityOrdered: number; unitCostKobo: number }>;
+  }>();
+  if (!body.supplierId || !body.items?.length) return c.json({ success: false, error: 'supplierId, items required' }, 400);
+
+  const poId = `po_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const stmts = [
+    c.env.DB.prepare(
+      `INSERT INTO purchase_orders (id, tenantId, supplierId, expectedDelivery) VALUES (?, ?, ?, ?)`,
+    ).bind(poId, tenantId, body.supplierId, body.expectedDelivery ?? null),
+    ...body.items.map(it =>
+      c.env.DB.prepare(
+        `INSERT INTO purchase_order_items (id, poId, productId, quantityOrdered, unitCostKobo) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(`poi_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, poId, it.productId, it.quantityOrdered, it.unitCostKobo),
+    ),
+  ];
+  await c.env.DB.batch(stmts);
+  return c.json({ success: true, data: { id: poId, status: 'PENDING' } }, 201);
+});
+
+// POST /purchase-orders/:id/receive — receive PO items, update stock
+app.post(
+  '/purchase-orders/:id/receive',
+  requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
+  async (c) => {
+    const tenantId = getTenantId(c);
+    const poId = c.req.param('id');
+    const body = await c.req.json<{ items: Array<{ productId: string; receivedQty: number; unitCostKobo: number }> }>();
+    if (!body.items?.length) return c.json({ success: false, error: 'items required' }, 400);
+
+    const po = await c.env.DB.prepare(
+      `SELECT id FROM purchase_orders WHERE id = ? AND tenantId = ? AND status != 'RECEIVED'`,
+    ).bind(poId, tenantId).first<{ id: string }>();
+    if (!po) return c.json({ success: false, error: 'Purchase order not found or already received' }, 404);
+
+    const now = Date.now();
+    const stmts = body.items.flatMap(it => [
+      c.env.DB.prepare(
+        `UPDATE products SET quantity = quantity + ? WHERE id = ? AND tenant_id = ?`,
+      ).bind(it.receivedQty, it.productId, tenantId),
+      c.env.DB.prepare(
+        `UPDATE purchase_order_items SET quantityReceived = ? WHERE poId = ? AND productId = ?`,
+      ).bind(it.receivedQty, poId, it.productId),
+      c.env.DB.prepare(
+        `INSERT INTO stock_adjustment_log (id, tenant_id, product_id, previous_qty, new_qty, delta, reason, created_at)
+         SELECT ?, ?, ?, quantity - ?, quantity, ?, 'purchase_order_received', ?
+         FROM products WHERE id = ? AND tenant_id = ?`,
+      ).bind(
+        `sal_po_${now}_${Math.random().toString(36).slice(2, 6)}`,
+        tenantId, it.productId, it.receivedQty, it.receivedQty, now, it.productId, tenantId,
+      ),
+    ]);
+    stmts.push(
+      c.env.DB.prepare(`UPDATE purchase_orders SET status = 'RECEIVED', receivedAt = ? WHERE id = ? AND tenantId = ?`).bind(new Date().toISOString(), poId, tenantId),
+    );
+    await c.env.DB.batch(stmts);
+
+    return c.json({ success: true, data: { id: poId, status: 'RECEIVED', itemsReceived: body.items.length } });
+  },
+);
+
+// ── POS-E16: Agency Banking Lookup ───────────────────────────────────────────
+// Returns agency banking provider config for the POS UI to display
+app.get('/agency-banking/config', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tc = c.get('tenantConfig' as never) as { agencyBankingProvider?: string; agencyBankingApiKey?: string } | undefined;
+  return c.json({
+    success: true,
+    data: {
+      provider: tc?.agencyBankingProvider ?? null,
+      configured: !!tc?.agencyBankingApiKey,
+    },
+  });
+});
+
+// POST /agency-banking/initiate — initiate a deposit/withdrawal lookup
+app.post('/agency-banking/initiate', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tc = c.get('tenantConfig' as never) as { agencyBankingProvider?: string; agencyBankingApiKey?: string } | undefined;
+  if (!tc?.agencyBankingProvider || !tc?.agencyBankingApiKey) {
+    return c.json({ success: false, error: 'Agency banking not configured for this tenant' }, 422);
+  }
+  const body = await c.req.json<{ accountNumber: string; bank: string; amountKobo: number; type: 'deposit' | 'withdrawal' }>();
+  const reference = `agb_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  return c.json({
+    success: true,
+    data: {
+      reference,
+      provider: tc.agencyBankingProvider,
+      accountNumber: body.accountNumber,
+      bank: body.bank,
+      amountKobo: body.amountKobo,
+      type: body.type,
+      status: 'INITIATED',
+      message: `${tc.agencyBankingProvider.toUpperCase()} transaction initiated. Reference: ${reference}`,
+    },
+  });
+});
+
+// ── POS-E18: Currency Rounding ────────────────────────────────────────────────
+// GET /rounding?totalKobo=x — compute rounded total for cash payments
+app.get('/rounding', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const totalKobo = parseInt(c.req.query('totalKobo') ?? '0');
+  const tc = c.get('tenantConfig' as never) as { cashRoundingKobo?: number } | undefined;
+  const unit = tc?.cashRoundingKobo ?? 0;
+  if (!unit) {
+    return c.json({ success: true, data: { exactKobo: totalKobo, roundedKobo: totalKobo, adjustmentKobo: 0, unitKobo: 0 } });
+  }
+  const roundedKobo = Math.ceil(totalKobo / unit) * unit;
+  return c.json({ success: true, data: { exactKobo: totalKobo, roundedKobo, adjustmentKobo: roundedKobo - totalKobo, unitKobo: unit } });
+});
+
+// ── POS-E12: Transfer payment status poll ─────────────────────────────────────
+app.get('/payment-status', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const reference = c.req.query('reference');
+  if (!reference) return c.json({ success: false, error: 'reference required' }, 400);
+  const confirmed = await c.env.SESSIONS_KV?.get(`transfer_confirmed:${reference}`).catch(() => null);
+  return c.json({ success: true, data: { confirmed: confirmed === '1', reference } });
 });
 
 export { app as posRouter };

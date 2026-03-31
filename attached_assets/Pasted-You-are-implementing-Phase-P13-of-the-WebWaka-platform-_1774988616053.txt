@@ -1,0 +1,135 @@
+You are implementing Phase P13 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This is the final phase covering advanced and expansion features. Implement these in the order listed. Each task is self-contained.
+
+Read the IMPLEMENTATION_PLAN.md file in the docs/ folder for full technical specifications for each task below.
+
+## Tasks (implement in this order):
+
+### TASK 1 — AI Product Listing Optimisation (MV-E18)
+In vendor product editor (src/modules/multi-vendor/ui.tsx):
+- After vendor fills in product name, add a "Improve with AI" button
+- On click: POST /api/multi-vendor/products/ai-suggest with { name, description, category }
+- Server: import createAiClient from @webwaka/core. Call complete({ messages: [{ role:'system', content:'You are a product listing expert for Nigerian e-commerce.' }, { role:'user', content:`Improve this product listing for a Nigerian marketplace:\nName: ${name}\nDescription: ${description}\nCategory: ${category}\n\nProvide: improved title (max 80 chars), structured description (max 300 chars), 5 relevant search tags. Respond as JSON: { title, description, tags }` }] })
+- Render AI suggestion card below the form with "Accept" and "Dismiss" buttons
+
+### TASK 2 — Subscription / Recurring Orders (SV-E14)
+In src/modules/single-vendor/api.ts:
+POST /api/single-vendor/subscriptions: body { productId, frequencyDays, paystackToken (from Paystack card tokenisation) }. INSERT into subscriptions.
+PATCH /api/single-vendor/subscriptions/:id: body { status: 'PAUSED'|'ACTIVE'|'CANCELLED' }. UPDATE subscriptions.
+
+In src/worker.ts scheduled handler (daily):
+SELECT * FROM subscriptions WHERE status = 'ACTIVE' AND DATE(nextChargeDate) <= DATE('now')
+For each:
+1. Attempt Paystack charge using paystackToken (POST /transaction/charge_authorization)
+2. If success: create a new order (same as regular checkout), set nextChargeDate = DATE('now', '+' || frequencyDays || ' days'), publish CommerceEvents.ORDER_READY_DELIVERY
+3. If fail (first): retry tomorrow
+4. If fail (third consecutive): UPDATE status = 'CANCELLED', send WhatsApp: "Your subscription for {productName} has been cancelled due to payment failure."
+
+### TASK 3 — OG Meta Edge Rendering for Social Sharing (SV-E15)
+In src/worker.ts, add a route BEFORE the SPA catch-all route:
+app.get('/products/:slug', async (c) => {
+const ua = c.req.header('User-Agent') ?? '';
+if (/bot|crawl|spider|facebookexternalhit|whatsapp|telegram/i.test(ua)) {
+const tenantId = getTenantId(c);
+const product = await c.env.DB.prepare('SELECT name, description, imageUrl, priceKobo FROM products WHERE slug = ? AND tenantId = ?').bind(c.req.param('slug'), tenantId).first();
+if (!product) return c.notFound();
+return c.html(`<!DOCTYPE html><html><head>
+<meta property="og:title" content="${product.name}" />
+<meta property="og:description" content="${product.description?.substring(0, 150)}" />
+<meta property="og:image" content="${product.imageUrl}" />
+<meta property="og:url" content="${c.req.url}" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="description" content="${product.description?.substring(0, 150)}" />
+</head><body><script>window.location.href='${c.req.url}';</script></body></html>`);
+}
+return c.env.ASSETS.fetch(c.req.raw);
+});
+
+Add slug column to products table via migration 0012_slugs.sql:
+ALTER TABLE products ADD COLUMN IF NOT EXISTS slug TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_slug ON products(tenantId, slug);
+Populate slugs from existing names: UPDATE products SET slug = LOWER(REPLACE(REPLACE(name, ' ', '-'), '/', '-')) WHERE slug IS NULL
+
+### TASK 4 — Flash Sales Engine (MV-E12)
+In src/worker.ts scheduled handler (every 5 minutes):
+UPDATE flash_sales SET active = 1 WHERE startTime <= datetime('now') AND endTime > datetime('now') AND active = 0 AND tenantId = ? — iterate per tenant or do globally
+UPDATE flash_sales SET active = 0 WHERE endTime <= datetime('now') AND active = 1
+
+For products with active flash_sales: the product price at checkout must use salePriceKobo instead of regular price. In the checkout handler: check if an active flash_sale exists for the productId and use its salePriceKobo.
+
+Storefront: for products with active flash_sales, show the sale price, crossed-out original price, and a countdown timer (JavaScript setInterval updating every second).
+
+### TASK 5 — Cash Drawer Expense Tracking (POS-E19)
+In src/modules/pos/api.ts:
+POST /api/pos/expenses (requireRole: STAFF or ADMIN):
+Body: { sessionId, amountKobo, category, note }
+INSERT into session_expenses
+
+In the shift close handler (PATCH /api/pos/sessions/:id/close):
+Compute: SELECT SUM(amountKobo) as totalExpensesKobo, json_group_array(json_object('category',category,'amountKobo',amountKobo,'note',note)) as breakdown FROM session_expenses WHERE sessionId = ? AND tenantId = ?
+Subtract totalExpensesKobo from the expected cash balance in the Z-report.
+Include expenseBreakdown in the Z-report response.
+
+### TASK 6 — Product Bundles (POS-E13)
+In src/modules/pos/api.ts:
+POST /api/pos/bundles: create a bundle with bundle_items
+GET /api/pos/bundles: list active bundles with their components
+In checkout: if item is a bundle (product type = 'bundle'), resolve it to component items for inventory deduction. Bundle priceKobo is fixed.
+
+### TASK 7 — NDPR Data Export and Deletion (SV-E18)
+POST /api/single-vendor/account/export (auth: customer):
+- Rate limit: once per 30 days per customer (checkRateLimit from @webwaka/core)
+- Query all tables for this customerId: orders, wishlists, subscriptions, customer_loyalty, addresses
+- Return as JSON: { profile: {...}, orders: [...], wishlist: [...] }
+
+DELETE /api/single-vendor/account (auth: customer):
+- Soft-delete: UPDATE customers SET name = 'Deleted User', phone = CONCAT('deleted_', id), email = NULL, deletedAt = NOW() WHERE id = ? AND tenantId = ?
+- Delete from wishlists, subscriptions (cancel active ones)
+- Preserve orders for merchant accounting (only PII fields are nulled)
+- Send confirmation SMS to the phone number before nulling it
+
+### TASK 8 — USSD Transfer Payment Confirmation (POS-E12)
+In src/worker.ts or a new webhook router:
+Add POST /webhooks/paystack (if not already existing):
+Validate Paystack signature using X-Paystack-Signature header (HMAC SHA512 of request body with PAYSTACK_SECRET_KEY).
+On event type 'charge.success' and channel = 'bank_transfer':
+- Find the pending POS order with matching payment reference
+- UPDATE the payment leg status to 'CONFIRMED'
+- If all payment legs are confirmed: UPDATE order status to 'COMPLETED'
+- Notify cashier via KV: set 'transfer_confirmed:${reference}' = '1' with TTL 300s
+In POS checkout UI: poll /api/pos/payment-status?reference= every 3 seconds while awaiting transfer confirmation.
+
+### TASK 9 — Remaining Batch (implement in order)
+Each of the following should be a focused implementation:
+
+A. SV-E17 — COD with Deposit: Add tenantConfig.codDepositPercent (0-100). At SV checkout with paymentMethod='COD': charge depositPercent of total via Paystack. Remaining collected on delivery. Order status: 'AWAITING_DELIVERY'.
+
+B. POS-E16 — Agency Banking Lookup: Add a "Agency Banking" payment tab in POS. Tenant config includes agencyBankingProvider ('moniepoint'|'opay'|'palmpay') and credentials. Show a form to initiate a withdrawal/deposit and display the transaction reference on receipt.
+
+C. MV-E17 — Social Commerce Import: Add POST /api/multi-vendor/products/import-csv accepting a WhatsApp Business product CSV (columns: name, description, price, image_url, category). Parse and create products in bulk. Return a summary of imported and failed rows.
+
+D. MV-E19 — Vendor Referral: Add referredBy column to vendors table. When a new vendor registers with a referral code, log referredBy. On first vendor payout, apply 100bps (1%) reduction to referrer's commission for 90 days by INSERT into commission_rules.
+
+E. MV-E20 — Bulk Pricing: Add product_price_tiers table (productId, tenantId, vendorId, minQty, priceKobo). At checkout: for each item, resolve price from tiers (find tier where minQty <= cartQty, take highest matching minQty). If no tier: use regular price.
+
+F. SV-E13 — Product Availability Scheduling: Add availableFrom TEXT, availableUntil TEXT, availableDays INTEGER to products table. At checkout: validate NOW() is within availableFrom/availableUntil and day-of-week bit matches availableDays. In storefront: show countdown to next availability.
+
+G. POS-E14 — Supplier and PO Management: Add CRUD for suppliers and purchase_orders tables (both created in P03 migration). Add "Receive PO" action: POST /api/pos/purchase-orders/:id/receive with { items: [{productId, receivedQty, unitCostKobo}] }. Update product quantities and insert stock_adjustment_log entries.
+
+H. POS-E17 — Thermal Printer Auto-Discovery: In POS UI, add "Pair Printer" button. On click: use navigator.bluetooth.requestDevice({ filters: [{ services: ['000018f0-0000-1000-8000-00805f9b34fb'] }] }) to discover ESC/POS Bluetooth printers. On pair: store deviceId in localStorage. On checkout: auto-print to paired printer using Web Bluetooth characteristic write.
+
+I. POS-E18 — Currency Rounding: In tenantConfig add cashRoundingKobo (e.g. 5000 = round to nearest ₦50). In POS checkout, for cash payment legs: roundedTotal = Math.ceil(totalKobo / cashRoundingKobo) * cashRoundingKobo. Show both exact and rounded amount. Insert ROUNDING_ADJUSTMENT ledger entry for the difference.
+
+J. POS-E20 — Product Image Offline Cache: In public/sw.js, add a cache-first strategy for all URLs matching /api/pos/products/*/image or matching the pattern of product thumbnail URLs. Pre-cache product thumbnails on first POS load using cache.addAll().
+
+K. MV-E14 — Marketplace-Wide Loyalty: Ensure the customer_loyalty table (created in P03) applies across all three modules for the same tenant. A customer who buys from the POS and from the marketplace accumulates points in the same row. The loyalty engine from Task 1 of P11 already does this if tenantId + customerId is the shared key — verify this is consistent.
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Apply migrations 0012 to staging
+4. Manual test: share a product URL on WhatsApp (use the WhatsApp link preview test) — verify OG image and title appear in the preview
+5. Manual test: activate a flash sale, verify the sale price appears at checkout
+6. Manual test: import a sample product CSV via the import endpoint, verify products are created
+```

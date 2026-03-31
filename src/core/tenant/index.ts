@@ -55,6 +55,11 @@ export interface TenantConfig {
   featureFlags: Record<string, boolean>;
   inventorySyncPreferences?: InventorySyncPreferences;
   loyalty?: LoyaltyConfig;
+  // P13 additions
+  codDepositPercent?: number;          // SV-E17 COD deposit (0-100, default 20)
+  cashRoundingKobo?: number;           // POS-E18 cash rounding unit (e.g. 5000 = ₦50)
+  agencyBankingProvider?: 'moniepoint' | 'opay' | 'palmpay';  // POS-E16
+  agencyBankingApiKey?: string;        // POS-E16 provider credential
 }
 
 // 2. Module Registry

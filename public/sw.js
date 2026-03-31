@@ -1,17 +1,20 @@
 /**
- * WebWaka Commerce Suite — Service Worker v3
+ * WebWaka Commerce Suite — Service Worker v4
  * Strategy:
  *   - Shell (HTML/CSS/JS): Cache-First
  *   - SV Catalog API (/api/single-vendor/catalog, /api/single-vendor/products):
  *       Stale-While-Revalidate (serve cached immediately, refresh in background)
+ *   - Product images (/api/pos/products/*/image, *.jpg, *.png, *.webp via CDN):
+ *       Cache-First (POS-E20)
  *   - Other API calls: Network-First with cache fallback
  *   - Mutations: Background Sync
  * Invariants: Offline-First, PWA-First, Nigeria-First
  */
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4';
 const SHELL_CACHE = `webwaka-commerce-shell-${CACHE_VERSION}`;
 const API_CACHE = `webwaka-commerce-api-${CACHE_VERSION}`;
 const CATALOG_CACHE = `webwaka-commerce-catalog-${CACHE_VERSION}`;
+const IMAGE_CACHE = `webwaka-commerce-images-${CACHE_VERSION}`;
 const SYNC_TAG = 'webwaka-commerce-sync';
 
 const SHELL_ASSETS = ['/', '/index.html', '/manifest.json'];
@@ -35,7 +38,7 @@ self.addEventListener('activate', (event) => {
     caches.keys().then((keys) =>
       Promise.all(
         keys
-          .filter((k) => k.startsWith('webwaka-commerce-') && ![SHELL_CACHE, API_CACHE, CATALOG_CACHE].includes(k))
+          .filter((k) => k.startsWith('webwaka-commerce-') && ![SHELL_CACHE, API_CACHE, CATALOG_CACHE, IMAGE_CACHE].includes(k))
           .map((k) => caches.delete(k))
       )
     ).then(() => self.clients.claim())
@@ -46,10 +49,36 @@ function isCatalogRequest(url) {
   return CATALOG_PATTERNS.some((p) => url.pathname.startsWith(p));
 }
 
+// Product image patterns: POS product image API and common image extensions from CDNs
+const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|gif|avif|svg)(\?.*)?$/i;
+function isProductImage(url) {
+  return IMAGE_EXTENSIONS.test(url.pathname) || url.pathname.includes('/products/') && url.pathname.includes('/image');
+}
+
+// Cache-First for product images — serves cached asset immediately; updates cache from network
+async function cacheFirstImage(request) {
+  const cache = await caches.open(IMAGE_CACHE);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+  try {
+    const res = await fetch(request);
+    if (res.ok) cache.put(request, res.clone());
+    return res;
+  } catch {
+    return Response.error();
+  }
+}
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
   if (request.method !== 'GET' || !url.protocol.startsWith('http')) return;
+
+  // ── Cache-First for product images (POS-E20 offline image caching) ─────────
+  if (isProductImage(url)) {
+    event.respondWith(cacheFirstImage(request));
+    return;
+  }
 
   // ── Stale-While-Revalidate for SV catalog/products endpoints ──────────────
   if (isCatalogRequest(url)) {

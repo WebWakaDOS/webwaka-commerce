@@ -147,6 +147,115 @@ ${urls.join('\n')}
   }
 });
 
+// ── SV-E15: OG Meta Edge Rendering for Social Sharing ────────────────────────
+// Intercepts bot/crawler requests to /products/:slug and returns OG meta HTML.
+// Must be registered BEFORE the notFound handler.
+app.get('/products/:slug', async (c) => {
+  const ua = c.req.header('User-Agent') ?? '';
+  const isCrawler = /bot|crawl|slurp|spider|facebookexternalhit|whatsapp|telegram/i.test(ua);
+
+  if (!isCrawler) {
+    return c.notFound();
+  }
+
+  const tenantId = c.req.header('x-tenant-id') ?? 'tnt_demo';
+  const slug = c.req.param('slug');
+
+  try {
+    const product = await c.env.DB.prepare(
+      `SELECT name, description, image_url AS imageUrl, price_kobo AS priceKobo
+       FROM products WHERE slug = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
+    ).bind(slug, tenantId).first<{ name: string; description: string | null; imageUrl: string | null; priceKobo: number }>();
+
+    if (!product) return c.notFound();
+
+    const esc = (s: string | null | undefined) => (s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const desc = esc(product.description?.substring(0, 150));
+    const url = c.req.url;
+
+    return c.html(`<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8" />
+<title>${esc(product.name)}</title>
+<meta property="og:title" content="${esc(product.name)}" />
+<meta property="og:description" content="${desc}" />
+<meta property="og:image" content="${esc(product.imageUrl ?? '')}" />
+<meta property="og:url" content="${esc(url)}" />
+<meta property="og:type" content="product" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="${esc(product.name)}" />
+<meta name="twitter:description" content="${desc}" />
+<meta name="twitter:image" content="${esc(product.imageUrl ?? '')}" />
+<meta name="description" content="${desc}" />
+</head><body>
+<script>window.location.replace(${JSON.stringify(url)});</script>
+</body></html>`);
+  } catch {
+    return c.notFound();
+  }
+});
+
+// ── POS-E12: Paystack Bank Transfer Webhook ───────────────────────────────────
+// Validates HMAC-SHA512 signature; auto-confirms transfer payment legs.
+app.post('/webhooks/paystack', async (c) => {
+  const secret = c.env.PAYSTACK_SECRET;
+  if (!secret) return c.json({ received: true }, 200); // no secret = passthrough in dev
+
+  const signature = c.req.header('x-paystack-signature') ?? '';
+  const rawBody = await c.req.text();
+
+  // Validate HMAC-SHA512
+  try {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-512' }, false, ['sign']);
+    const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(rawBody));
+    const hex = Array.from(new Uint8Array(mac)).map(b => b.toString(16).padStart(2, '0')).join('');
+    if (hex !== signature) {
+      return c.json({ error: 'Invalid signature' }, 401);
+    }
+  } catch {
+    return c.json({ error: 'Signature validation failed' }, 400);
+  }
+
+  let payload: { event?: string; data?: { reference?: string; channel?: string; status?: string } };
+  try { payload = JSON.parse(rawBody); } catch { return c.json({ received: true }, 200); }
+
+  if (payload.event === 'charge.success' && payload.data?.channel === 'bank_transfer' && payload.data?.status === 'success') {
+    const ref = payload.data.reference;
+    if (ref && c.env.DB) {
+      try {
+        await c.env.DB.prepare(
+          `UPDATE order_payment_legs SET status = 'CONFIRMED', updated_at = ?
+           WHERE reference = ? AND method = 'transfer' AND status = 'PENDING'`,
+        ).bind(Date.now(), ref).run();
+
+        const leg = await c.env.DB.prepare(
+          `SELECT order_id FROM order_payment_legs WHERE reference = ? LIMIT 1`,
+        ).bind(ref).first<{ order_id: string }>();
+
+        if (leg?.order_id) {
+          const pending = await c.env.DB.prepare(
+            `SELECT COUNT(*) as cnt FROM order_payment_legs WHERE order_id = ? AND status != 'CONFIRMED'`,
+          ).bind(leg.order_id).first<{ cnt: number }>();
+
+          if ((pending?.cnt ?? 1) === 0) {
+            await c.env.DB.prepare(
+              `UPDATE orders SET order_status = 'COMPLETED', payment_status = 'paid', updated_at = ? WHERE id = ?`,
+            ).bind(Date.now(), leg.order_id).run();
+          }
+        }
+
+        if (c.env.SESSIONS_KV) {
+          await c.env.SESSIONS_KV.put(`transfer_confirmed:${ref}`, '1', { expirationTtl: 300 });
+        }
+      } catch (err) {
+        console.error('[webhook/paystack] DB update error:', err);
+      }
+    }
+  }
+
+  return c.json({ received: true }, 200);
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.notFound((c) => {
   return c.json(
@@ -620,6 +729,101 @@ export default {
       console.log(`[cron] Vendor analytics snapshot complete for ${(activeVendors ?? []).length} vendors on ${today}`);
     } catch (err) {
       console.error('[cron] Vendor analytics error:', err);
+    }
+
+    // ── MV-E12: Flash Sales Engine — activate/deactivate based on time windows ──
+    try {
+      const nowIso = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const activated = await env.DB.prepare(
+        `UPDATE flash_sales SET active = 1 WHERE startTime <= ? AND endTime > ? AND active = 0`,
+      ).bind(nowIso, nowIso).run();
+      const deactivated = await env.DB.prepare(
+        `UPDATE flash_sales SET active = 0 WHERE endTime <= ? AND active = 1`,
+      ).bind(nowIso).run();
+      if ((activated.meta?.changes ?? 0) > 0 || (deactivated.meta?.changes ?? 0) > 0) {
+        console.log(`[cron] Flash sales: activated=${activated.meta?.changes ?? 0} deactivated=${deactivated.meta?.changes ?? 0}`);
+      }
+      // Invalidate KV cache for products with changed flash sale status
+      const affectedProducts = await env.DB.prepare(
+        `SELECT DISTINCT productId, tenantId FROM flash_sales WHERE active = 1`,
+      ).all<{ productId: string; tenantId: string }>();
+      for (const p of affectedProducts.results ?? []) {
+        await env.CATALOG_CACHE?.delete(`catalog:${p.tenantId}:product:${p.productId}`).catch(() => {});
+      }
+    } catch (err) {
+      console.error('[cron] Flash sales engine error:', err);
+    }
+
+    // ── SV-E14: Subscription Recurring Orders — charge on nextChargeDate ────────
+    try {
+      const today2 = new Date().toISOString().slice(0, 10);
+      const { results: dueSubs } = await env.DB.prepare(
+        `SELECT s.id, s.tenantId, s.customerId, s.productId, s.frequencyDays, s.paystackToken,
+                s.retryCount, s.productName,
+                p.name AS pName, p.price_kobo AS priceKobo,
+                c.phone AS customerPhone
+         FROM subscriptions s
+         LEFT JOIN products p ON p.id = s.productId AND p.tenant_id = s.tenantId
+         LEFT JOIN customers c ON c.id = s.customerId AND c.tenant_id = s.tenantId
+         WHERE s.status = 'ACTIVE' AND DATE(s.nextChargeDate) <= DATE(?)`,
+      ).bind(today2).all<{
+        id: string; tenantId: string; customerId: string; productId: string;
+        frequencyDays: number; paystackToken: string; retryCount: number; productName: string | null;
+        pName: string | null; priceKobo: number | null; customerPhone: string | null;
+      }>();
+
+      for (const sub of dueSubs ?? []) {
+        if (!env.PAYSTACK_SECRET) continue;
+        const price = sub.priceKobo ?? 0;
+        const productName = sub.productName ?? sub.pName ?? 'Product';
+        try {
+          const chargeRes = await fetch('https://api.paystack.co/transaction/charge_authorization', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${env.PAYSTACK_SECRET}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ authorization_code: sub.paystackToken, email: `sub_${sub.customerId}@webwaka.internal`, amount: price }),
+          });
+          const chargeData = await chargeRes.json() as { status: boolean; data?: { status: string; reference: string } };
+
+          if (chargeData.status && chargeData.data?.status === 'success') {
+            // Create order
+            const orderId = `ord_sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+            const nextCharge = new Date();
+            nextCharge.setDate(nextCharge.getDate() + sub.frequencyDays);
+            await env.DB.batch([
+              env.DB.prepare(
+                `INSERT INTO orders (id, tenant_id, customer_id, total_amount, payment_method, payment_status, order_status, payment_reference, created_at)
+                 VALUES (?, ?, ?, ?, 'subscription', 'paid', 'PROCESSING', ?, ?)`,
+              ).bind(orderId, sub.tenantId, sub.customerId, price, chargeData.data.reference, Date.now()),
+              env.DB.prepare(
+                `UPDATE subscriptions SET nextChargeDate = ?, retryCount = 0 WHERE id = ?`,
+              ).bind(nextCharge.toISOString().slice(0, 10), sub.id),
+            ]);
+            console.log(`[cron] Subscription ${sub.id} charged OK — next: ${nextCharge.toISOString().slice(0, 10)}`);
+          } else {
+            const newRetry = (sub.retryCount ?? 0) + 1;
+            if (newRetry >= 3) {
+              await env.DB.prepare(
+                `UPDATE subscriptions SET status = 'CANCELLED', retryCount = ?, lastFailedAt = ? WHERE id = ?`,
+              ).bind(newRetry, new Date().toISOString(), sub.id).run();
+              // Send WhatsApp cancellation notice
+              if (sub.customerPhone && env.TERMII_API_KEY) {
+                const sms = createSmsProvider(env.TERMII_API_KEY, 'WebWaka');
+                await sms.sendMessage(sub.customerPhone, `Your subscription for ${productName} has been cancelled due to payment failure. Please update your payment method at webwaka.shop.`).catch(() => {});
+              }
+              console.log(`[cron] Subscription ${sub.id} cancelled after 3 failed charges`);
+            } else {
+              await env.DB.prepare(
+                `UPDATE subscriptions SET retryCount = ?, lastFailedAt = ? WHERE id = ?`,
+              ).bind(newRetry, new Date().toISOString(), sub.id).run();
+              console.log(`[cron] Subscription ${sub.id} charge failed (retry ${newRetry}/3)`);
+            }
+          }
+        } catch (subErr) {
+          console.error(`[cron] Subscription ${sub.id} charge error:`, subErr);
+        }
+      }
+    } catch (err) {
+      console.error('[cron] Subscription charging error:', err);
     }
   },
 };

@@ -4,7 +4,7 @@
  * Invariants: Offline-First, Mobile-First, Nigeria-First (kobo integers), Multi-tenancy.
  * P02-MV-E01: Replaced per-vendor product loop with single FTS5 catalog search call.
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { MarketplaceCore, MarketplaceCartItem } from './core';
 import {
   getMvProducts,
@@ -731,6 +731,141 @@ export const VendorAnalyticsDashboard: React.FC<{ vendorToken: string; tenantId:
           </table>
         </div>
       )}
+    </div>
+  );
+};
+
+// ── FlashSaleCountdown — MV-E12 ───────────────────────────────────────────────
+export const FlashSaleCountdown: React.FC<{ endTime: string }> = ({ endTime }) => {
+  const calcRemaining = () => Math.max(0, Math.floor((new Date(endTime).getTime() - Date.now()) / 1000));
+  const [secsLeft, setSecsLeft] = useState(calcRemaining);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    timerRef.current = setInterval(() => {
+      const r = calcRemaining();
+      setSecsLeft(r);
+      if (r === 0 && timerRef.current) clearInterval(timerRef.current);
+    }, 1000);
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [endTime]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (secsLeft === 0) return <span style={{ fontSize: '11px', color: '#dc2626', fontWeight: 700 }}>Sale ended</span>;
+  const h = Math.floor(secsLeft / 3600);
+  const m = Math.floor((secsLeft % 3600) / 60);
+  const s = secsLeft % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    <span style={{ fontSize: '11px', fontWeight: 700, color: '#dc2626', background: '#fee2e2', padding: '2px 6px', borderRadius: '4px' }}>
+      ⏱ {h > 0 ? `${pad(h)}:` : ''}{pad(m)}:{pad(s)}
+    </span>
+  );
+};
+
+// ── VendorProductEditor — MV-E18 (AI Product Listing Optimisation) ────────────
+export const VendorProductEditor: React.FC<{ vendorToken: string; tenantId: string }> = ({ vendorToken, tenantId }) => {
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [category, setCategory] = useState('');
+  const [priceNaira, setPriceNaira] = useState('');
+  const [quantity, setQuantity] = useState('10');
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiSuggestion, setAiSuggestion] = useState<{ title: string; description: string; tags: string[] } | null>(null);
+  const [aiError, setAiError] = useState('');
+
+  const handleImproveWithAI = async () => {
+    if (!name.trim()) { setAiError('Enter a product name first'); return; }
+    setAiLoading(true); setAiError(''); setAiSuggestion(null);
+    try {
+      const res = await fetch('/api/multi-vendor/products/ai-suggest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}` },
+        body: JSON.stringify({ name, description, category }),
+      });
+      const json = await res.json() as { success: boolean; data?: { suggestion: { title: string; description: string; tags: string[] } }; error?: string };
+      if (json.success && json.data?.suggestion) setAiSuggestion(json.data.suggestion);
+      else setAiError(json.error ?? 'AI suggestion failed');
+    } catch (e) { setAiError(String(e)); }
+    finally { setAiLoading(false); }
+  };
+
+  const handleAcceptSuggestion = () => {
+    if (!aiSuggestion) return;
+    setName(aiSuggestion.title);
+    setDescription(aiSuggestion.description);
+    setAiSuggestion(null);
+  };
+
+  const handleSave = async () => {
+    if (!name.trim() || !priceNaira) { setMsg('Name and price required'); return; }
+    setSaving(true); setMsg('');
+    try {
+      const res = await fetch('/api/multi-vendor/vendor/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}` },
+        body: JSON.stringify({ name, description, category, price: Math.round(parseFloat(priceNaira) * 100), quantity: parseInt(quantity) || 0 }),
+      });
+      const json = await res.json() as { success: boolean; error?: string };
+      if (json.success) { setMsg('✓ Product saved'); setName(''); setDescription(''); setCategory(''); setPriceNaira(''); }
+      else setMsg(`Error: ${json.error ?? 'Unknown'}`);
+    } catch (e) { setMsg(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  const inputStyle: React.CSSProperties = { width: '100%', padding: '7px 10px', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.88rem', boxSizing: 'border-box', marginBottom: '10px' };
+  const labelStyle: React.CSSProperties = { fontSize: '0.8rem', color: '#374151', fontWeight: 600, display: 'block', marginBottom: '3px' };
+
+  return (
+    <div style={{ maxWidth: '540px', padding: '1rem' }}>
+      <h3 style={{ margin: '0 0 1rem', fontSize: '1rem' }}>Add / Edit Product</h3>
+      {msg && <div style={{ padding: '8px 12px', borderRadius: '6px', marginBottom: '12px', fontSize: '0.85rem', background: msg.startsWith('Error') || msg.startsWith('Name') ? '#fee2e2' : '#d1fae5', color: msg.startsWith('Error') || msg.startsWith('Name') ? '#dc2626' : '#065f46' }}>{msg}</div>}
+
+      <label style={labelStyle}>Product Name *</label>
+      <input value={name} onChange={e => setName(e.target.value)} style={inputStyle} placeholder="e.g. Ankara Fabric Roll 6 yards" />
+
+      {/* Improve with AI button — appears after name is typed */}
+      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+        <button
+          onClick={handleImproveWithAI}
+          disabled={aiLoading || !name.trim()}
+          style={{ padding: '6px 14px', background: aiLoading ? '#d1d5db' : '#7c3aed', color: '#fff', border: 'none', borderRadius: '6px', cursor: aiLoading ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.82rem' }}
+        >{aiLoading ? '✨ Improving…' : '✨ Improve with AI'}</button>
+        {aiError && <span style={{ fontSize: '0.8rem', color: '#dc2626' }}>{aiError}</span>}
+      </div>
+
+      {/* AI Suggestion Card */}
+      {aiSuggestion && (
+        <div style={{ border: '2px solid #7c3aed', borderRadius: '8px', padding: '12px', marginBottom: '12px', background: '#faf5ff' }}>
+          <div style={{ fontSize: '0.8rem', color: '#7c3aed', fontWeight: 700, marginBottom: '6px' }}>✨ AI Suggestion</div>
+          <div style={{ fontSize: '0.88rem', fontWeight: 600, marginBottom: '4px' }}>{aiSuggestion.title}</div>
+          <div style={{ fontSize: '0.82rem', color: '#4b5563', marginBottom: '8px' }}>{aiSuggestion.description}</div>
+          {aiSuggestion.tags.length > 0 && (
+            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginBottom: '10px' }}>
+              {aiSuggestion.tags.map(t => (
+                <span key={t} style={{ background: '#ede9fe', color: '#7c3aed', borderRadius: '12px', padding: '2px 8px', fontSize: '0.76rem' }}>{t}</span>
+              ))}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button onClick={handleAcceptSuggestion} style={{ padding: '5px 14px', background: '#7c3aed', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.82rem' }}>Accept</button>
+            <button onClick={() => setAiSuggestion(null)} style={{ padding: '5px 14px', background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem' }}>Dismiss</button>
+          </div>
+        </div>
+      )}
+
+      <label style={labelStyle}>Description</label>
+      <textarea value={description} onChange={e => setDescription(e.target.value)} rows={3} style={{ ...inputStyle, resize: 'vertical' }} placeholder="Product description…" />
+      <label style={labelStyle}>Category</label>
+      <input value={category} onChange={e => setCategory(e.target.value)} style={inputStyle} placeholder="e.g. Fashion, Electronics" />
+      <label style={labelStyle}>Price (₦) *</label>
+      <input type="number" value={priceNaira} onChange={e => setPriceNaira(e.target.value)} style={inputStyle} placeholder="0.00" min="0" step="0.01" />
+      <label style={labelStyle}>Stock Quantity</label>
+      <input type="number" value={quantity} onChange={e => setQuantity(e.target.value)} style={inputStyle} placeholder="10" min="0" />
+      <button onClick={handleSave} disabled={saving} style={{ padding: '0.5rem 1.5rem', background: saving ? '#d1d5db' : '#2563eb', color: '#fff', border: 'none', borderRadius: '6px', cursor: saving ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.9rem' }}>
+        {saving ? 'Saving…' : 'Save Product'}
+      </button>
     </div>
   );
 };

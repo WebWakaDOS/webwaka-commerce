@@ -23,7 +23,7 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider } from '@webwaka/core';
+import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider, createAiClient } from '@webwaka/core';
 import { publishEvent } from '../../core/event-bus';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
@@ -914,7 +914,38 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   }
 
   const now = Date.now();
-  const subtotal = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
+  const nowIso = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  // ── MV-E12: Flash Sale price resolution (server-authoritative) ───────────
+  // ── MV-E20: Bulk Pricing tier resolution ─────────────────────────────────
+  const resolvedItems = await Promise.all(
+    body.items.map(async (item) => {
+      let effectivePrice = item.price;
+
+      // Flash sale — use salePriceKobo if there's an active sale for this product
+      try {
+        const fs = await c.env.DB.prepare(
+          `SELECT salePriceKobo FROM flash_sales WHERE productId = ? AND tenantId = ? AND active = 1
+           AND startTime <= ? AND endTime > ? AND quantitySold < quantityLimit LIMIT 1`,
+        ).bind(item.product_id, getTenantId(c), nowIso, nowIso).first<{ salePriceKobo: number }>();
+        if (fs && typeof fs.salePriceKobo === 'number') effectivePrice = fs.salePriceKobo;
+      } catch { /* non-fatal */ }
+
+      // Bulk pricing — find best matching tier (highest minQty <= cartQty)
+      if (effectivePrice === item.price) {
+        try {
+          const tier = await c.env.DB.prepare(
+            `SELECT priceKobo FROM product_price_tiers WHERE productId = ? AND tenantId = ? AND minQty <= ? ORDER BY minQty DESC LIMIT 1`,
+          ).bind(item.product_id, getTenantId(c), item.quantity).first<{ priceKobo: number }>();
+          if (tier && typeof tier.priceKobo === 'number') effectivePrice = tier.priceKobo;
+        } catch { /* non-fatal */ }
+      }
+
+      return { ...item, price: effectivePrice };
+    }),
+  );
+
+  const subtotal = resolvedItems.reduce((s, i) => s + i.price * i.quantity, 0);
   const paymentRef = body.payment_reference ?? `pay_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
   // ── VAT computation via TaxEngine ────────────────────────────────────────
@@ -925,8 +956,8 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     { category: 'general', amountKobo: subtotal },
   ]);
 
-  // ── Group items by vendor ─────────────────────────────────────────────────
-  const vendorGroups = body.items.reduce((acc, item) => {
+  // ── Group items by vendor (use resolvedItems with flash-sale/bulk prices) ───
+  const vendorGroups = resolvedItems.reduce((acc, item) => {
     if (!acc[item.vendor_id]) acc[item.vendor_id] = { items: [], subtotal: 0 };
     acc[item.vendor_id]!.items.push(item);
     acc[item.vendor_id]!.subtotal += item.price * item.quantity;
@@ -3512,6 +3543,231 @@ app.get('/vendor/analytics', async (c) => {
     console.error('[MV][vendor/analytics] error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
+});
+
+// ── MV-E18: AI Product Listing Optimisation ──────────────────────────────────
+app.post('/products/ai-suggest', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const body = await c.req.json<{ name: string; description?: string; category?: string }>();
+  if (!body.name?.trim()) return c.json({ success: false, error: 'name is required' }, 400);
+
+  if (!c.env.OPENROUTER_API_KEY) {
+    return c.json({ success: false, error: 'AI optimisation not configured (missing OPENROUTER_API_KEY)' }, 503);
+  }
+
+  try {
+    const ai = createAiClient(c.env.OPENROUTER_API_KEY);
+    const result = await ai.complete({
+      model: 'openai/gpt-4o-mini',
+      maxTokens: 400,
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a product listing expert for Nigerian e-commerce. You help vendors write compelling, SEO-friendly product listings for the Nigerian market.',
+        },
+        {
+          role: 'user',
+          content: `Improve this product listing for a Nigerian marketplace:\nName: ${body.name}\nDescription: ${body.description ?? ''}\nCategory: ${body.category ?? ''}\n\nProvide: improved title (max 80 chars), structured description (max 300 chars), 5 relevant search tags. Respond ONLY as JSON with no markdown: { "title": "...", "description": "...", "tags": ["tag1","tag2","tag3","tag4","tag5"] }`,
+        },
+      ],
+    });
+
+    if (result.error) {
+      return c.json({ success: false, error: result.error }, 502);
+    }
+
+    let suggestion: { title: string; description: string; tags: string[] };
+    try {
+      const raw = result.content.replace(/```json\n?|\n?```/g, '').trim();
+      suggestion = JSON.parse(raw) as typeof suggestion;
+    } catch {
+      suggestion = { title: body.name, description: result.content, tags: [] };
+    }
+
+    return c.json({ success: true, data: { suggestion, tokensUsed: result.tokensUsed } });
+  } catch (err) {
+    console.error('[MV][ai-suggest] error:', err);
+    return c.json({ success: false, error: 'AI suggestion failed' }, 500);
+  }
+});
+
+// ── MV-E17: Social Commerce CSV Import ───────────────────────────────────────
+app.post('/products/import-csv', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorToken = c.req.header('Authorization')?.replace('Bearer ', '') ?? '';
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? 'unknown';
+
+  const contentType = c.req.header('Content-Type') ?? '';
+  let csvText = '';
+
+  if (contentType.includes('text/csv') || contentType.includes('text/plain')) {
+    csvText = await c.req.text();
+  } else {
+    const formData = await c.req.formData().catch(() => null);
+    const file = formData?.get('file');
+    csvText = file ? await (file as File).text() : '';
+  }
+
+  if (!csvText.trim()) return c.json({ success: false, error: 'CSV content required' }, 400);
+
+  const lines = csvText.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return c.json({ success: false, error: 'CSV must have header row + at least one data row' }, 400);
+
+  const header = lines[0]!.toLowerCase().split(',').map(h => h.trim().replace(/"/g, ''));
+  const colIdx = (name: string) => header.indexOf(name);
+
+  const imported: string[] = [];
+  const failed: Array<{ row: number; reason: string }> = [];
+  const now = Date.now();
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i]!.split(',').map(c2 => c2.trim().replace(/^"|"$/g, ''));
+    const name = cols[colIdx('name')] ?? '';
+    const description = cols[colIdx('description')] ?? '';
+    const priceRaw = cols[colIdx('price')] ?? '';
+    const imageUrl = cols[colIdx('image_url')] ?? '';
+    const category = cols[colIdx('category')] ?? '';
+
+    if (!name) { failed.push({ row: i + 1, reason: 'name is required' }); continue; }
+    const price = parseFloat(priceRaw);
+    if (isNaN(price) || price < 0) { failed.push({ row: i + 1, reason: 'invalid price' }); continue; }
+
+    const priceKobo = Math.round(price * 100);
+    const productId = `mvp_csv_${now}_${Math.random().toString(36).slice(2, 9)}`;
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO products (id, tenant_id, name, description, price, price_kobo, image_url, category, slug, vendor_id, is_active, quantity, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 100, ?, ?)
+         ON CONFLICT (tenant_id, slug) DO UPDATE SET name = excluded.name, description = excluded.description, price = excluded.price`,
+      ).bind(productId, tenantId, name, description, priceKobo, priceKobo, imageUrl || null, category || null, slug, vendorId, now, now).run();
+      imported.push(productId);
+    } catch (e) {
+      failed.push({ row: i + 1, reason: String(e) });
+    }
+  }
+
+  void vendorToken; // used for auth only
+
+  return c.json({
+    success: true,
+    data: { imported: imported.length, failed: failed.length, failedRows: failed, importedIds: imported },
+  }, 201);
+});
+
+// ── MV-E19: Vendor Referral Programme ────────────────────────────────────────
+// GET /vendor/referral-code — get or generate a referral code for the current vendor
+app.get('/vendor/referral-code', requireRole(['VENDOR', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  const vendor = await c.env.DB.prepare(
+    `SELECT id, referralCode FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+  ).bind(vendorId, tenantId).first<{ id: string; referralCode: string | null }>();
+
+  if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
+
+  let code = vendor.referralCode;
+  if (!code) {
+    code = `REF${vendorId.slice(-6).toUpperCase()}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+    await c.env.DB.prepare(`UPDATE vendors SET referralCode = ? WHERE id = ?`).bind(code, vendorId).run();
+  }
+  return c.json({ success: true, data: { referralCode: code } });
+});
+
+// POST /vendor/apply-referral — apply a referral code when onboarding
+app.post('/vendor/apply-referral', requireRole(['VENDOR']), async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  const { referralCode } = await c.req.json<{ referralCode: string }>();
+  if (!referralCode?.trim()) return c.json({ success: false, error: 'referralCode required' }, 400);
+
+  const referrer = await c.env.DB.prepare(
+    `SELECT id FROM vendors WHERE referralCode = ? AND marketplace_tenant_id = ?`,
+  ).bind(referralCode.toUpperCase().trim(), tenantId).first<{ id: string }>();
+  if (!referrer) return c.json({ success: false, error: 'Referral code not found' }, 404);
+
+  const commissionUntil = new Date();
+  commissionUntil.setDate(commissionUntil.getDate() + 90);
+  const now = new Date().toISOString();
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE vendors SET referredBy = ? WHERE id = ? AND marketplace_tenant_id = ?`).bind(referrer.id, vendorId, tenantId),
+    c.env.DB.prepare(
+      `INSERT INTO commission_rules (id, tenantId, vendorId, rateBps, effectiveFrom, effectiveUntil)
+       VALUES (?, ?, ?, 900, ?, ?)`,
+    ).bind(`cr_ref_${Date.now()}`, tenantId, referrer.id, now, commissionUntil.toISOString()),
+  ]);
+
+  return c.json({ success: true, data: { message: 'Referral applied. Referrer gets 1% commission reduction for 90 days.' } });
+});
+
+// ── MV-E20: Flash Sales — list active flash sales for a tenant ────────────────
+app.get('/flash-sales', async (c) => {
+  const tenantId = getTenantId(c);
+  const { results } = await c.env.DB.prepare(
+    `SELECT fs.id, fs.productId, fs.salePriceKobo, fs.originalPriceKobo, fs.quantityLimit,
+            fs.quantitySold, fs.startTime, fs.endTime, p.name AS productName
+     FROM flash_sales fs LEFT JOIN products p ON p.id = fs.productId AND p.tenant_id = fs.tenantId
+     WHERE fs.tenantId = ? AND fs.active = 1 ORDER BY fs.endTime ASC`,
+  ).bind(tenantId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { flashSales: results ?? [] } });
+});
+
+// ── MV-E20: Bulk Pricing — GET tiers for a product ───────────────────────────
+app.get('/products/:id/price-tiers', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, minQty, priceKobo, vendorId FROM product_price_tiers WHERE productId = ? AND tenantId = ? ORDER BY minQty ASC`,
+  ).bind(productId, tenantId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { tiers: results ?? [] } });
+});
+
+// POST /products/:id/price-tiers — admin/vendor create tier
+app.post('/products/:id/price-tiers', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const body = await c.req.json<{ minQty: number; priceKobo: number }>();
+  if (!body.minQty || !body.priceKobo) return c.json({ success: false, error: 'minQty and priceKobo required' }, 400);
+  const id = `tier_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? null;
+  await c.env.DB.prepare(
+    `INSERT INTO product_price_tiers (id, tenantId, vendorId, productId, minQty, priceKobo) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(id, tenantId, vendorId, productId, body.minQty, body.priceKobo).run();
+  return c.json({ success: true, data: { id, minQty: body.minQty, priceKobo: body.priceKobo } }, 201);
+});
+
+// ── SV-E13: Product Availability Scheduling — check product availability ──────
+app.get('/products/:id/availability', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const product = await c.env.DB.prepare(
+    `SELECT id, availableFrom, availableUntil, availableDays FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+  ).bind(productId, tenantId).first<{ id: string; availableFrom: string | null; availableUntil: string | null; availableDays: number | null }>();
+  if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const dayBit = 1 << now.getDay(); // bit 0=Sun
+  const fromOk = !product.availableFrom || nowIso >= product.availableFrom;
+  const untilOk = !product.availableUntil || nowIso <= product.availableUntil;
+  const dayOk = product.availableDays == null || (product.availableDays & dayBit) !== 0;
+  const available = fromOk && untilOk && dayOk;
+
+  let nextAvailable: string | null = null;
+  if (!available && product.availableDays != null) {
+    for (let d = 1; d <= 7; d++) {
+      const candidate = new Date(now);
+      candidate.setDate(candidate.getDate() + d);
+      if ((product.availableDays & (1 << candidate.getDay())) !== 0) {
+        nextAvailable = candidate.toISOString().slice(0, 10);
+        break;
+      }
+    }
+  }
+
+  return c.json({ success: true, data: { available, availableFrom: product.availableFrom, availableUntil: product.availableUntil, availableDays: product.availableDays, nextAvailable } });
 });
 
 export { app as multiVendorRouter };
