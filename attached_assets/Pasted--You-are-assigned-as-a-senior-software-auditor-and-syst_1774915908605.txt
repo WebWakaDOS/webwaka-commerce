@@ -1,0 +1,108 @@
+
+You are assigned as a senior software auditor and systems architect for this repository. Your task is to perform a deep, end-to-end audit of the entire codebase and produce a comprehensive production-readiness report.
+
+This is NOT a documentation review. You must inspect actual source code, configurations, dependencies, and integrations.
+
+Follow these instructions strictly:
+
+1. FULL REPOSITORY ANALYSIS  
+Thoroughly scan and analyze:
+- All source code files (frontend, backend, services, scripts)
+- Configuration files (env, CI/CD, deployment configs)
+- Dependency files (package.json, requirements, etc.)
+- Database schemas and models
+- API routes and integrations
+- Background jobs, queues, and workers
+- Authentication and authorization logic
+- Error handling and logging mechanisms
+
+Do not assume anything is implemented correctly—verify from code.
+
+2. FEATURE & ENHANCEMENT TRACKING  
+Identify all planned or implied features by examining:
+- README files
+- Inline TODOs and comments
+- Issue references (if present in code)
+- Feature flags or partially implemented modules
+
+Then classify each feature:
+- Fully implemented and working
+- Partially implemented (describe gaps)
+- Not implemented at all
+- Implemented but broken or unreliable
+
+3. BUG & RISK IDENTIFICATION  
+Identify all current issues including:
+- Runtime errors and potential crash points
+- Broken logic or incomplete flows
+- Dead code or unused modules
+- Security vulnerabilities (auth flaws, exposed secrets, injection risks)
+- Performance bottlenecks
+- Data consistency issues
+- Missing validation or edge case handling
+
+Be specific—reference exact files and code sections.
+
+4. INTEGRATION & SYSTEM CONSISTENCY  
+Evaluate:
+- Whether all modules integrate correctly
+- API consistency across services
+- Data flow correctness across components
+- Environment variable usage and completeness
+- External service dependencies (payment, messaging, etc.)
+
+Highlight any broken or missing integrations.
+
+5. TESTING & RELIABILITY  
+Assess:
+- Presence and coverage of tests
+- Missing critical test cases
+- Reliability risks due to lack of testing
+- Manual vs automated validation gaps
+
+6. DEPLOYMENT READINESS  
+Evaluate whether the system can be deployed right now. Check:
+- Build process completeness
+- Environment configuration requirements
+- CI/CD readiness
+- Migration readiness (DB, assets)
+- Logging and monitoring setup
+- Rollback capability
+
+7. PRODUCTION READINESS GAP ANALYSIS  
+Define clearly what is required to reach 100% production readiness.
+
+Break this into:
+- Critical blockers (must fix before deploy)
+- High priority issues
+- Medium priority improvements
+- Optional enhancements
+
+8. OUTPUT FORMAT  
+Produce a structured report with these sections:
+
+- Repository Overview  
+- Implemented Features (Verified)  
+- Partially Implemented Features  
+- Missing Features  
+- Active Bugs & Issues  
+- Security Risks  
+- Integration Gaps  
+- Testing Gaps  
+- Deployment Readiness Status  
+- Production Readiness Checklist (Actionable Tasks)
+
+Each issue or task must include:
+- Description  
+- Location (file/module)  
+- Severity (Critical / High / Medium / Low)  
+- Recommended fix  
+
+9. FINAL VERDICT  
+End with a clear statement:
+
+“Current Production Readiness: X%”
+
+Include a short justification explaining why.
+
+Be brutally honest, precise, and evidence-based. Do not assume completeness—prove it from the code.
