@@ -479,32 +479,86 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [otpLoading, setOtpLoading] = useState(false);
   const [otpError, setOtpError] = useState('');
 
+  // ── Storefront branding — inject CSS variables from tenant config ────────────
+  useEffect(() => {
+    let styleEl: HTMLStyleElement | null = null;
+    fetch('/api/single-vendor/config', { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.ok ? r.json() as Promise<{ success: boolean; data?: { branding?: { primaryColor?: string; accentColor?: string; fontFamily?: string } } }> : null)
+      .then(json => {
+        const b = json?.data?.branding ?? {};
+        const primary = b.primaryColor ?? '#2563eb';
+        const accent = b.accentColor ?? '#16a34a';
+        const font = b.fontFamily ?? 'Inter, system-ui, sans-serif';
+        styleEl = document.createElement('style');
+        styleEl.setAttribute('data-ww-theme', tenantId);
+        styleEl.textContent = `:root { --color-primary: ${primary}; --color-accent: ${accent}; --font-family: ${font}; }`;
+        document.head.appendChild(styleEl);
+      })
+      .catch(() => {
+        styleEl = document.createElement('style');
+        styleEl.setAttribute('data-ww-theme', tenantId);
+        styleEl.textContent = ':root { --color-primary: #2563eb; --color-accent: #16a34a; --font-family: Inter, system-ui, sans-serif; }';
+        document.head.appendChild(styleEl);
+      });
+    return () => { if (styleEl) document.head.removeChild(styleEl); };
+  }, [tenantId]);
+
   // ── Wishlist (offline-first via Dexie) ────────────────────────────────────
+  const GUEST_WISHLIST_KEY = `webwaka_wishlist_${tenantId}`;
   const [wishlisted, setWishlisted] = useState<Set<string>>(new Set());
 
+  // Load wishlist: from Dexie if authenticated, or localStorage if guest
   useEffect(() => {
-    if (!customerId) return;
-    getWishlistItems(tenantId, customerId).then(items => {
-      setWishlisted(new Set(items.map(i => i.productId)));
-    }).catch(() => {});
-  }, [tenantId, customerId]);
+    if (customerId) {
+      getWishlistItems(tenantId, customerId).then(items => {
+        setWishlisted(new Set(items.map(i => i.productId)));
+      }).catch(() => {});
+    } else {
+      try {
+        const guestIds: string[] = JSON.parse(localStorage.getItem(GUEST_WISHLIST_KEY) ?? '[]');
+        setWishlisted(new Set(guestIds));
+      } catch { setWishlisted(new Set()); }
+    }
+  }, [tenantId, customerId, GUEST_WISHLIST_KEY]);
 
   const handleToggleWishlist = useCallback(async (p: Product) => {
-    if (!customerId) { setShowOtpModal(true); return; }
-    const action = await toggleWishlistItem(tenantId, customerId, { id: p.id, name: p.name, price: p.price, imageEmoji: '🛍️' });
+    if (!customerId) {
+      // Guest: persist to localStorage
+      const guestIds: string[] = JSON.parse(localStorage.getItem(GUEST_WISHLIST_KEY) ?? '[]');
+      const isIn = guestIds.includes(p.id);
+      const next = isIn ? guestIds.filter(id => id !== p.id) : [...guestIds, p.id];
+      localStorage.setItem(GUEST_WISHLIST_KEY, JSON.stringify(next));
+      setWishlisted(new Set(next));
+      return;
+    }
+
+    const isCurrentlyWishlisted = wishlisted.has(p.id);
+    // Optimistic UI update
     setWishlisted(prev => {
       const next = new Set(prev);
-      if (action === 'added') next.add(p.id); else next.delete(p.id);
+      if (isCurrentlyWishlisted) next.delete(p.id); else next.add(p.id);
       return next;
     });
+
+    // Update Dexie
+    await toggleWishlistItem(tenantId, customerId, { id: p.id, name: p.name, price: p.price, imageEmoji: '🛍️' }).catch(() => {});
+
+    // Sync to server
     if (authToken) {
-      fetch('/api/single-vendor/wishlist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
-        body: JSON.stringify({ product_id: p.id }),
-      }).catch(() => {});
+      if (isCurrentlyWishlisted) {
+        fetch(`/api/single-vendor/wishlist/${encodeURIComponent(p.id)}`, {
+          method: 'DELETE',
+          headers: { 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+        }).catch(() => {});
+      } else {
+        fetch('/api/single-vendor/wishlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+          body: JSON.stringify({ product_id: p.id }),
+        }).catch(() => {});
+      }
     }
-  }, [tenantId, customerId, authToken]);
+  }, [tenantId, customerId, authToken, wishlisted, GUEST_WISHLIST_KEY]);
 
   // ── OTP handlers ──────────────────────────────────────────────────────────
   const handleRequestOtp = async () => {
@@ -532,14 +586,33 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
       });
       const d = await res.json() as { success: boolean; data?: { token: string; customer_id: string; phone: string; loyalty_points: number }; error?: string };
       if (d.success && d.data) {
-        setAuthToken(d.data.token);
+        const newToken = d.data.token;
+        setAuthToken(newToken);
         setCustomerId(d.data.customer_id);
         setCustomerPhone(d.data.phone);
         setCustomerLoyalty(d.data.loyalty_points);
-        sessionStorage.setItem(`ww_tok_${tenantId}`, d.data.token);
+        sessionStorage.setItem(`ww_tok_${tenantId}`, newToken);
         sessionStorage.setItem(`ww_cid_${tenantId}`, d.data.customer_id);
         sessionStorage.setItem(`ww_cph_${tenantId}`, d.data.phone);
         setShowOtpModal(false); setOtpStep('phone'); setOtpCode(''); setOtpPhone('');
+
+        // ── Guest wishlist merge: POST localStorage items → server, then clear ──
+        try {
+          const guestKey = `webwaka_wishlist_${tenantId}`;
+          const guestIds: string[] = JSON.parse(localStorage.getItem(guestKey) ?? '[]');
+          if (guestIds.length > 0) {
+            await Promise.allSettled(
+              guestIds.map(productId =>
+                fetch('/api/single-vendor/wishlist', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, Authorization: `Bearer ${newToken}` },
+                  body: JSON.stringify({ product_id: productId }),
+                })
+              )
+            );
+            localStorage.removeItem(guestKey);
+          }
+        } catch { /* non-fatal */ }
       } else setOtpError(d.error ?? 'Invalid OTP');
     } catch { setOtpError('Network error. Try again.'); }
     finally { setOtpLoading(false); }
@@ -606,8 +679,23 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [searchQuery, setSearchQuery] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [activeCategory, setActiveCategory] = useState('');
+  const [svSuggestions, setSvSuggestions] = useState<string[]>([]);
+  const [svSuggestShow, setSvSuggestShow] = useState(false);
+  const [svSuggestIdx, setSvSuggestIdx] = useState(-1);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const gridContainerRef = useRef<HTMLDivElement>(null);
+
+  // ── SV Autocomplete — 300ms debounce, min 2 chars ────────────────────────
+  useEffect(() => {
+    if (!searchInput || searchInput.length < 2) { setSvSuggestions([]); return; }
+    const t = setTimeout(() => {
+      fetch(`/api/single-vendor/search/suggest?q=${encodeURIComponent(searchInput)}`, { headers: { 'x-tenant-id': tenantId } })
+        .then(r => r.json() as Promise<{ success: boolean; data?: { suggestions: string[] } }>)
+        .then(j => { setSvSuggestions(j.data?.suggestions ?? []); setSvSuggestShow(true); setSvSuggestIdx(-1); })
+        .catch(() => setSvSuggestions([]));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchInput, tenantId]);
 
   // ── Product modal ─────────────────────────────────────────────────────────
   const [modalProduct, setModalProduct] = useState<Product | null>(null);
@@ -1090,21 +1178,44 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
 
       {/* Top bar: search + account button */}
       <div style={{ padding: '10px 12px 0', display: 'flex', gap: '8px' }}>
-        <input
-          type="search"
-          placeholder="Search products… (e.g. Ankara)"
-          value={searchInput}
-          onChange={e => setSearchInput(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') { setSearchQuery(searchInput.trim()); setActiveCategory(''); } }}
-          style={{ flex: 1, padding: '9px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', outline: 'none' }}
-        />
+        <div style={{ position: 'relative', flex: 1 }}>
+          <input
+            type="search"
+            placeholder="Search products… (e.g. Ankara)"
+            value={searchInput}
+            onChange={e => { setSearchInput(e.target.value); setSvSuggestShow(true); }}
+            onBlur={() => setTimeout(() => setSvSuggestShow(false), 150)}
+            onFocus={() => svSuggestions.length > 0 && setSvSuggestShow(true)}
+            onKeyDown={e => {
+              if (svSuggestShow && svSuggestions.length > 0) {
+                if (e.key === 'ArrowDown') { e.preventDefault(); setSvSuggestIdx(i => Math.min(i + 1, svSuggestions.length - 1)); return; }
+                if (e.key === 'ArrowUp') { e.preventDefault(); setSvSuggestIdx(i => Math.max(i - 1, -1)); return; }
+                if (e.key === 'Enter' && svSuggestIdx >= 0) { e.preventDefault(); const s = svSuggestions[svSuggestIdx]; if (s) { setSearchInput(s); setSearchQuery(s); setSvSuggestShow(false); setSvSuggestIdx(-1); setActiveCategory(''); } return; }
+                if (e.key === 'Escape') { setSvSuggestShow(false); setSvSuggestIdx(-1); return; }
+              }
+              if (e.key === 'Enter') { setSearchQuery(searchInput.trim()); setActiveCategory(''); setSvSuggestShow(false); }
+            }}
+            style={{ width: '100%', padding: '9px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', outline: 'none', boxSizing: 'border-box' }}
+          />
+          {svSuggestShow && svSuggestions.length > 0 && (
+            <ul role="listbox" style={{ position: 'absolute', top: '100%', left: 0, right: 0, backgroundColor: '#fff', border: '1px solid #d1d5db', borderRadius: '0 0 8px 8px', margin: 0, padding: 0, listStyle: 'none', zIndex: 100, boxShadow: '0 4px 12px rgba(0,0,0,0.12)', maxHeight: '200px', overflowY: 'auto' }}>
+              {svSuggestions.map((s, idx) => (
+                <li key={s} role="option" aria-selected={idx === svSuggestIdx}
+                  onClick={() => { setSearchInput(s); setSearchQuery(s); setSvSuggestShow(false); setSvSuggestIdx(-1); setActiveCategory(''); }}
+                  onMouseEnter={() => setSvSuggestIdx(idx)} onMouseLeave={() => setSvSuggestIdx(-1)}
+                  style={{ padding: '8px 12px', cursor: 'pointer', fontSize: '13px', borderBottom: '1px solid #f3f4f6', backgroundColor: idx === svSuggestIdx ? '#f0fdf4' : 'transparent' }}
+                >{s}</li>
+              ))}
+            </ul>
+          )}
+        </div>
         <button
-          onClick={() => { setSearchQuery(searchInput.trim()); setActiveCategory(''); }}
+          onClick={() => { setSearchQuery(searchInput.trim()); setActiveCategory(''); setSvSuggestShow(false); }}
           style={{ padding: '9px 14px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600, fontSize: '13px' }}
         >🔍</button>
         {(searchQuery || activeCategory) && (
           <button
-            onClick={() => { setSearchQuery(''); setSearchInput(''); setActiveCategory(''); }}
+            onClick={() => { setSearchQuery(''); setSearchInput(''); setActiveCategory(''); setSvSuggestions([]); setSvSuggestShow(false); }}
             style={{ padding: '9px 12px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
           >✕</button>
         )}

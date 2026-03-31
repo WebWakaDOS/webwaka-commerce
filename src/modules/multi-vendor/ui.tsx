@@ -137,9 +137,11 @@ export const MarketplaceInterface: React.FC<{
     return () => controller.abort();
   }, [loadProducts, searchQuery, categoryFilter]);
 
-  // ── Autocomplete suggestions (SV-E19 / P12) ───────────────────────────────
+  // ── Autocomplete suggestions (SV-E19 / P12) ── 300ms debounce ───────────────
+  const [suggestionActiveIdx, setSuggestionActiveIdx] = useState(-1);
+
   useEffect(() => {
-    if (!searchQuery || searchQuery.length < 2) { setSuggestions([]); return; }
+    if (!searchQuery || searchQuery.length < 2) { setSuggestions([]); setSuggestionActiveIdx(-1); return; }
     const timer = setTimeout(async () => {
       try {
         const res = await fetch(`/api/multi-vendor/search/suggest?q=${encodeURIComponent(searchQuery)}`, {
@@ -147,9 +149,10 @@ export const MarketplaceInterface: React.FC<{
         });
         const json = await res.json() as { success: boolean; data?: { suggestions: string[] } };
         setSuggestions(json.data?.suggestions ?? []);
+        setSuggestionActiveIdx(-1);
         setShowSuggestions(true);
       } catch { setSuggestions([]); }
-    }, 250);
+    }, 300);
     return () => clearTimeout(timer);
   }, [searchQuery, tenantId]);
 
@@ -274,6 +277,22 @@ export const MarketplaceInterface: React.FC<{
             onChange={e => { setSearchQuery(e.target.value); setShowSuggestions(true); }}
             onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
             onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
+            onKeyDown={(e) => {
+              if (!showSuggestions || suggestions.length === 0) return;
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setSuggestionActiveIdx((i) => Math.min(i + 1, suggestions.length - 1));
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setSuggestionActiveIdx((i) => Math.max(i - 1, -1));
+              } else if (e.key === 'Enter' && suggestionActiveIdx >= 0) {
+                e.preventDefault();
+                const selected = suggestions[suggestionActiveIdx];
+                if (selected) { setSearchQuery(selected); setShowSuggestions(false); setSuggestionActiveIdx(-1); }
+              } else if (e.key === 'Escape') {
+                setShowSuggestions(false); setSuggestionActiveIdx(-1);
+              }
+            }}
             style={{ width: '100%', padding: '0.5rem 0.75rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.95rem', boxSizing: 'border-box' }}
             aria-label="Search products"
             aria-autocomplete="list"
@@ -281,14 +300,15 @@ export const MarketplaceInterface: React.FC<{
           />
           {showSuggestions && suggestions.length > 0 && (
             <ul role="listbox" style={{ position: 'absolute', top: '100%', left: 0, right: 0, backgroundColor: '#fff', border: '1px solid #d1d5db', borderRadius: '0 0 6px 6px', margin: 0, padding: 0, listStyle: 'none', zIndex: 50, boxShadow: '0 4px 12px rgba(0,0,0,0.1)', maxHeight: '200px', overflowY: 'auto' }}>
-              {suggestions.map((s) => (
+              {suggestions.map((s, idx) => (
                 <li
                   key={s}
                   role="option"
-                  onClick={() => { setSearchQuery(s); setShowSuggestions(false); }}
-                  style={{ padding: '0.5rem 0.75rem', cursor: 'pointer', fontSize: '0.9rem', borderBottom: '1px solid #f3f4f6' }}
-                  onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#f0f9ff')}
-                  onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+                  aria-selected={idx === suggestionActiveIdx}
+                  onClick={() => { setSearchQuery(s); setShowSuggestions(false); setSuggestionActiveIdx(-1); }}
+                  style={{ padding: '0.5rem 0.75rem', cursor: 'pointer', fontSize: '0.9rem', borderBottom: '1px solid #f3f4f6', backgroundColor: idx === suggestionActiveIdx ? '#f0f9ff' : 'transparent' }}
+                  onMouseEnter={() => setSuggestionActiveIdx(idx)}
+                  onMouseLeave={() => setSuggestionActiveIdx(-1)}
                 >
                   {s}
                 </li>
@@ -322,9 +342,15 @@ export const MarketplaceInterface: React.FC<{
         ) : (
           vendorNames.map(vendorName => {
             const badge = vendorBadgeMap[vendorName];
+            const vendorItems = inventory.filter(i => i.vendorName === vendorName);
+            const vendorId = vendorItems[0]?.vendorId ?? vendorName;
+            const branding = vendorItems[0] as MvProduct & { branding?: { primaryColor?: string; bannerUrl?: string; tagline?: string } } | undefined;
+            const vendorPrimary = (branding as Record<string, unknown> | undefined)?.primaryColor as string | undefined ?? '#000';
             return (
-            <div key={vendorName} style={{ marginBottom: '2rem' }}>
-              <h2 style={{ fontSize: '1.2rem', marginBottom: '1rem', borderBottom: '2px solid #ccc', paddingBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <div key={vendorName} data-vendor-id={vendorId} style={{ marginBottom: '2rem' }}>
+              {/* Vendor-scoped CSS via inline style injection */}
+              <style>{`[data-vendor-id="${CSS.escape(vendorId)}"] { --vendor-primary: ${vendorPrimary}; }`}</style>
+              <h2 style={{ fontSize: '1.2rem', marginBottom: '1rem', borderBottom: `2px solid ${vendorPrimary}`, paddingBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 {vendorName}
                 {badge && badgeLabel[badge] && (
                   <span style={{ fontSize: '0.75rem', fontWeight: 'normal', padding: '2px 8px', borderRadius: '12px', background: badge === 'TOP_SELLER' ? '#fef3c7' : badge === 'VERIFIED' ? '#d1fae5' : '#ede9fe', color: badge === 'TOP_SELLER' ? '#92400e' : badge === 'VERIFIED' ? '#065f46' : '#5b21b6' }}>
@@ -657,11 +683,24 @@ export const VendorAnalyticsDashboard: React.FC<{ vendorToken: string; tenantId:
       {data.revenueTrend.length > 0 && (
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '1rem', marginBottom: '1.5rem' }}>
           <h4 style={{ margin: '0 0 0.75rem', fontSize: '0.9rem', color: '#374151' }}>Daily Revenue</h4>
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '3px', height: '80px' }}>
-            {data.revenueTrend.map((d) => (
-              <div key={d.date} title={`${d.date}: ₦${(d.revenueKobo / 100).toFixed(0)}`} style={{ flex: 1, background: '#2563eb', borderRadius: '2px 2px 0 0', height: `${Math.round((d.revenueKobo / maxRev) * 100)}%`, minHeight: d.revenueKobo > 0 ? '4px' : '0', transition: 'height 0.2s' }} />
-            ))}
-          </div>
+          {/* SVG sparkline — no external chart library */}
+          <svg width="100%" height="80" viewBox={`0 0 ${data.revenueTrend.length * 12} 80`} preserveAspectRatio="none" aria-label="Revenue sparkline" role="img">
+            <defs>
+              <linearGradient id="revGradient" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#2563eb" stopOpacity="0.6" />
+                <stop offset="100%" stopColor="#2563eb" stopOpacity="0.05" />
+              </linearGradient>
+            </defs>
+            {data.revenueTrend.map((d, i) => {
+              const barH = maxRev > 0 ? Math.max(Math.round((d.revenueKobo / maxRev) * 72), d.revenueKobo > 0 ? 2 : 0) : 0;
+              return (
+                <g key={d.date}>
+                  <title>{`${d.date}: ₦${(d.revenueKobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 0 })}`}</title>
+                  <rect x={i * 12 + 1} y={80 - barH} width={10} height={barH} rx={2} fill="url(#revGradient)" stroke="#2563eb" strokeWidth={barH > 0 ? 0.5 : 0} />
+                </g>
+              );
+            })}
+          </svg>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px', fontSize: '0.65rem', color: '#9ca3af' }}>
             <span>{data.revenueTrend[0]?.date}</span>
             <span>{data.revenueTrend[data.revenueTrend.length - 1]?.date}</span>

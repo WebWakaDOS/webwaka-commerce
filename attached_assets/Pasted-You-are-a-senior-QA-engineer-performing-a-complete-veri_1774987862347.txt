@@ -1,0 +1,91 @@
+You are a senior QA engineer performing a complete verification of Phase P12 (Discovery, Merchandising & Merchant Tools) in the webwaka-commerce repository.
+
+Verify all discovery, branding, and analytics features.
+
+## Step 1 — Read Everything First
+Read completely:
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/multi-vendor/ui.tsx
+- src/modules/admin/ui.tsx
+- src/core/tenant/index.ts
+- src/worker.ts
+- migrations/0010_vendor_branding.sql and 0011_vendor_analytics.sql
+
+## Step 2 — Verify Product Attributes (P12-T01)
+- [ ] POST /api/single-vendor/products/:id/attributes: inserts into product_attributes
+- [ ] GET /api/single-vendor/products/:id/attributes: returns all attributes for product
+- [ ] product_attributes.tenantId is always set from the authenticated request — NOT from body
+- [ ] Attribute values are included in the product detail response (GET /api/sv/products/:id)
+- [ ] FTS5 index is re-built or updated when attributes change (verify there is a trigger or explicit re-index call)
+- [ ] Same endpoints exist for multi-vendor with same behavior
+- [ ] Admin product form has a dynamic attribute section
+
+## Step 3 — Verify Wishlist (P12-T02)
+- [ ] POST /api/single-vendor/wishlist: INSERT OR IGNORE (duplicate-safe)
+- [ ] DELETE /api/single-vendor/wishlist/:productId: removes item
+- [ ] GET /api/single-vendor/wishlist: JOINs wishlists with products table and returns product details
+- [ ] Requires customer authentication for all three endpoints
+- [ ] SV storefront: heart icon exists on product cards
+- [ ] Clicking heart toggles wishlist add/remove
+- [ ] Unauthenticated wishlist: stored in localStorage as webwaka_wishlist_{tenantId}
+- [ ] On customer login: localStorage wishlist items are POSTed to /api/single-vendor/wishlist and localStorage is cleared
+- [ ] EDGE CASE: same product added twice (POST twice) — only one record exists (INSERT OR IGNORE enforces this)
+
+## Step 4 — Verify Storefront Branding (P12-T03)
+- [ ] TenantConfig type has branding field: primaryColor, accentColor, fontFamily, heroImageUrl, announcementBar
+- [ ] SV storefront reads tenantConfig.branding and injects <style>:root{--color-primary:...}</style> into the document
+- [ ] CSS variables used: --color-primary, --color-accent, --font-family (at minimum)
+- [ ] In admin UI: Theme Editor section with color pickers, font selector, hero image URL input, announcement bar text
+- [ ] "Save Theme" button updates TENANT_CONFIG in KV via PUT /api/admin/tenant/branding
+- [ ] Preview panel in admin shows changes before saving
+- [ ] EDGE CASE: tenantConfig.branding is null/missing — storefront uses sensible defaults (no crashes, no missing CSS variables)
+
+## Step 5 — Verify Vendor Branding (P12-T04)
+- [ ] migration 0010 adds branding TEXT column to vendors table
+- [ ] PATCH /api/multi-vendor/vendor/branding: updates vendor branding JSON (requireRole: VENDOR)
+- [ ] Vendor store page applies CSS variables scoped to [data-vendor-id="${vendorId}"]
+- [ ] Scoped CSS does NOT affect other vendor pages on the same marketplace
+- [ ] EDGE CASE: vendor with no branding set → store renders with default marketplace theme (no errors)
+
+## Step 6 — Verify Autocomplete Search (P12-T05)
+- [ ] GET /api/single-vendor/search/suggest?q= endpoint exists
+- [ ] Returns { suggestions: string[] } with max 5 results
+- [ ] Uses LIKE query on products.name (or FTS5 prefix search if available)
+- [ ] Filters by tenantId and deletedAt IS NULL
+- [ ] SV storefront search: debounced 300ms, triggers after 2+ characters
+- [ ] Dropdown renders below search input with keyboard navigation (arrow up/down, enter to select, escape to close)
+- [ ] Selecting a suggestion populates the search field and triggers a full search
+- [ ] Same endpoint exists for multi-vendor: GET /api/multi-vendor/search/suggest?q=
+
+## Step 7 — Verify WhatsApp Order Tracking Messages (P12-T06)
+- [ ] In handleDeliveryStatusUpdated: distinct message template used for each of 6 statuses
+- [ ] PICKED_UP message contains: order reference and tracking URL
+- [ ] IN_TRANSIT message contains: estimated delivery date
+- [ ] OUT_FOR_DELIVERY message instructs customer to be available
+- [ ] DELIVERED message contains: review invitation link
+- [ ] FAILED message explains retry plan
+- [ ] RETURNED message mentions refund timeline
+- [ ] EDGE CASE: status value not in the 6 expected values → no message sent (graceful handling, no crash)
+
+## Step 8 — Verify Vendor Analytics Dashboard (P12-T07)
+- [ ] migration 0011 creates vendor_daily_analytics table with UNIQUE on (vendorId, tenantId, date)
+- [ ] Daily cron in worker.ts: INSERT OR REPLACE into vendor_daily_analytics
+- [ ] SQL uses DATE('now') for current date aggregation
+- [ ] GET /api/multi-vendor/vendor/analytics?days=30: returns revenueTrend array (one entry per day), topProducts, avgOrderValue, totalOrders
+- [ ] revenueTrend has exactly 'days' entries (including zero-revenue days — filled with 0)
+- [ ] Top products are sorted by revenueKobo descending, limited to 5
+- [ ] In vendor dashboard UI: revenue sparkline renders as SVG (no external chart library import)
+- [ ] KPI cards display correctly formatted naira amounts (not raw kobo values)
+- [ ] EDGE CASE: vendor with no orders this period → revenueTrend all zeros, topProducts empty array (no errors)
+
+## Step 9 — TypeScript and Tests
+Run: npx tsc --noEmit — fix all errors.
+Run: npm test — fix all failures.
+
+## Step 10 — Fix All Issues
+Fix every issue found.
+
+## Step 11 — Completion Confirmation
+"P12 QA COMPLETE — Product attributes with FTS5 inclusion, wishlist with guest-to-authenticated merge, SV storefront CSS variable branding, vendor-scoped branding, autocomplete search with keyboard navigation, per-status WhatsApp tracking messages, vendor daily analytics cron and dashboard. All edge cases handled. TypeScript clean. Tests passing."
+```

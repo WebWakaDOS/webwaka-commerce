@@ -522,13 +522,84 @@ const ThemeEditor: React.FC<{ tenantId: string; adminKey: string }> = ({ tenantI
       <label style={labelStyle}>Announcement Bar</label>
       <input type="text" value={announcementBar} onChange={(e) => setAnnouncementBar(e.target.value)} style={inputStyle} placeholder="Free delivery on orders above ₦10,000!" />
 
-      <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginTop: '4px' }}>
-        <Button onClick={handleSave} primary>{saving ? 'Saving…' : 'Save Theme'}</Button>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          <div style={{ width: '16px', height: '16px', borderRadius: '4px', backgroundColor: primaryColor, border: '1px solid #e2e8f0' }} />
-          <div style={{ width: '16px', height: '16px', borderRadius: '4px', backgroundColor: accentColor, border: '1px solid #e2e8f0' }} />
-          <span style={{ fontSize: '11px', color: '#64748b', fontFamily: fontFamily }}>Aa — {fontFamily.split(',')[0]?.trim()}</span>
+      {/* Live preview panel */}
+      <div style={{ marginTop: '12px', border: `2px solid ${primaryColor}`, borderRadius: '8px', overflow: 'hidden', fontFamily: fontFamily }}>
+        <div style={{ backgroundColor: primaryColor, color: '#fff', padding: '8px 12px', fontSize: '13px', fontWeight: 600 }}>Preview</div>
+        <div style={{ padding: '12px', backgroundColor: '#f8fafc' }}>
+          {announcementBar && (
+            <div style={{ backgroundColor: accentColor, color: '#fff', padding: '4px 10px', borderRadius: '4px', fontSize: '12px', marginBottom: '8px', textAlign: 'center' }}>{announcementBar}</div>
+          )}
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+            <div style={{ width: '32px', height: '32px', backgroundColor: primaryColor, borderRadius: '6px' }} />
+            <span style={{ fontWeight: 700, fontSize: '14px', fontFamily: fontFamily }}>Your Store</span>
+          </div>
+          <button style={{ backgroundColor: primaryColor, color: '#fff', border: 'none', borderRadius: '6px', padding: '6px 16px', fontWeight: 600, fontSize: '13px', fontFamily: fontFamily, cursor: 'default' }}>Add to Cart</button>
+          <button style={{ backgroundColor: accentColor, color: '#fff', border: 'none', borderRadius: '6px', padding: '6px 16px', fontWeight: 600, fontSize: '13px', fontFamily: fontFamily, marginLeft: '8px', cursor: 'default' }}>Checkout</button>
         </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginTop: '12px' }}>
+        <Button onClick={handleSave} primary>{saving ? 'Saving…' : 'Save Theme'}</Button>
+      </div>
+    </div>
+  );
+};
+
+// ── AdminProductAttributes — Product attribute management (P12-T01) ───────────
+const AdminProductAttributes: React.FC<{ tenantId: string; adminKey: string }> = ({ tenantId, adminKey }) => {
+  const [productId, setProductId] = useState('');
+  const [attrName, setAttrName] = useState('');
+  const [attrValue, setAttrValue] = useState('');
+  const [attributes, setAttributes] = useState<Array<{ id: string; attributeName: string; attributeValue: string; createdAt: string }>>([]);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const loadAttrs = async (pid: string) => {
+    if (!pid.trim()) return;
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/single-vendor/products/${encodeURIComponent(pid)}/attributes`, { headers: { 'x-tenant-id': tenantId } });
+      const json = await res.json() as { success: boolean; data?: { attributes: typeof attributes } };
+      setAttributes(json.data?.attributes ?? []);
+    } catch { setAttributes([]); }
+    setLoading(false);
+  };
+
+  const handleAddAttr = async () => {
+    if (!productId.trim() || !attrName.trim() || !attrValue.trim()) { setMsg('All fields required'); return; }
+    setMsg('');
+    try {
+      const res = await fetch(`/api/single-vendor/products/${encodeURIComponent(productId)}/attributes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'x-admin-key': adminKey, 'x-role': 'TENANT_ADMIN' },
+        body: JSON.stringify({ attributeName: attrName.trim(), attributeValue: attrValue.trim() }),
+      });
+      const json = await res.json() as { success: boolean; error?: string };
+      if (json.success) { setMsg('✓ Attribute saved'); setAttrName(''); setAttrValue(''); loadAttrs(productId); }
+      else setMsg(`Error: ${json.error ?? 'Unknown'}`);
+    } catch (e) { setMsg(`Error: ${String(e)}`); }
+  };
+
+  const inputStyle = { padding: '6px 10px', border: '1px solid #e2e8f0', borderRadius: '4px', fontSize: '13px' };
+
+  return (
+    <div>
+      {msg && <div style={{ padding: '6px 10px', borderRadius: '4px', marginBottom: '10px', fontSize: '13px', background: msg.startsWith('Error') ? '#fee2e2' : '#d1fae5', color: msg.startsWith('Error') ? '#dc2626' : '#065f46' }}>{msg}</div>}
+      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '12px', flexWrap: 'wrap' }}>
+        <input type="text" value={productId} onChange={e => setProductId(e.target.value)} style={{ ...inputStyle, minWidth: '200px' }} placeholder="Product ID" />
+        <Button onClick={() => loadAttrs(productId)}>Load</Button>
+      </div>
+      {loading && <p style={{ color: '#64748b', fontSize: '13px' }}>Loading…</p>}
+      {attributes.length > 0 && (
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', marginBottom: '12px' }}>
+          <thead><tr style={{ borderBottom: '2px solid #e2e8f0' }}><th style={{ padding: '6px 8px', textAlign: 'left' }}>Attribute</th><th style={{ padding: '6px 8px', textAlign: 'left' }}>Value</th></tr></thead>
+          <tbody>{attributes.map(a => (<tr key={a.id} style={{ borderBottom: '1px solid #f1f5f9' }}><td style={{ padding: '6px 8px' }}>{a.attributeName}</td><td style={{ padding: '6px 8px' }}>{a.attributeValue}</td></tr>))}</tbody>
+        </table>
+      )}
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+        <input type="text" value={attrName} onChange={e => setAttrName(e.target.value)} style={inputStyle} placeholder="e.g. Colour" />
+        <input type="text" value={attrValue} onChange={e => setAttrValue(e.target.value)} style={inputStyle} placeholder="e.g. Red" />
+        <Button onClick={handleAddAttr} primary>Add Attribute</Button>
       </div>
     </div>
   );
@@ -594,6 +665,10 @@ export const MarketplaceAdminDashboard: React.FC<{ user: User; config: TenantCon
 
       <Card title="Storefront Theme Editor (SV-E09)">
         <ThemeEditor tenantId={tenantId} adminKey={adminKey} />
+      </Card>
+
+      <Card title="Product Attributes (P12-T01)">
+        <AdminProductAttributes tenantId={tenantId} adminKey={adminKey} />
       </Card>
     </div>
   );

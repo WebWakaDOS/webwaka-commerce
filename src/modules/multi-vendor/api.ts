@@ -3451,8 +3451,16 @@ app.get('/vendor/analytics', async (c) => {
   const days = Math.min(Math.max(1, Number(c.req.query('days') ?? 30)), 90);
 
   try {
+    // Build full date range — exactly `days` entries, oldest first
+    const dateRange: string[] = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      dateRange.push(d.toISOString().slice(0, 10));
+    }
+
     // Revenue trend from vendor_daily_analytics
-    const { results: trend } = await c.env.DB.prepare(
+    const { results: dbTrend } = await c.env.DB.prepare(
       `SELECT date, revenueKobo, orderCount, avgOrderValueKobo
        FROM vendor_daily_analytics
        WHERE vendorId = ? AND tenantId = ?
@@ -3462,12 +3470,16 @@ app.get('/vendor/analytics', async (c) => {
       date: string; revenueKobo: number; orderCount: number; avgOrderValueKobo: number;
     }>();
 
+    // Zero-fill missing days — every day in dateRange must have an entry
+    const dbMap = new Map((dbTrend ?? []).map((r) => [r.date, r]));
+    const trend = dateRange.map((date) => dbMap.get(date) ?? { date, revenueKobo: 0, orderCount: 0, avgOrderValueKobo: 0 });
+
     // Aggregated KPIs
-    const totalRevenue = (trend ?? []).reduce((s, r) => s + r.revenueKobo, 0);
-    const totalOrders = (trend ?? []).reduce((s, r) => s + r.orderCount, 0);
+    const totalRevenue = trend.reduce((s, r) => s + r.revenueKobo, 0);
+    const totalOrders = trend.reduce((s, r) => s + r.orderCount, 0);
     const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
 
-    // Top 5 products by revenue (last N days from vendor_orders / order_items join)
+    // Top 5 products by revenue (last N days from order_items join)
     const { results: topProducts } = await c.env.DB.prepare(
       `SELECT oi.product_id, oi.product_name AS name,
               SUM(oi.quantity)     AS units_sold,
@@ -3487,7 +3499,7 @@ app.get('/vendor/analytics', async (c) => {
     return c.json({
       success: true,
       data: {
-        revenueTrend: trend ?? [],
+        revenueTrend: trend,
         topProducts: topProducts ?? [],
         totalRevenue,
         totalOrders,

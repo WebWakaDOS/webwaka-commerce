@@ -1048,7 +1048,7 @@ app.get('/wishlist', async (c) => {
   }
 });
 
-// ── POST /wishlist — Add or remove product (toggles) ─────────────────────────
+// ── POST /wishlist — Add product (INSERT OR IGNORE — duplicate-safe) ──────────
 app.post('/wishlist', async (c) => {
   const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
@@ -1058,23 +1058,32 @@ app.post('/wishlist', async (c) => {
   if (!body.product_id) return c.json({ success: false, error: 'product_id is required' }, 400);
 
   try {
-    const existing = await c.env.DB.prepare(
-      'SELECT id FROM wishlists WHERE tenant_id = ? AND customer_id = ? AND product_id = ?'
-    ).bind(tenantId, customer.customerId, body.product_id).first<{ id: string }>();
-
     const now = Date.now();
-    if (existing) {
-      await c.env.DB.prepare('DELETE FROM wishlists WHERE id = ?').bind(existing.id).run();
-      return c.json({ success: true, data: { action: 'removed', product_id: body.product_id } });
-    } else {
-      const wlId = `wl_${now}_${Math.random().toString(36).slice(2, 8)}`;
-      await c.env.DB.prepare(
-        'INSERT INTO wishlists (id, tenant_id, customer_id, product_id, added_at) VALUES (?, ?, ?, ?, ?)'
-      ).bind(wlId, tenantId, customer.customerId, body.product_id, now).run();
-      return c.json({ success: true, data: { action: 'added', product_id: body.product_id } }, 201);
-    }
+    const wlId = `wl_${now}_${Math.random().toString(36).slice(2, 8)}`;
+    await c.env.DB.prepare(
+      'INSERT OR IGNORE INTO wishlists (id, tenant_id, customer_id, product_id, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind(wlId, tenantId, customer.customerId, body.product_id, now).run();
+    return c.json({ success: true, data: { action: 'added', product_id: body.product_id } }, 201);
   } catch (err) {
     console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── DELETE /wishlist/:productId — Remove product from wishlist ────────────────
+app.delete('/wishlist/:productId', async (c) => {
+  const tenantId = getTenantId(c);
+  const customer = await authenticateCustomer(c);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const productId = c.req.param('productId');
+  try {
+    await c.env.DB.prepare(
+      'DELETE FROM wishlists WHERE tenant_id = ? AND customer_id = ? AND product_id = ?'
+    ).bind(tenantId, customer.customerId, productId).run();
+    return c.json({ success: true, data: { action: 'removed', product_id: productId } });
+  } catch (err) {
+    console.error('[SV][wishlist DELETE] error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
@@ -1632,6 +1641,58 @@ app.post('/paystack/webhook', async (c) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // P12 — PRODUCT DISCOVERY & BRANDING (SV-E06, SV-E11, SV-E09, SV-E19)
 // ══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /config — Public tenant config (branding, features) ──────────────────
+app.get('/config', async (c) => {
+  const tenantId = getTenantId(c);
+  try {
+    const config = await c.env.TENANT_CONFIG.get(`tenant:${tenantId}`, 'json') as Record<string, unknown> | null;
+    const branding = (config?.branding as Record<string, unknown> | null) ?? {};
+    return c.json({
+      success: true,
+      data: {
+        tenantId,
+        branding: {
+          primaryColor: branding.primaryColor ?? '#2563eb',
+          accentColor: branding.accentColor ?? '#16a34a',
+          fontFamily: branding.fontFamily ?? 'Inter, system-ui, sans-serif',
+          logoUrl: branding.logoUrl ?? null,
+          heroImageUrl: branding.heroImageUrl ?? null,
+          announcementBar: branding.announcementBar ?? null,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[SV][config] error:', err);
+    return c.json({ success: true, data: { tenantId, branding: { primaryColor: '#2563eb', accentColor: '#16a34a', fontFamily: 'Inter, system-ui, sans-serif', logoUrl: null, heroImageUrl: null, announcementBar: null } } });
+  }
+});
+
+// ── GET /products/:id — Product detail with attributes (P12-T01) ──────────────
+app.get('/products/:id', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  try {
+    const product = await c.env.DB.prepare(
+      `SELECT id, name, description, price, quantity, category, image_url, sku,
+              has_variants, slug, is_active
+       FROM products
+       WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL`
+    ).bind(productId, tenantId).first<Record<string, unknown>>();
+
+    if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+    // Include attribute values
+    const { results: attrs } = await c.env.DB.prepare(
+      'SELECT attributeName, attributeValue FROM product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+    ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
+
+    return c.json({ success: true, data: { ...product, attributes: attrs ?? [] } });
+  } catch (err) {
+    console.error('[SV][products/:id] error:', err);
+    return c.json({ success: false, error: 'Product not found' }, 404);
+  }
+});
 
 // ── GET /search/suggest — Autocomplete suggestions (SV-E19) ──────────────────
 // Must be declared BEFORE /search/:id routes to avoid param capture
