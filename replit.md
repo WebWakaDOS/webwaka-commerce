@@ -371,7 +371,7 @@ See `.env.example` for reference:
 - **CAC suite (5 tests):** provider_error on HTTP 401, verified:true on substring match, verified:false with mismatch reason, graceful fetch throw, correct Prembly headers + rc_number body.
 - **Factory suite (3 tests):** all three methods present, defaults to sandbox endpoint, uses production endpoint when specified.
 
-**Test count: 817/817 passing (16 new), TypeScript clean**
+**Test count: 828/828 passing (11 new), TypeScript clean**
 
 ## Phase 11 — Promo Engine, Loyalty Tiers, Campaigns, Inventory Sync (session March 31 2026)
 
@@ -416,4 +416,4 @@ See `.env.example` for reference:
 - Receipt expanded: shows pts redeemed (red), pts earned (green), new balance, and tier.
 - All loyalty state cleared on hold, checkout, and receipt dismiss.
 
-**TypeScript clean, Vite starts with no errors.**
+**TypeScript clean (0 errors across all 18 test files and production source), 828/828 tests passing.**

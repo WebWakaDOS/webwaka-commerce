@@ -80,8 +80,8 @@ export async function handleInventoryUpdated(
               `Good news! ${productName} is back in stock. Shop now: ${storeUrl}`,
               'whatsapp',
             ).catch(() => {});
+            notifiedCount++;
           }
-          notifiedCount++;
         } catch { /* non-fatal per customer */ }
       }
 

@@ -105,7 +105,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
     expect(mockPrepare).toHaveBeenCalledTimes(3);
 
     // Verify the INSERT statement was built for the product
-    const insertCall = mockPrepare.mock.calls[2][0] as string;
+    const insertCall = mockPrepare.mock.calls[2]![0] as string;
     expect(insertCall).toMatch(/INSERT INTO products/i);
   });
 
@@ -158,11 +158,11 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
 
     // Verify UPDATE was issued (last_write_wins: overwrite regardless of version)
     expect(mockPrepare).toHaveBeenCalledTimes(3);
-    const updateCall = mockPrepare.mock.calls[2][0] as string;
+    const updateCall = mockPrepare.mock.calls[2]![0] as string;
     expect(updateCall).toMatch(/UPDATE products/i);
 
     // Verify quantity=20 was passed to bind
-    const bindArgs = (mockPrepare.mock.results[2].value as { bind: ReturnType<typeof vi.fn> }).bind.mock.calls;
+    const bindArgs = (mockPrepare.mock.results[2]!.value as { bind: ReturnType<typeof vi.fn> }).bind.mock.calls;
     expect(bindArgs[0]).toContain(20); // quantity = 20
   });
 
@@ -202,7 +202,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
 
     // Only the tenants query should run — no products UPDATE/INSERT
     expect(mockPrepare).toHaveBeenCalledTimes(1);
-    const tenantsCall = mockPrepare.mock.calls[0][0] as string;
+    const tenantsCall = mockPrepare.mock.calls[0]![0] as string;
     expect(tenantsCall).toMatch(/FROM tenants/i);
   });
 

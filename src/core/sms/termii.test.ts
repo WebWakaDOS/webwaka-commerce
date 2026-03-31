@@ -16,7 +16,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Import the REAL implementation directly (not through the @webwaka/core alias)
-import { sendTermiiSms } from '../../../../webwaka-core/src/sms/termii';
+import { sendTermiiSms } from '../../../packages/webwaka-core/src/sms/termii';
 
 const TERMII_API_URL = 'https://api.ng.termii.com/api/sms/send';
 
@@ -56,7 +56,7 @@ describe('sendTermiiSms — @webwaka/core Termii SMS helper', () => {
     const result = await sendTermiiSms({
       to: '+2348012345678',
       message: 'OTP: 654321',
-      apiKey: (undefined as unknown as string) ?? '',
+      apiKey: '',
     });
 
     expect(result.success).toBe(true);

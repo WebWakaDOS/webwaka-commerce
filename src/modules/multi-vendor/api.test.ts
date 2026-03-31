@@ -3143,7 +3143,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         makeRequest('POST', '/checkout', checkoutBody),
         mockEnv as any,
       );
-      const insertCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]).filter(
+      const insertCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!).filter(
         (sql: string) => sql.includes('marketplace_orders'),
       );
       expect(insertCalls.length).toBeGreaterThanOrEqual(1);
@@ -3382,7 +3382,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         makeRequest('POST', '/checkout', checkoutBody),
         mockEnv as any,
       );
-      const insertCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]).filter(
+      const insertCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!).filter(
         (sql: string) => sql.includes('marketplace_orders'),
       );
       expect(insertCalls.length).toBeGreaterThanOrEqual(1);
@@ -3516,7 +3516,7 @@ describe('MV-4 POST /checkout — Paystack server-side verify', () => {
       makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
       mockEnvWithPaystack as any,
     );
-    const fetchCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const fetchCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(fetchCall[0]).toContain(`/transaction/verify/${checkoutBodyPaystack.payment_reference}`);
   });
 
@@ -3528,7 +3528,7 @@ describe('MV-4 POST /checkout — Paystack server-side verify', () => {
       makeRequestWithPaystack('POST', '/checkout', checkoutBodyPaystack),
       mockEnvWithPaystack as any,
     );
-    const fetchCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const fetchCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(fetchCall[1].headers.Authorization).toContain(`Bearer ${PAYSTACK_SECRET}`);
   });
 
@@ -3596,7 +3596,7 @@ describe('MV-4 Settlement escrow math', () => {
       .filter((args: unknown[]) => args.some((a: unknown) => typeof a === 'string' && (a as string).startsWith('stl_')));
     const holdUntilArg = insertCalls.length > 0 ? insertCalls[0] : null;
     // Verify settlements INSERT was called (hold_until is a bind argument)
-    const allSqlCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const allSqlCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     expect(allSqlCalls.some((sql: string) => sql.includes('settlements'))).toBe(true);
     // Verify hold_until > before (escrow in future)
     if (holdUntilArg) {
@@ -3692,7 +3692,7 @@ describe('MV-4 Settlement escrow math', () => {
     expect(bd.payout).toBe(bd.subtotal - bd.commission);
     // Settlement amount = payout (not subtotal)
     const settlementInserts = mockDb.prepare.mock.calls
-      .map((c: [string]) => c[0])
+      .map((c: string[]) => c[0]!)
       .filter((sql: string) => sql.includes('INSERT OR IGNORE INTO settlements'));
     expect(settlementInserts.length).toBeGreaterThanOrEqual(1);
   });
@@ -3758,7 +3758,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
       body: webhookBody,
     });
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
-    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     const orderUpdate = updateCalls.find((sql: string) => sql.includes("payment_status = 'paid'") && sql.includes('orders'));
     expect(orderUpdate).toBeDefined();
   });
@@ -3771,7 +3771,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
       body: webhookBody,
     });
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
-    const settlementUpdate = mockDb.prepare.mock.calls.map((c: [string]) => c[0])
+    const settlementUpdate = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!)
       .find((sql: string) => sql.includes("'eligible'") && sql.includes('settlements'));
     expect(settlementUpdate).toBeDefined();
   });
@@ -3788,7 +3788,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
       body: transferBody,
     });
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
-    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     const payoutUpdate = updateCalls.find((sql: string) =>
       sql.includes("status = 'paid'") && sql.includes('payout_requests'),
     );
@@ -3815,7 +3815,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
       body: webhookBody,
     });
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
-    const insertLog = mockDb.prepare.mock.calls.map((c: [string]) => c[0])
+    const insertLog = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!)
       .find((sql: string) => sql.includes('paystack_webhook_log'));
     expect(insertLog).toBeDefined();
   });
@@ -4111,7 +4111,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     await multiVendorRouter.fetch(req, mockEnv as any);
-    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     const promotionUpdate = updateCalls.find((sql: string) =>
       sql.includes("'eligible'") && sql.includes('settlements') && sql.includes('hold_until'),
     );
@@ -4151,7 +4151,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     await multiVendorRouter.fetch(req, mockEnv as any);
-    const settlementQueryCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0])
+    const settlementQueryCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!)
       .filter((sql: string) => sql.includes('FROM settlements'));
     expect(settlementQueryCalls.length).toBeGreaterThanOrEqual(1);
   });
@@ -4297,7 +4297,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
       body: JSON.stringify({}),
     });
     await multiVendorRouter.fetch(req, mockEnv as any);
-    const updateCalls = mockDb.prepare.mock.calls.map((c: [string]) => c[0]);
+    const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     const settlementUpdate = updateCalls.find((sql: string) =>
       sql.includes("status = 'released'") && sql.includes('settlements'),
     );

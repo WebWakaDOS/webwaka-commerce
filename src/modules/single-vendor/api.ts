@@ -378,9 +378,9 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
 
       // 1. Date window check (validFrom / validUntil)
       const nowIso = new Date(Date.now()).toISOString();
-      if (promo.validFrom && nowIso < promo.validFrom) return c.json({ success: false, error: 'Promo code is not yet active' }, 422);
-      if (promo.validUntil && nowIso > promo.validUntil) return c.json({ success: false, error: 'Promo code has expired' }, 422);
-      if (promo.expires_at && promo.expires_at < Date.now()) return c.json({ success: false, error: 'Promo code has expired' }, 422);
+      if (promo.validFrom && nowIso < promo.validFrom) return c.json({ success: false, error: 'promo_not_yet_active' }, 422);
+      if (promo.validUntil && nowIso > promo.validUntil) return c.json({ success: false, error: 'promo_expired' }, 422);
+      if (promo.expires_at && promo.expires_at < Date.now()) return c.json({ success: false, error: 'promo_expired' }, 422);
 
       // 2. Minimum order value
       const minOrder = promo.minOrderValueKobo ?? promo.min_order_kobo;
@@ -399,7 +399,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
             'SELECT COUNT(*) as cnt FROM promo_usage WHERE promoId = ? AND customerId = ? AND tenantId = ?'
           ).bind(promo.id, promoCustomerKey, tenantId).first<{ cnt: number }>();
           if ((usageRow?.cnt ?? 0) >= promo.maxUsesPerCustomer) {
-            return c.json({ success: false, error: 'You have already used this promo code the maximum number of times' }, 422);
+            return c.json({ success: false, error: 'promo_already_used' }, 422);
           }
         }
       }
