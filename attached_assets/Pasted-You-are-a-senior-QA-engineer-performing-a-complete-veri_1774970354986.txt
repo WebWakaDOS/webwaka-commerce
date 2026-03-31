@@ -1,0 +1,72 @@
+You are a senior QA engineer performing a complete verification of Phase P05 (Logistics Integration Wiring) in the webwaka-commerce repository.
+
+Verify that commerce correctly publishes delivery requests and fully handles incoming delivery status events.
+
+## Step 1 — Read Everything First
+Read completely:
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/core/event-bus/handlers/index.ts
+- src/worker.ts
+- migrations/0004_vendor_pickup.sql (or wherever pickupAddress was added to vendors)
+
+## Step 2 — Verify SV Delivery Request Publication (P05-T01)
+- [ ] In src/modules/single-vendor/api.ts: locate the order creation/confirmation handler
+- [ ] After a successful order INSERT into D1: a CommerceEvents.ORDER_READY_DELIVERY event is published
+- [ ] The event is published using publishEvent(env.COMMERCE_EVENTS, {...}) — not an HTTP call to logistics
+- [ ] Event payload contains: orderId, tenantId, sourceModule:'single-vendor', pickupAddress (from tenantConfig.storeAddress), deliveryAddress (from order body), itemsSummary
+- [ ] pickupAddress is read from tenantConfig — NOT hardcoded
+- [ ] The event is published AFTER the order is confirmed in D1 — not before (ordering matters)
+- [ ] If the event publish fails: the order creation itself is NOT rolled back (publish is best-effort; use try/catch that logs but does not rethrow)
+
+## Step 3 — Verify Delivery Quote Storage and Retrieval (P05-T02)
+- [ ] In src/core/event-bus/handlers/index.ts: a handler for CommerceEvents.DELIVERY_QUOTE exists
+- [ ] Handler stores quotes in KV: key = 'delivery_options:${orderId}', TTL = 3600 seconds
+- [ ] In src/modules/single-vendor/api.ts: GET /api/single-vendor/orders/:id/delivery-options endpoint exists
+- [ ] This endpoint reads from KV key 'delivery_options:${orderId}'
+- [ ] If KV key not found: returns { quotes: [], pending: true }
+- [ ] If KV key found: returns { quotes: [...parsed quotes] }
+- [ ] Response includes correct Content-Type: application/json
+
+## Step 4 — Verify MV Per-Vendor Delivery Events (P05-T03)
+- [ ] In src/modules/multi-vendor/api.ts: locate the umbrella order creation handler
+- [ ] After all vendor sub-orders are created: a loop publishes one event per vendor sub-order
+- [ ] Each event uses CommerceEvents.ORDER_READY_DELIVERY
+- [ ] Each event payload contains: orderId (vendor sub-order ID, NOT the umbrella ID), vendorId, sourceModule:'multi-vendor', pickupAddress (from vendor record), deliveryAddress (umbrella order's shipping address)
+- [ ] The vendors table has a pickupAddress column (verify in D1 schema or migration)
+- [ ] If a vendor has no pickupAddress configured: the event is still published but with a null/empty pickupAddress (do not crash — handle gracefully)
+
+## Step 5 — Verify Delivery Status Handler (P05-T04)
+- [ ] In src/core/event-bus/handlers/index.ts: handleDeliveryStatusUpdated is fully implemented (NOT a stub)
+- [ ] Reads from payload: orderId, tenantId, status, trackingUrl, provider, estimatedDelivery
+- [ ] Maps canonical logistics status to internal order status:
+PICKED_UP → 'PROCESSING', IN_TRANSIT → 'SHIPPED', OUT_FOR_DELIVERY → 'OUT_FOR_DELIVERY',
+DELIVERED → 'DELIVERED', FAILED → 'DELIVERY_FAILED', RETURNED → 'RETURNED'
+- [ ] Runs: UPDATE orders SET status = mappedStatus, updatedAt = ? WHERE id = orderId AND tenantId = tenantId
+- [ ] After update: fetches customer phone from D1
+- [ ] Sends a WhatsApp message via createSmsProvider from @webwaka/core
+- [ ] Message content is appropriate for each status (not a generic message for all statuses)
+- [ ] After message sent: deletes 'order:${orderId}' from CATALOG_CACHE KV (cache invalidation)
+- [ ] Handler is idempotent: receiving the same DELIVERY_STATUS event twice does not send duplicate SMS or corrupt order status
+
+## Step 6 — Verify Vendor Pickup Address Migration (P05-T05)
+- [ ] A migration file adds pickupAddress column to vendors table
+- [ ] pickupAddress column type is TEXT (stores JSON)
+- [ ] In MV vendor settings API: pickupAddress is accepted in the vendor update request body
+- [ ] pickupAddress JSON is validated: must contain street, city, state, lga at minimum
+
+## Step 7 — Edge Case Testing
+Test each edge case:
+- [ ] SV order with no storeAddress in tenantConfig: does the event publish fail gracefully? The order must still be created.
+- [ ] MV order with 3 vendors: verify exactly 3 DELIVERY_QUOTE events are published (one per vendor)
+- [ ] DELIVERY_STATUS with unknown status value (e.g. 'PROCESSING_AT_WAREHOUSE'): verify handler does not crash; maps to a safe default
+
+## Step 8 — TypeScript and Tests
+Run: npx tsc --noEmit — fix all errors.
+Run: npm test — fix all failures.
+
+## Step 9 — Fix All Issues
+Fix every issue found.
+
+## Step 10 — Completion Confirmation
+"P05 QA COMPLETE — SV delivery request published post-order-creation, delivery quotes stored in KV, MV per-vendor delivery events published, delivery status handler fully implemented with correct status mapping and WhatsApp notifications, vendor pickupAddress migration applied. TypeScript clean. Tests passing."

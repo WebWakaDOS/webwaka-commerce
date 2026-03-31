@@ -444,6 +444,20 @@ app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
     return c.json({ success: false, error: `status must be one of: ${validStatuses.join(', ')}` }, 400);
   }
 
+  // Validate pickupAddress structure when provided (P05-T5)
+  if (body.pickupAddress !== undefined) {
+    const addr = body.pickupAddress as Record<string, unknown>;
+    if (typeof addr !== 'object' || addr === null || Array.isArray(addr)) {
+      return c.json({ success: false, error: 'pickupAddress must be an object' }, 400);
+    }
+    const requiredAddrFields = ['street', 'city', 'state', 'lga'] as const;
+    for (const field of requiredAddrFields) {
+      if (!addr[field] || typeof addr[field] !== 'string') {
+        return c.json({ success: false, error: `pickupAddress.${field} is required and must be a non-empty string` }, 400);
+      }
+    }
+  }
+
   const now = Date.now();
   try {
     const vendor = await c.env.DB.prepare(
