@@ -16,6 +16,7 @@ import {
   getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms,
   createPaymentProvider, createSmsProvider, updateWithVersionLock, CommerceEvents,
 } from '@webwaka/core';
+import { publishEvent } from '../../core/event-bus';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
@@ -398,9 +399,18 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
           const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET ?? '');
           await paymentProvider.initiateRefund(body.paystack_reference);
 
-          // Notify event bus
-          // (publishEvent not available here; queue via fetch side-channel or just log)
-          void CommerceEvents.PAYMENT_REFUNDED;
+          // Publish PAYMENT_REFUNDED event via CF Queues (or in-memory fallback in dev)
+          await publishEvent(c.env.COMMERCE_EVENTS, {
+            id: `evt_ref_${Date.now()}`,
+            tenantId: tenantId!,
+            type: CommerceEvents.PAYMENT_REFUNDED,
+            sourceModule: 'single_vendor_storefront',
+            timestamp: Date.now(),
+            payload: {
+              reference: body.paystack_reference,
+              reason: 'stock_unavailable',
+            },
+          });
 
           // Notify customer via WhatsApp
           const smsProvider = createSmsProvider(c.env.TERMII_API_KEY ?? '');

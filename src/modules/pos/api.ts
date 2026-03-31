@@ -6,7 +6,7 @@
  * Invariants: Nigeria-First (Paystack), Offline-First (sync), Multi-tenancy, PCI-DSS error hygiene
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole } from '@webwaka/core';
+import { getTenantId, requireRole, updateWithVersionLock } from '@webwaka/core';
 import { checkRateLimit, _createRateLimitStore, generatePayRef } from '../../utils';
 import type { Env } from '../../worker';
 
@@ -543,23 +543,25 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   const orderId = `ord_pos_${now}_${crypto.randomUUID().slice(0, 8)}`;
 
   try {
-    // Step 1 — Batch stock validation
+    // Step 1 — Batch stock validation (include version for optimistic lock)
     const stockResults = await c.env.DB.batch(
       lineItems.map((item) =>
         c.env.DB.prepare(
-          'SELECT id, quantity, name FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+          'SELECT id, quantity, name, version FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
         ).bind(item.product_id, tenantId),
       ),
     );
 
-    // Step 2 — Accumulate stock failures
+    // Step 2 — Accumulate stock failures; collect known versions for locking
     const insufficientItems: Array<{ product_id: string; available: number; requested: number }> =
       [];
+    const stockVersions = new Map<string, { version: number; newQty: number }>();
+
     for (let i = 0; i < lineItems.length; i++) {
       const batchResult = stockResults[i];
       const lineItem = lineItems[i];
       if (!batchResult || !lineItem) continue;
-      const rows = batchResult.results as Array<{ id: string; quantity: number; name: string }>;
+      const rows = batchResult.results as Array<{ id: string; quantity: number; name: string; version: number }>;
       if (rows.length === 0) {
         return c.json(
           { success: false, error: `Product not found: ${lineItem.product_id}` },
@@ -569,6 +571,10 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       const firstRow = rows[0];
       if (!firstRow) continue;
       const available = firstRow.quantity;
+      stockVersions.set(lineItem.product_id, {
+        version: firstRow.version,
+        newQty: available - lineItem.quantity,
+      });
       if (available < lineItem.quantity) {
         insufficientItems.push({
           product_id: lineItem.product_id,
@@ -621,13 +627,36 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     const primaryMethod =
       resolvedPayments.length === 1 ? (resolvedPayments[0]?.method ?? 'cash') : 'split';
 
-    // Step 6 — Atomic D1 batch: deduct stock + insert order
-    const deductStmts = lineItems.map((item) =>
-      c.env.DB.prepare(
-        'UPDATE products SET quantity = quantity - ?, version = version + 1, updated_at = ? WHERE id = ? AND tenant_id = ? AND quantity >= ?',
-      ).bind(item.quantity, now, item.product_id, tenantId, item.quantity),
-    );
+    // Step 6a — Deduct stock with optimistic locking (POS-E08 / SV-E02)
+    // updateWithVersionLock is idempotent per (id, tenantId, expectedVersion).
+    // A conflict means another terminal already sold the same unit — return 409
+    // so the client can re-read stock and retry or queue for background sync.
+    for (const item of lineItems) {
+      const stockInfo = stockVersions.get(item.product_id);
+      if (!stockInfo) continue;
 
+      const lockResult = await updateWithVersionLock(
+        c.env.DB,
+        'products',
+        { quantity: stockInfo.newQty },
+        { id: item.product_id, tenantId: tenantId!, expectedVersion: stockInfo.version },
+      );
+
+      if (lockResult.conflict) {
+        return c.json(
+          {
+            success: false,
+            error: 'inventory_conflict',
+            retry: true,
+            product_id: item.product_id,
+            code: 'STOCK_RACE',
+          },
+          409,
+        );
+      }
+    }
+
+    // Step 6b — Insert order (stock already deducted above)
     const insertStmt = c.env.DB.prepare(
       `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal, discount, total_amount, payment_method, payments_json, session_id, payment_status, order_status, channel, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`,
@@ -647,17 +676,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       now,
     );
 
-    const batchResults = await c.env.DB.batch([...deductStmts, insertStmt]);
-
-    // Step 7 — Detect stock race condition
-    for (let i = 0; i < lineItems.length; i++) {
-      if ((batchResults[i] as { meta: { changes: number } }).meta.changes === 0) {
-        return c.json(
-          { success: false, error: 'Stock changed during checkout, please retry', code: 'STOCK_RACE' },
-          409,
-        );
-      }
-    }
+    await c.env.DB.batch([insertStmt]);
 
     // Step 8 — Award loyalty points if customer phone provided (non-blocking)
     // Rate: 1 point per ₦100 spent (10,000 kobo = 1 point)

@@ -11,7 +11,7 @@ const mockDb = {
   bind: vi.fn().mockReturnThis(),
   all: vi.fn().mockResolvedValue({ results: [] }),
   first: vi.fn().mockResolvedValue(null),
-  run: vi.fn().mockResolvedValue({ success: true }),
+  run: vi.fn().mockResolvedValue({ success: true, meta: { changes: 1 } }),
   batch: vi.fn().mockResolvedValue([]),
 };
 
@@ -27,7 +27,7 @@ function req(method: string, path: string, body?: unknown, tenant = 'tnt_cov') {
 }
 
 const stockBatch = (qty: number, id = 'prod_1') => [
-  { results: [{ id, quantity: qty, name: 'Item' }], meta: { changes: 0 } },
+  { results: [{ id, quantity: qty, name: 'Item', version: 1 }], meta: { changes: 0 } },
 ];
 const deductBatch = (n = 1) => [
   ...Array(n).fill({ results: [], meta: { changes: 1 } }),
@@ -41,7 +41,7 @@ beforeEach(() => {
   mockDb.bind.mockReturnThis();
   mockDb.all.mockResolvedValue({ results: [] });
   mockDb.first.mockResolvedValue(null);
-  mockDb.run.mockResolvedValue({ success: true });
+  mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
   mockDb.batch
     .mockResolvedValueOnce(stockBatch(100))
     .mockResolvedValueOnce(deductBatch(1));
@@ -51,16 +51,14 @@ beforeEach(() => {
 describe('Inventory Concurrency — Race Conditions', () => {
   it('detects race on 2nd item only in a 2-item cart', async () => {
     mockDb.batch.mockReset();
-    mockDb.batch
-      .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 10, name: 'A' }], meta: { changes: 0 } },
-        { results: [{ id: 'prod_2', quantity: 10, name: 'B' }], meta: { changes: 0 } },
-      ])
-      .mockResolvedValueOnce([
-        { results: [], meta: { changes: 1 } }, // prod_1 deducts OK
-        { results: [], meta: { changes: 0 } }, // prod_2 raced — 0 rows affected
-        { results: [], meta: { changes: 1 } }, // INSERT order
-      ]);
+    mockDb.batch.mockResolvedValueOnce([
+      { results: [{ id: 'prod_1', quantity: 10, name: 'A', version: 1 }], meta: { changes: 0 } },
+      { results: [{ id: 'prod_2', quantity: 10, name: 'B', version: 1 }], meta: { changes: 0 } },
+    ]);
+    // prod_1 lock succeeds, prod_2 lock conflicts (another terminal won)
+    mockDb.run
+      .mockResolvedValueOnce({ success: true, meta: { changes: 1 } })
+      .mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
 
     const res = await posRouter.fetch(req('POST', '/checkout', {
       items: [
@@ -78,14 +76,10 @@ describe('Inventory Concurrency — Race Conditions', () => {
     mockDb.batch.mockReset();
     mockDb.batch
       .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 10, name: 'A' }], meta: { changes: 0 } },
-        { results: [{ id: 'prod_2', quantity: 10, name: 'B' }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_1', quantity: 10, name: 'A', version: 1 }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_2', quantity: 10, name: 'B', version: 1 }], meta: { changes: 0 } },
       ])
-      .mockResolvedValueOnce([
-        { results: [], meta: { changes: 1 } }, // prod_1
-        { results: [], meta: { changes: 1 } }, // prod_2
-        { results: [], meta: { changes: 1 } }, // INSERT order
-      ]);
+      .mockResolvedValueOnce([{ results: [], meta: { changes: 1 } }]);
 
     const res = await posRouter.fetch(req('POST', '/checkout', {
       items: [
@@ -99,14 +93,11 @@ describe('Inventory Concurrency — Race Conditions', () => {
 
   it('reports STOCK_RACE even when 1st product races (not only last)', async () => {
     mockDb.batch.mockReset();
-    mockDb.batch
-      .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 5, name: 'Pepper' }], meta: { changes: 0 } },
-      ])
-      .mockResolvedValueOnce([
-        { results: [], meta: { changes: 0 } }, // 1st product races
-        { results: [], meta: { changes: 1 } }, // INSERT order
-      ]);
+    mockDb.batch.mockResolvedValueOnce([
+      { results: [{ id: 'prod_1', quantity: 5, name: 'Pepper', version: 1 }], meta: { changes: 0 } },
+    ]);
+    // 1st product lock conflicts immediately
+    mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
 
     const res = await posRouter.fetch(req('POST', '/checkout', {
       items: [{ product_id: 'prod_1', quantity: 5, price: 1000, name: 'Pepper' }],
@@ -150,7 +141,7 @@ describe('Inventory Concurrency — Race Conditions', () => {
     mockDb.batch.mockReset();
     mockDb.batch
       .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 7, name: 'Exact' }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_1', quantity: 7, name: 'Exact', version: 1 }], meta: { changes: 0 } },
       ])
       .mockResolvedValueOnce(deductBatch(1));
     const res = await posRouter.fetch(req('POST', '/checkout', {
@@ -164,7 +155,7 @@ describe('Inventory Concurrency — Race Conditions', () => {
     mockDb.batch.mockReset();
     mockDb.batch
       .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 8, name: 'Near' }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_1', quantity: 8, name: 'Near', version: 1 }], meta: { changes: 0 } },
       ])
       .mockResolvedValueOnce(deductBatch(1));
     const res = await posRouter.fetch(req('POST', '/checkout', {

@@ -12,7 +12,7 @@ const mockDb = {
   bind: vi.fn().mockReturnThis(),
   all: vi.fn().mockResolvedValue({ results: [] }),
   first: vi.fn().mockResolvedValue(null),
-  run: vi.fn().mockResolvedValue({ success: true }),
+  run: vi.fn().mockResolvedValue({ success: true, meta: { changes: 1 } }),
   batch: vi.fn().mockResolvedValue([]),
 };
 
@@ -30,7 +30,7 @@ function makeRequest(method: string, path: string, body?: unknown, tenantId = 't
 
 // ─── Batch helpers ────────────────────────────────────────────────────────────
 const makeSufficientStockBatch = (qty = 100) => [
-  { results: [{ id: 'prod_1', quantity: qty, name: 'Test Product' }], meta: { changes: 0 } },
+  { results: [{ id: 'prod_1', quantity: qty, name: 'Test Product', version: 1 }], meta: { changes: 0 } },
 ];
 const makeSuccessfulDeductBatch = (itemCount = 1) => [
   ...Array(itemCount).fill({ results: [], meta: { changes: 1 } }),
@@ -45,7 +45,7 @@ describe('COM-1: POS API', () => {
     mockDb.bind.mockReturnThis();
     mockDb.all.mockResolvedValue({ results: [] });
     mockDb.first.mockResolvedValue(null);
-    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
     mockDb.batch
       .mockResolvedValueOnce(makeSufficientStockBatch(100))
       .mockResolvedValueOnce(makeSuccessfulDeductBatch(1));
@@ -407,8 +407,8 @@ describe('COM-1: POS API', () => {
       mockDb.batch.mockReset();
       mockDb.batch
         .mockResolvedValueOnce([
-          { results: [{ id: 'prod_1', quantity: 100, name: 'A' }], meta: { changes: 0 } },
-          { results: [{ id: 'prod_2', quantity: 100, name: 'B' }], meta: { changes: 0 } },
+          { results: [{ id: 'prod_1', quantity: 100, name: 'A', version: 1 }], meta: { changes: 0 } },
+          { results: [{ id: 'prod_2', quantity: 100, name: 'B', version: 1 }], meta: { changes: 0 } },
         ])
         .mockResolvedValueOnce(makeSuccessfulDeductBatch(2));
       const req = makeRequest('POST', '/checkout', {
@@ -465,7 +465,7 @@ describe('COM-1: POS API', () => {
         vi.clearAllMocks();
         mockDb.prepare.mockReturnThis();
         mockDb.bind.mockReturnThis();
-        mockDb.run.mockResolvedValue({ success: true });
+        mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
         mockDb.batch
           .mockResolvedValueOnce(makeSufficientStockBatch(100))
           .mockResolvedValueOnce(makeSuccessfulDeductBatch(1));
@@ -542,14 +542,11 @@ describe('COM-1: POS API', () => {
 
     it('should return 409 STOCK_RACE when concurrent checkout wins', async () => {
       mockDb.batch.mockReset();
-      mockDb.batch
-        .mockResolvedValueOnce([
-          { results: [{ id: 'prod_1', quantity: 10, name: 'Last Unit' }], meta: { changes: 0 } },
-        ])
-        .mockResolvedValueOnce([
-          { results: [], meta: { changes: 0 } },
-          { results: [], meta: { changes: 1 } },
-        ]);
+      mockDb.batch.mockResolvedValueOnce([
+        { results: [{ id: 'prod_1', quantity: 10, name: 'Last Unit', version: 1 }], meta: { changes: 0 } },
+      ]);
+      // Simulate optimistic lock conflict: another terminal already updated this row
+      mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
       const req = makeRequest('POST', '/checkout', {
         items: [{ product_id: 'prod_1', quantity: 10, price: 5000, name: 'Last Unit' }],
         payment_method: 'cash',

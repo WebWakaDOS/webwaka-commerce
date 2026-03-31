@@ -34,7 +34,7 @@ export class StorefrontCore {
     const payment = createPaymentProvider(this.paystackSecret);
 
     const chargeResult = await payment.verifyCharge(
-      `ref_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      `pay_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
     );
 
     if (!chargeResult.success) {

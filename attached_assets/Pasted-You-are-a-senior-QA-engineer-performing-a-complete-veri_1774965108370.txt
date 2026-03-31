@@ -1,0 +1,107 @@
+You are a senior QA engineer performing a complete verification of Phase P02 (Critical Production Fixes) in the webwaka-commerce repository.
+
+Your job is to verify every fix was implemented correctly, test each one for correctness and edge cases, find any remaining bugs, fix everything you find, and confirm when the phase is 100% verified.
+
+## Step 1 — Read Everything First
+Read these files completely:
+- src/core/tenant/index.ts
+- src/modules/pos/ui.tsx
+- src/modules/pos/useBackgroundSync.ts
+- src/core/offline/db.ts
+- src/modules/single-vendor/api.ts
+- src/modules/single-vendor/core.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/multi-vendor/ui.tsx
+- src/core/sync/server.ts
+- src/core/event-bus/handlers/index.ts
+- migrations/ (all .sql files)
+
+## Step 2 — Verify P02-T01: Legacy Tenant Resolver Deleted
+- [ ] Search the entire codebase for any export named 'tenantResolver' (the mock/in-memory one). It must not exist.
+- [ ] Search for any import of 'tenantResolver' across all files. There must be zero.
+- [ ] Verify that src/core/tenant/index.ts exports ONLY the KV-backed resolver function (createTenantResolverMiddleware or equivalent).
+- [ ] Verify there is a comment in tenant/index.ts prohibiting mock resolvers.
+- [ ] If the legacy resolver still exists or is still imported: remove it and update all imports now.
+
+## Step 3 — Verify P02-T02: Offline Product Hydration (POS-E01)
+- [ ] In src/core/offline/db.ts: a 'products' table exists in the Dexie schema with the schema string 'id, tenantId, sku, category, updatedAt'
+- [ ] In src/modules/pos/useBackgroundSync.ts: after successful mutation flush, syncProductCache(tenantId) is called
+- [ ] syncProductCache fetches GET /api/pos/products?tenantId=... and calls db.table('products').bulkPut(result)
+- [ ] In src/modules/pos/ui.tsx: fetchProducts() checks navigator.onLine FIRST before attempting network fetch
+- [ ] If offline AND Dexie 'products' has data: products are loaded from Dexie and displayed
+- [ ] If online: server data is fetched and upserted into Dexie after fetch
+- [ ] A visible offline mode indicator exists in the JSX (e.g. a badge, banner, or status text)
+- [ ] The offline path does NOT make any network calls when navigator.onLine is false
+
+Bug check: Read the fetchProducts function. Verify the offline check is the FIRST conditional, not nested inside a try/catch that would still attempt network access. If the logic is incorrect, fix it.
+
+## Step 4 — Verify P02-T03: Post-Payment Auto-Refund (SV-E01)
+- [ ] In src/modules/single-vendor/api.ts checkout handler: locate where Paystack verification occurs
+- [ ] After verification succeeds, the D1 stock deduction batch runs
+- [ ] After the batch: the code checks if ANY deduction had meta.changes === 0
+- [ ] If stock failed: createPaymentProvider from @webwaka/core is used (NOT a hardcoded fetch to Paystack)
+- [ ] Refund is initiated: provider.initiateRefund(reference) is called
+- [ ] A PAYMENT_REFUNDED event is published using CommerceEvents.PAYMENT_REFUNDED (NOT a hardcoded string)
+- [ ] A WhatsApp/SMS notification is sent to the customer using createSmsProvider from @webwaka/core
+- [ ] HTTP 409 is returned with { error: 'stock_unavailable', refundInitiated: true }
+- [ ] If stock succeeded: order creation proceeds normally (regression check)
+
+Bug check: Verify the refund code is INSIDE the checkout handler, not a separate route. Verify the Paystack secret key comes from env (not hardcoded). If env.PAYSTACK_SECRET_KEY is not present in the Env interface in src/worker.ts, add it.
+
+## Step 5 — Verify P02-T04: Optimistic Locking on Inventory (SV-E02)
+- [ ] Search src/modules/single-vendor/api.ts for all UPDATE statements affecting the 'products' table quantity field
+- [ ] Every such UPDATE uses updateWithVersionLock from @webwaka/core — NOT a plain db.prepare('UPDATE products SET quantity = ? WHERE id = ?')
+- [ ] On conflict (result.conflict === true): HTTP 409 returned with { error: 'inventory_conflict', retry: true }
+- [ ] Search src/modules/multi-vendor/api.ts for all product quantity UPDATE statements
+- [ ] Every MV product quantity update also uses updateWithVersionLock
+
+Bug check: Run a search for 'UPDATE products SET quantity' across the entire codebase. For every match: verify it goes through updateWithVersionLock. If any plain UPDATE exists, replace it.
+
+## Step 6 — Verify P02-T05: Multi-Terminal Stock Sync Locking (POS-E08)
+- [ ] In src/core/sync/server.ts: the mutation processing loop handles 'pos.checkout' mutation type
+- [ ] For 'pos.checkout': does NOT simply insert orders without checking stock
+- [ ] Uses updateWithVersionLock for each item's stock deduction
+- [ ] The mutation payload includes a knownVersion field per item (verify client sends this)
+- [ ] Conflicts are collected in a conflicts[] array
+- [ ] conflicts[] is returned in the sync response body
+- [ ] The sync endpoint does NOT return HTTP 500 on stock version conflict — it returns a structured response with the conflicts list
+
+## Step 7 — Verify P02-T06: FTS5 Search in MV Frontend (MV-E01)
+- [ ] In src/modules/multi-vendor/ui.tsx: search for any loop that iterates through vendors to fetch products (the old pattern)
+- [ ] That loop must NOT exist. If it does: remove it now and replace with the search API call.
+- [ ] The product fetch uses GET /api/multi-vendor/search?q=...&tenantId=...
+- [ ] In src/modules/multi-vendor/api.ts: GET /api/multi-vendor/search endpoint exists
+- [ ] The search query uses FTS5: SELECT ... FROM products_fts WHERE products_fts MATCH ?
+- [ ] The search returns paginated results with a total count
+- [ ] Loading state is shown while fetching
+- [ ] Empty state is shown when no results match
+
+Bug check: Verify the FTS5 virtual table 'products_fts' exists in the D1 migrations. Search all migration files for 'CREATE VIRTUAL TABLE ... USING fts5'. If it does not exist, create a migration that adds it.
+
+## Step 8 — Verify P02-T07: Stub Event Handlers Implemented
+- [ ] In src/core/event-bus/handlers/index.ts: handleOrderCreated is NOT empty/a stub
+- [ ] handleOrderCreated inserts into platform_order_log table (id, tenantId, orderId, sourceModule, createdAt)
+- [ ] handleShiftClosed is NOT empty — it queries orders and inserts into shift_analytics
+- [ ] handleVendorKycSubmitted is NOT empty — it inserts into kyc_review_queue with status 'PENDING'
+- [ ] platform_order_log table exists in a migration file
+- [ ] shift_analytics table exists in a migration file
+- [ ] kyc_review_queue table exists in a migration file
+- [ ] All three handler functions are idempotent (safe to call twice with the same event)
+
+## Step 9 — Verify P02-T08: Mock Payment Processor Removed from Production Path
+- [ ] Search src/modules/single-vendor/core.ts for any MockPaymentProcessor, mock payment, or fake payment class
+- [ ] If found in production path: it must be moved to a __mocks__ or __tests__ directory
+- [ ] The production checkout flow in api.ts uses createPaymentProvider from @webwaka/core exclusively
+- [ ] No test mock leaks into any production API handler
+
+## Step 10 — Run Tests and TypeScript Check
+Run: npx tsc --noEmit — fix all errors before continuing.
+Run: npm test — all tests must pass. If any test fails: read the failure, identify root cause, fix, re-run.
+
+## Step 11 — Fix All Issues Found
+Every issue identified above must be fixed before declaring this phase verified.
+
+## Step 12 — Completion Confirmation
+Only after all checks pass and all tests are green, output:
+"P02 QA COMPLETE — All 8 fixes verified: legacy resolver removed, offline hydration working, auto-refund implemented, optimistic locking on all inventory updates, multi-terminal sync locking, FTS5 search in MV, all stub handlers implemented, mock payment removed. TypeScript clean. Tests passing."
+```

@@ -1,14 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { Hono } from 'hono';
-import { tenantResolver, requireModule, moduleRegistry, createTenantResolverMiddleware, TenantConfig } from './index';
+import { requireModule, moduleRegistry, createTenantResolverMiddleware, TenantConfig } from './index';
 
-// ── Mock KV namespace for createTenantResolverMiddleware tests ────────────────
+// ── Mock KV namespace for all tests ──────────────────────────────────────────
 function makeMockKV(store: Record<string, unknown>): KVNamespace {
   return {
     get: async (key: string, type?: string) => {
       const val = store[key];
       if (val === undefined) return null;
-      if (type === 'json') return val as any;
+      if (type === 'json') return val as unknown;
       return JSON.stringify(val);
     },
   } as unknown as KVNamespace;
@@ -23,6 +23,17 @@ const demoConfig: TenantConfig = {
   featureFlags: { ai_recommendations: false },
 };
 
+// Helper: build an app backed by createTenantResolverMiddleware + mock KV
+function buildApp(kv: KVNamespace) {
+  const app = new Hono<{ Variables: { tenantConfig: TenantConfig } }>();
+  app.use('*', createTenantResolverMiddleware(kv));
+  app.get('/test', (c) => {
+    const config = c.get('tenantConfig' as never) as TenantConfig;
+    return c.json({ tenantId: config?.tenantId, marketplaceId: config?.marketplaceId });
+  });
+  return app;
+}
+
 describe('Tenant-as-Code & Module Registry', () => {
   it('should register and retrieve modules', () => {
     const posModule = moduleRegistry.get('retail_pos');
@@ -31,90 +42,72 @@ describe('Tenant-as-Code & Module Registry', () => {
   });
 
   it('should resolve tenant by X-Tenant-ID header', async () => {
-    const app = new Hono<{ Variables: { tenant: any } }>();
-    app.use('*', tenantResolver);
-    app.get('/test', (c) => {
-      const tenant = c.get('tenant');
-      return c.json({ tenantId: tenant.tenantId });
-    });
-
+    const kv = makeMockKV({ 'tenant:tnt_123': { ...demoConfig, tenantId: 'tnt_123' } });
+    const app = buildApp(kv);
     const req = new Request('http://localhost/test', {
       headers: { 'X-Tenant-ID': 'tnt_123' },
     });
-
     const res = await app.fetch(req);
     expect(res.status).toBe(200);
-
     const data = await res.json() as { tenantId: string };
     expect(data.tenantId).toBe('tnt_123');
   });
 
-  it('should resolve tenant by domain', async () => {
-    const app = new Hono<{ Variables: { tenant: any } }>();
-    app.use('*', tenantResolver);
-    app.get('/test', (c) => {
-      const tenant = c.get('tenant');
-      return c.json({ tenantId: tenant.tenantId });
-    });
-
-    const req = new Request('http://shop.example.com/test');
-
+  it('should return 400 when tenant header is missing', async () => {
+    const kv = makeMockKV({});
+    const app = buildApp(kv);
+    const req = new Request('http://localhost/test');
     const res = await app.fetch(req);
-    expect(res.status).toBe(200);
-
-    const data = await res.json() as { tenantId: string };
-    expect(data.tenantId).toBe('tnt_123');
+    expect(res.status).toBe(400);
   });
 
   it('should return 404 for unknown tenant', async () => {
-    const app = new Hono<{ Variables: { tenant: any } }>();
-    app.use('*', tenantResolver);
-    app.get('/test', (c) => c.json({ ok: true }));
-
-    const req = new Request('http://unknown.example.com/test');
-
+    const kv = makeMockKV({});
+    const app = buildApp(kv);
+    const req = new Request('http://localhost/test', {
+      headers: { 'X-Tenant-ID': 'tnt_unknown' },
+    });
     const res = await app.fetch(req);
     expect(res.status).toBe(404);
   });
 
   it('should allow access if module is enabled', async () => {
-    const app = new Hono<{ Variables: { tenant: any } }>();
-    app.use('*', tenantResolver);
-    app.get('/pos', requireModule('retail_pos'), (c) => c.json({ ok: true }));
-
-    const req = new Request('http://shop.example.com/pos');
-
-    const res = await app.fetch(req);
+    const kv = makeMockKV({ 'tenant:tnt_demo': demoConfig });
+    const app2 = new Hono<{ Variables: { tenantConfig: TenantConfig } }>();
+    app2.use('*', createTenantResolverMiddleware(kv));
+    app2.get('/pos', requireModule('retail_pos'), (c) => c.json({ ok: true }));
+    const req = new Request('http://localhost/pos', {
+      headers: { 'X-Tenant-ID': 'tnt_demo' },
+    });
+    const res = await app2.fetch(req);
     expect(res.status).toBe(200);
   });
 
   it('should deny access if module is not enabled', async () => {
-    const app = new Hono<{ Variables: { tenant: any } }>();
-    app.use('*', tenantResolver);
-    app.get('/marketplace', requireModule('multi_vendor_marketplace'), (c) => c.json({ ok: true }));
-
-    const req = new Request('http://shop.example.com/marketplace');
-
-    const res = await app.fetch(req);
+    const kv = makeMockKV({ 'tenant:tnt_demo': demoConfig });
+    const app2 = new Hono<{ Variables: { tenantConfig: TenantConfig } }>();
+    app2.use('*', createTenantResolverMiddleware(kv));
+    app2.get('/marketplace', requireModule('multi_vendor_marketplace'), (c) => c.json({ ok: true }));
+    const req = new Request('http://localhost/marketplace', {
+      headers: { 'X-Tenant-ID': 'tnt_demo' },
+    });
+    const res = await app2.fetch(req);
     expect(res.status).toBe(403);
   });
 
   it('should support scoped vendor tenants (marketplaceId + tenantId)', async () => {
-    const app = new Hono<{ Variables: { tenant: any } }>();
-    app.use('*', tenantResolver);
-    app.get('/test', (c) => {
-      const tenant = c.get('tenant');
-      return c.json({
-        tenantId: tenant.tenantId,
-        marketplaceId: tenant.marketplaceId,
-      });
+    const vendorConfig: TenantConfig = {
+      ...demoConfig,
+      tenantId: 'tnt_vendor_1',
+      marketplaceId: 'tnt_marketplace_1',
+    };
+    const kv = makeMockKV({ 'tenant:tnt_vendor_1': vendorConfig });
+    const app = buildApp(kv);
+    const req = new Request('http://localhost/test', {
+      headers: { 'X-Tenant-ID': 'tnt_vendor_1' },
     });
-
-    const req = new Request('http://vendor1.marketplace.com/test');
-
     const res = await app.fetch(req);
     expect(res.status).toBe(200);
-
     const data = await res.json() as { tenantId: string; marketplaceId: string };
     expect(data.tenantId).toBe('tnt_vendor_1');
     expect(data.marketplaceId).toBe('tnt_marketplace_1');
@@ -123,7 +116,7 @@ describe('Tenant-as-Code & Module Registry', () => {
 
 // ── createTenantResolverMiddleware — KV-backed (P0-T07) ───────────────────────
 describe('createTenantResolverMiddleware (KV-backed)', () => {
-  function buildApp(kv: KVNamespace) {
+  function buildKvApp(kv: KVNamespace) {
     const app = new Hono<{ Variables: { tenantConfig: TenantConfig } }>();
     app.use('*', createTenantResolverMiddleware(kv));
     app.get('/test', (c) => {
@@ -135,7 +128,7 @@ describe('createTenantResolverMiddleware (KV-backed)', () => {
 
   it('resolves tenant and sets tenantConfig in context', async () => {
     const kv = makeMockKV({ 'tenant:tnt_demo': demoConfig });
-    const app = buildApp(kv);
+    const app = buildKvApp(kv);
     const req = new Request('http://localhost/test', {
       headers: { 'x-tenant-id': 'tnt_demo' },
     });
@@ -148,7 +141,7 @@ describe('createTenantResolverMiddleware (KV-backed)', () => {
 
   it('returns 404 when tenant is not found in KV', async () => {
     const kv = makeMockKV({});
-    const app = buildApp(kv);
+    const app = buildKvApp(kv);
     const req = new Request('http://localhost/test', {
       headers: { 'x-tenant-id': 'tnt_unknown' },
     });
@@ -161,7 +154,7 @@ describe('createTenantResolverMiddleware (KV-backed)', () => {
 
   it('returns 400 when x-tenant-id header is missing', async () => {
     const kv = makeMockKV({ 'tenant:tnt_demo': demoConfig });
-    const app = buildApp(kv);
+    const app = buildKvApp(kv);
     const req = new Request('http://localhost/test');
     const res = await app.fetch(req);
     expect(res.status).toBe(400);
@@ -172,7 +165,7 @@ describe('createTenantResolverMiddleware (KV-backed)', () => {
 
   it('reads the KV key as tenant:<tenantId>', async () => {
     const kv = makeMockKV({ 'tenant:tnt_acme': { ...demoConfig, tenantId: 'tnt_acme' } });
-    const app = buildApp(kv);
+    const app = buildKvApp(kv);
     const req = new Request('http://localhost/test', {
       headers: { 'X-Tenant-ID': 'tnt_acme' },
     });

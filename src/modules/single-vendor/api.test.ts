@@ -25,7 +25,7 @@ const mockDb = {
   bind: vi.fn().mockReturnThis(),
   all: vi.fn().mockResolvedValue({ results: [] }),
   first: vi.fn().mockImplementation(() => mockFirstImpl()),
-  run: vi.fn().mockResolvedValue({ success: true }),
+  run: vi.fn().mockResolvedValue({ success: true, meta: { changes: 1 } }),
   batch: vi.fn().mockResolvedValue([
     { meta: { changes: 1 } }, // INSERT orders
     { meta: { changes: 1 } }, // UPDATE products stock
@@ -86,17 +86,17 @@ function checkoutBody(overrides: Record<string, unknown> = {}) {
 }
 
 /** Mock D1 to return a valid product on .first() */
-function mockProduct(overrides: Partial<{ id: string; name: string; price: number; quantity: number }> = {}) {
-  const prod = { id: 'prod_1', name: 'T-Shirt', price: 20000, quantity: 10, ...overrides };
+function mockProduct(overrides: Partial<{ id: string; name: string; price: number; quantity: number; version: number }> = {}) {
+  const prod = { id: 'prod_1', name: 'T-Shirt', price: 20000, quantity: 10, version: 1, ...overrides };
   mockFirstImpl = () => Promise.resolve(prod);
 }
 
 /** Mock D1 promo then product (first call = promo, subsequent = product) */
 function mockProductThenPromo(
-  productOverrides: Partial<{ id: string; name: string; price: number; quantity: number }> = {},
+  productOverrides: Partial<{ id: string; name: string; price: number; quantity: number; version: number }> = {},
   promoOverrides: Record<string, unknown> = {},
 ) {
-  const prod = { id: 'prod_1', name: 'T-Shirt', price: 20000, quantity: 10, ...productOverrides };
+  const prod = { id: 'prod_1', name: 'T-Shirt', price: 20000, quantity: 10, version: 1, ...productOverrides };
   const promo = {
     id: 'promo_1', code: 'SAVE20', discount_type: 'pct', discount_value: 20,
     min_order_kobo: 0, max_uses: 0, current_uses: 0, expires_at: null, is_active: 1,
@@ -119,7 +119,7 @@ describe('COM-2: Single-Vendor Storefront API', () => {
     mockDb.all.mockResolvedValue({ results: [] });
     mockFirstImpl = () => Promise.resolve(null);
     mockDb.first.mockImplementation(() => mockFirstImpl());
-    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
     mockDb.batch.mockResolvedValue([
       { meta: { changes: 1 } },
       { meta: { changes: 1 } },
@@ -726,19 +726,16 @@ describe('COM-2: Single-Vendor Storefront API', () => {
       expect(mockDb.batch).toHaveBeenCalledTimes(1);
     });
 
-    it('should return 409 on stock race condition (batch changes=0)', async () => {
+    it('should return 409 on stock race condition (optimistic lock conflict)', async () => {
       mockProduct({ price: 20000, quantity: 10 });
       vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 21500 }));
-      mockDb.batch.mockResolvedValueOnce([
-        { meta: { changes: 1 } },
-        { meta: { changes: 0 } }, // race: stock deduction failed
-        { meta: { changes: 1 } },
-      ]);
+      // Simulate optimistic lock conflict: another request already updated this product row
+      mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
       const req = makeRequest('POST', '/checkout', checkoutBody());
       const res = await singleVendorRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(409);
       const data = await res.json() as any;
-      expect(data.error).toMatch(/race|try again/i);
+      expect(data.error).toMatch(/stock_unavailable|race|try again/i);
     });
 
     it('should isolate multi-tenant — INV-MT', async () => {
