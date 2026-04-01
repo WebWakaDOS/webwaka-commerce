@@ -55,6 +55,9 @@ function isProductImage(url) {
   return IMAGE_EXTENSIONS.test(url.pathname) || url.pathname.includes('/products/') && url.pathname.includes('/image');
 }
 
+// Max number of image entries to keep in cache (prevents unbounded growth on low-end devices)
+const IMAGE_CACHE_MAX_ENTRIES = 200;
+
 // Cache-First for product images — serves cached asset immediately; updates cache from network
 async function cacheFirstImage(request) {
   const cache = await caches.open(IMAGE_CACHE);
@@ -62,7 +65,16 @@ async function cacheFirstImage(request) {
   if (cached) return cached;
   try {
     const res = await fetch(request);
-    if (res.ok) cache.put(request, res.clone());
+    if (res.ok) {
+      cache.put(request, res.clone());
+      // Evict oldest entries if cache exceeds size limit
+      cache.keys().then((keys) => {
+        if (keys.length > IMAGE_CACHE_MAX_ENTRIES) {
+          const toDelete = keys.slice(0, keys.length - IMAGE_CACHE_MAX_ENTRIES);
+          toDelete.forEach((k) => cache.delete(k));
+        }
+      }).catch(() => {});
+    }
     return res;
   } catch {
     return Response.error();

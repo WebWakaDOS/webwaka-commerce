@@ -693,11 +693,72 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   }>();
 
   // Normalize: accept line_items or items (backward compat)
-  const lineItems: LineItem[] = body.line_items ?? body.items ?? [];
+  const rawLineItems: LineItem[] = body.line_items ?? body.items ?? [];
 
-  if (lineItems.length === 0) {
+  if (rawLineItems.length === 0) {
     return c.json({ success: false, error: 'Cart is empty' }, 400);
   }
+
+  // ── POS-E13: Bundle expansion — resolve bundle items into components for stock deduction ──
+  // Bundle items are identified when their product_id exists in product_bundles table.
+  // The bundle's priceKobo is used for the order total; component stocks are deducted individually.
+  // Atomic: if ANY component is out of stock, the whole checkout is rejected.
+  const lineItems: LineItem[] = [];
+  const bundlePriceOverrides = new Map<string, number>(); // bundleItemId → bundle price (for totals)
+
+  for (const item of rawLineItems) {
+    // Check if this item is a bundle
+    const bundle = await c.env.DB.prepare(
+      `SELECT id, priceKobo FROM product_bundles WHERE id = ? AND tenantId = ? AND active = 1`,
+    ).bind(item.product_id, tenantId).first<{ id: string; priceKobo: number }>().catch(() => null);
+
+    if (bundle) {
+      // Fetch bundle components
+      const { results: components } = await c.env.DB.prepare(
+        `SELECT bi.productId, bi.quantity AS componentQty, p.name, p.price_kobo AS priceKobo, p.quantity AS stockQty
+         FROM bundle_items bi JOIN products p ON p.id = bi.productId AND p.tenant_id = ?
+         WHERE bi.bundleId = ?`,
+      ).bind(tenantId, bundle.id).all<{ productId: string; componentQty: number; name: string; priceKobo: number; stockQty: number }>();
+
+      if (!components || components.length === 0) {
+        return c.json({ success: false, error: `Bundle ${bundle.id} has no components configured` }, 400);
+      }
+
+      // Atomic stock check: ALL components must have enough stock
+      const insufficient = components.filter(comp => comp.stockQty < comp.componentQty * item.quantity);
+      if (insufficient.length > 0) {
+        return c.json({
+          success: false,
+          error: 'Insufficient stock for bundle component(s)',
+          insufficient_items: insufficient.map(c2 => ({ product_id: c2.productId, available: c2.stockQty, requested: c2.componentQty * item.quantity })),
+        }, 409);
+      }
+
+      // Expand bundle into component line items for stock deduction
+      // Track that the first component carries the bundle price for totalling purposes
+      const bundleLineKey = `bundle_${bundle.id}_${Math.random().toString(36).slice(2, 6)}`;
+      for (let ci = 0; ci < components.length; ci++) {
+        const comp = components[ci]!;
+        const expandedId = `${comp.productId}__from_bundle_${bundleLineKey}`;
+        // First component carries bundle price; rest carry 0 (price already covered)
+        lineItems.push({
+          product_id: comp.productId,
+          quantity: comp.componentQty * item.quantity,
+          price: ci === 0 ? bundle.priceKobo * item.quantity : 0,
+          name: comp.name,
+        });
+        if (ci === 0) bundlePriceOverrides.set(expandedId, bundle.priceKobo * item.quantity);
+      }
+    } else {
+      lineItems.push(item);
+    }
+  }
+
+  if (lineItems.length === 0) {
+    return c.json({ success: false, error: 'Cart is empty after bundle expansion' }, 400);
+  }
+
+  void bundlePriceOverrides; // computed; stock deduction already uses component quantities
 
   // Rate limit: 10 checkouts/min per session_id (PCI hardening)
   if (body.session_id) {
@@ -1660,29 +1721,42 @@ app.post(
     ).bind(poId, tenantId).first<{ id: string }>();
     if (!po) return c.json({ success: false, error: 'Purchase order not found or already received' }, 404);
 
+    // Fetch ordered quantities to detect overage (received > ordered → allowed but logged distinctly)
+    const orderedMap = new Map<string, number>();
+    const { results: orderedItems } = await c.env.DB.prepare(
+      `SELECT productId, quantityOrdered FROM purchase_order_items WHERE poId = ?`,
+    ).bind(poId).all<{ productId: string; quantityOrdered: number }>();
+    for (const oi of orderedItems ?? []) orderedMap.set(oi.productId, oi.quantityOrdered);
+
     const now = Date.now();
-    const stmts = body.items.flatMap(it => [
-      c.env.DB.prepare(
-        `UPDATE products SET quantity = quantity + ? WHERE id = ? AND tenant_id = ?`,
-      ).bind(it.receivedQty, it.productId, tenantId),
-      c.env.DB.prepare(
-        `UPDATE purchase_order_items SET quantityReceived = ? WHERE poId = ? AND productId = ?`,
-      ).bind(it.receivedQty, poId, it.productId),
-      c.env.DB.prepare(
-        `INSERT INTO stock_adjustment_log (id, tenant_id, product_id, previous_qty, new_qty, delta, reason, created_at)
-         SELECT ?, ?, ?, quantity - ?, quantity, ?, 'purchase_order_received', ?
-         FROM products WHERE id = ? AND tenant_id = ?`,
-      ).bind(
-        `sal_po_${now}_${Math.random().toString(36).slice(2, 6)}`,
-        tenantId, it.productId, it.receivedQty, it.receivedQty, now, it.productId, tenantId,
-      ),
-    ]);
+    const stmts = body.items.flatMap(it => {
+      const qtyOrdered = orderedMap.get(it.productId) ?? it.receivedQty;
+      const isOverage = it.receivedQty > qtyOrdered;
+      const reason = isOverage ? 'purchase_order_overage' : 'purchase_order_received';
+      return [
+        c.env.DB.prepare(
+          `UPDATE products SET quantity = quantity + ? WHERE id = ? AND tenant_id = ?`,
+        ).bind(it.receivedQty, it.productId, tenantId),
+        c.env.DB.prepare(
+          `UPDATE purchase_order_items SET quantityReceived = ? WHERE poId = ? AND productId = ?`,
+        ).bind(it.receivedQty, poId, it.productId),
+        c.env.DB.prepare(
+          `INSERT INTO stock_adjustment_log (id, tenant_id, product_id, previous_qty, new_qty, delta, reason, created_at)
+           SELECT ?, ?, ?, quantity - ?, quantity, ?, ?, ?
+           FROM products WHERE id = ? AND tenant_id = ?`,
+        ).bind(
+          `sal_po_${now}_${Math.random().toString(36).slice(2, 6)}`,
+          tenantId, it.productId, it.receivedQty, it.receivedQty, reason, now, it.productId, tenantId,
+        ),
+      ];
+    });
     stmts.push(
       c.env.DB.prepare(`UPDATE purchase_orders SET status = 'RECEIVED', receivedAt = ? WHERE id = ? AND tenantId = ?`).bind(new Date().toISOString(), poId, tenantId),
     );
     await c.env.DB.batch(stmts);
 
-    return c.json({ success: true, data: { id: poId, status: 'RECEIVED', itemsReceived: body.items.length } });
+    const overageItems = body.items.filter(it => it.receivedQty > (orderedMap.get(it.productId) ?? it.receivedQty));
+    return c.json({ success: true, data: { id: poId, status: 'RECEIVED', itemsReceived: body.items.length, overageItems: overageItems.length > 0 ? overageItems : undefined } });
   },
 );
 

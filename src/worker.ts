@@ -45,6 +45,7 @@ export interface Env {
   PREMBLY_API_KEY?: string;             // Prembly x-api-key (P09 CAC)
   PREMBLY_APP_ID?: string;              // Prembly app-id (P09 CAC)
   ADMIN_PHONE?: string;                 // Marketplace admin WhatsApp/SMS for MANUAL_REVIEW alerts (P09)
+  ASSETS?: Fetcher;                     // CF Pages static assets binding for SPA pass-through (P13-T03)
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -155,7 +156,10 @@ app.get('/products/:slug', async (c) => {
   const isCrawler = /bot|crawl|slurp|spider|facebookexternalhit|whatsapp|telegram/i.test(ua);
 
   if (!isCrawler) {
-    return c.notFound();
+    // Pass non-bot requests through to the SPA static assets handler (CF Pages ASSETS binding).
+    // If ASSETS is not configured (dev mode), serve a minimal redirect to the SPA root.
+    if (c.env.ASSETS) return c.env.ASSETS.fetch(c.req.raw);
+    return c.html(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><script>window.location.replace('/');</script></head><body></body></html>`);
   }
 
   const tenantId = c.req.header('x-tenant-id') ?? 'tnt_demo';

@@ -1,0 +1,162 @@
+
+You are a senior QA engineer performing a complete verification of Phase P13 (Advanced & Expansion Features) in the webwaka-commerce repository.
+
+This is the final phase. Verify every feature systematically. Do not skip any task.
+
+## Step 1 — Read Everything First
+Read completely:
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/pos/api.ts
+- src/modules/pos/ui.tsx
+- src/worker.ts
+- migrations/0012_slugs.sql (or equivalent)
+- public/sw.js
+
+## Step 2 — Verify AI Product Listing Optimisation (P13-T01)
+- [ ] POST /api/multi-vendor/products/ai-suggest endpoint exists in multi-vendor/api.ts
+- [ ] Uses createAiClient from @webwaka/core — NOT direct fetch to OpenAI or Anthropic
+- [ ] OPENROUTER_API_KEY comes from env — NOT hardcoded
+- [ ] Model used is a value from OpenRouter (e.g. 'openai/gpt-4o-mini') — NOT an OpenAI or Anthropic direct model string
+- [ ] Response is JSON: { title: string, description: string, tags: string[] }
+- [ ] In vendor product editor UI: "Improve with AI" button exists
+- [ ] On click: spinner shown while waiting for AI response
+- [ ] Suggestion card appears with Accept/Dismiss actions
+- [ ] Accept: populates form fields with AI suggestion
+- [ ] Dismiss: removes suggestion card, form unchanged
+- [ ] EDGE CASE: AI API returns an error → show error message, do not crash the form
+
+## Step 3 — Verify Subscription / Recurring Orders (P13-T02)
+- [ ] POST /api/single-vendor/subscriptions: creates subscription with paystackToken
+- [ ] PATCH /api/single-vendor/subscriptions/:id: accepts status PAUSED/ACTIVE/CANCELLED
+- [ ] Daily cron in worker.ts: queries subscriptions WHERE status='ACTIVE' AND DATE(nextChargeDate) <= DATE('now')
+- [ ] For each: attempts Paystack charge using stored token (POST /transaction/charge_authorization)
+- [ ] On success: creates a new order, updates nextChargeDate, publishes DELIVERY event
+- [ ] On first failure: nextChargeDate stays the same (retry tomorrow)
+- [ ] On third consecutive failure: status = 'CANCELLED', WhatsApp notification sent
+- [ ] Consecutive failure tracking: needs a failedAttempts column on subscriptions — verify it exists in schema, add if missing
+- [ ] EDGE CASE: paystackToken is expired → charge fails gracefully, no unhandled exception
+
+## Step 4 — Verify OG Meta Edge Rendering (P13-T03)
+- [ ] In src/worker.ts: route GET /products/:slug exists BEFORE the SPA catch-all route
+- [ ] User-Agent detection for crawlers: checks for bot, crawl, spider, facebookexternalhit, whatsapp, telegram (case-insensitive)
+- [ ] For crawlers: returns HTML with og:title, og:description, og:image, og:url, twitter:card, and a JavaScript redirect
+- [ ] For non-crawlers: passes through to the SPA (ASSETS.fetch or equivalent)
+- [ ] products table has slug column (verify in migration 0012)
+- [ ] Existing products have slugs populated (UPDATE products SET slug = ... WHERE slug IS NULL)
+- [ ] UNIQUE index on (tenantId, slug) exists
+- [ ] OG description is truncated to 150 characters (no truncation = risk of large HTML)
+- [ ] EDGE CASE: product slug not found → returns a 404 response, not a 500
+
+## Step 5 — Verify Flash Sales Engine (P13-T04)
+- [ ] flash_sales table existed from P03 migration — verify it was actually created
+- [ ] Scheduled cron (every 5 minutes or most frequent available): activates eligible flash sales
+- [ ] Scheduled cron: deactivates expired flash sales
+- [ ] At checkout: for each cart item, checks if an active flash_sale exists for the productId
+- [ ] If yes: uses salePriceKobo instead of regular products.priceKobo
+- [ ] salePriceKobo is validated to be <= originalPriceKobo (cannot flash sale at a higher price)
+- [ ] quantityLimit is enforced: if quantitySold >= quantityLimit, flash sale is treated as inactive for that product
+- [ ] Storefront: products with active flash_sales show sale price with crossed-out original price
+- [ ] Countdown timer renders correctly and counts down to endTime
+- [ ] EDGE CASE: flash sale expires mid-checkout (user had item in cart but sale ended before payment) → regular price applied at checkout
+
+## Step 6 — Verify Cash Drawer Expenses (P13-T05)
+- [ ] POST /api/pos/expenses: inserts into session_expenses (requireRole: STAFF or ADMIN)
+- [ ] In shift close handler: SELECT SUM(amountKobo) from session_expenses WHERE sessionId = ?
+- [ ] Total expenses subtracted from expectedCashBalance in Z-report
+- [ ] expenseBreakdown array returned in Z-report response
+- [ ] EDGE CASE: session with no expenses → expenses = 0, Z-report unaffected
+
+## Step 7 — Verify Product Bundles (P13-T06)
+- [ ] POST /api/pos/bundles: creates bundle with bundle_items
+- [ ] GET /api/pos/bundles: returns active bundles with component details
+- [ ] At POS checkout: if item is a bundle, resolves to component items for stock deduction
+- [ ] Each component item's stock is deducted independently
+- [ ] If ANY component is out of stock: entire bundle cannot be purchased (atomic check)
+- [ ] Bundle priceKobo is used — NOT the sum of component prices
+
+## Step 8 — Verify NDPR Data Export and Deletion (P13-T07)
+- [ ] POST /api/single-vendor/account/export: requires customer authentication
+- [ ] Rate limited to 1 request per 30 days per customer (uses checkRateLimit from @webwaka/core)
+- [ ] Returns all customer data: profile, orders, wishlist, subscriptions, loyalty
+- [ ] DELETE /api/single-vendor/account: requires customer authentication
+- [ ] Anonymises: name = 'Deleted User', phone = 'deleted_' + id, email = NULL, deletedAt = NOW()
+- [ ] Does NOT delete order records (preserved for merchant accounting)
+- [ ] Deletes wishlist records (optional per NDPR)
+- [ ] Cancels active subscriptions before deletion
+- [ ] Confirmation SMS sent to the phone number BEFORE the phone is anonymised (order matters)
+- [ ] EDGE CASE: exporting twice within 30 days → HTTP 429 rate limited, not a second export
+
+## Step 9 — Verify USSD Transfer Confirmation (P13-T08)
+- [ ] Paystack webhook endpoint exists: POST /webhooks/paystack
+- [ ] Signature validation: HMAC SHA512 of raw request body using PAYSTACK_SECRET_KEY
+- [ ] Invalid signature: HTTP 401 returned immediately
+- [ ] On event type 'charge.success' AND channel = 'bank_transfer': finds matching POS order by reference
+- [ ] Updates payment leg status to 'CONFIRMED'
+- [ ] If all payment legs confirmed: updates order status to 'COMPLETED'
+- [ ] Sets KV key 'transfer_confirmed:${reference}' for UI polling
+- [ ] POS checkout UI polls GET /api/pos/payment-status?reference= every 3 seconds when awaiting transfer
+
+## Step 10 — Verify Remaining Batch (P13-T09)
+Verify each sub-task is implemented:
+
+A. COD with Deposit (SV-E17):
+- [ ] tenantConfig has codDepositPercent field
+- [ ] At SV checkout with paymentMethod='COD': Paystack charge = depositPercent% of total
+- [ ] Order status after COD checkout: 'AWAITING_DELIVERY' (not COMPLETED)
+- [ ] EDGE CASE: codDepositPercent = 0 → no Paystack charge, full COD
+
+B. Social Commerce Import (MV-E17):
+- [ ] POST /api/multi-vendor/products/import-csv exists
+- [ ] Accepts CSV with columns: name, description, price, image_url, category
+- [ ] Creates products in bulk with correct tenantId and vendorId
+- [ ] Returns { imported: N, failed: M, errors: [...] }
+- [ ] EDGE CASE: malformed CSV row → skipped with error logged, other rows still imported
+
+C. Vendor Referral (MV-E19):
+- [ ] referredBy column on vendors table (add to migration if missing)
+- [ ] On first vendor payout: checks if vendor was referred
+- [ ] If referred: INSERT into commission_rules with 100bps reduction for referrer, 90-day window
+- [ ] referral chain does not apply recursively (only 1 level of referral reward)
+
+D. Bulk/Wholesale Pricing (MV-E20):
+- [ ] product_price_tiers table exists (add migration if missing): productId, tenantId, vendorId, minQty, priceKobo
+- [ ] At checkout: for each item, SELECT priceKobo FROM product_price_tiers WHERE productId = ? AND minQty <= cartQty ORDER BY minQty DESC LIMIT 1
+- [ ] If tier found: use tier price; else use regular price
+- [ ] EDGE CASE: quantity exactly equals minQty threshold → tier price applied (inclusive boundary)
+
+E. Product Availability Scheduling (SV-E13):
+- [ ] availableFrom, availableUntil, availableDays columns on products (add migration if missing)
+- [ ] At checkout: validates product is available at current time and day
+- [ ] Day-of-week bitmask: bit 0 = Monday, bit 6 = Sunday (document the convention)
+- [ ] EDGE CASE: availableFrom and availableUntil are both NULL → product always available
+
+F. Supplier and PO Management (POS-E14):
+- [ ] GET/POST /api/pos/suppliers CRUD endpoints exist
+- [ ] GET/POST /api/pos/purchase-orders endpoints exist
+- [ ] POST /api/pos/purchase-orders/:id/receive: updates product quantities and inserts stock_adjustment_log
+- [ ] EDGE CASE: receiving more than ordered quantity → allowed but logged as overage
+
+G. Currency Rounding (POS-E18):
+- [ ] tenantConfig has cashRoundingKobo field (optional, default 0 = no rounding)
+- [ ] For cash payment legs: roundedTotal = Math.ceil(totalKobo / cashRoundingKobo) * cashRoundingKobo
+- [ ] If cashRoundingKobo = 0 or null: no rounding applied
+- [ ] ROUNDING_ADJUSTMENT ledger entry inserted for the difference amount
+- [ ] POS checkout shows both exact and rounded amounts when rounding is active
+
+H. Product Image Offline Cache (POS-E20):
+- [ ] public/sw.js: contains a cache-first strategy for product thumbnail URLs
+- [ ] Strategy matches image URLs relevant to the POS (e.g. same-origin /images/ path or cdn domain)
+- [ ] Cache is given a name and has a size limit to prevent unbounded growth
+
+## Step 11 — Full TypeScript and Test Check
+Run: npx tsc --noEmit — fix all errors.
+Run: npm test — fix all failures.
+Check public/sw.js for any syntax errors (it is not TypeScript-compiled — review manually).
+
+## Step 12 — Fix All Issues
+Fix every issue found across all sub-tasks.
+
+## Step 13 — Completion Confirmation
+"P13 QA COMPLETE — AI product optimisation via OpenRouter, subscription recurring billing, OG meta edge rendering for social sharing, flash sales engine with cron lifecycle, cash drawer expenses in Z-report, product bundles with component stock deduction, NDPR data export/deletion, USSD transfer webhook confirmation, COD with deposit, CSV product import, vendor referral with commission reduction, bulk pricing tiers, product availability scheduling, supplier PO management, currency rounding, product image service worker cache. All edge cases verified. TypeScript clean. Tests passing."
+``

@@ -3702,6 +3702,52 @@ app.post('/vendor/apply-referral', requireRole(['VENDOR']), async (c) => {
   return c.json({ success: true, data: { message: 'Referral applied. Referrer gets 1% commission reduction for 90 days.' } });
 });
 
+// ── MV-E20: Flash Sales — create a flash sale (admin only, validates price) ────
+app.post('/flash-sales', requireRole(['TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    productId: string;
+    salePriceKobo: number;
+    startTime: string;
+    endTime: string;
+    quantityLimit: number;
+  }>();
+
+  if (!body.productId || !body.startTime || !body.endTime) {
+    return c.json({ success: false, error: 'productId, startTime, endTime required' }, 400);
+  }
+  if (body.quantityLimit != null && body.quantityLimit < 1) {
+    return c.json({ success: false, error: 'quantityLimit must be >= 1' }, 400);
+  }
+
+  // Fetch the product's original price for validation
+  const product = await c.env.DB.prepare(
+    `SELECT id, price_kobo AS priceKobo FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+  ).bind(body.productId, tenantId).first<{ id: string; priceKobo: number }>();
+  if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  // QA requirement: salePriceKobo must be <= originalPriceKobo (cannot flash-sale at a higher price)
+  if (body.salePriceKobo > product.priceKobo) {
+    return c.json({ success: false, error: `salePriceKobo (${body.salePriceKobo}) cannot exceed originalPriceKobo (${product.priceKobo})` }, 400);
+  }
+  if (body.salePriceKobo < 0) {
+    return c.json({ success: false, error: 'salePriceKobo must be >= 0' }, 400);
+  }
+
+  const id = `fs_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const startIso = new Date(body.startTime).toISOString().replace('T', ' ').slice(0, 19);
+  const endIso = new Date(body.endTime).toISOString().replace('T', ' ').slice(0, 19);
+  const active = startIso <= now && now < endIso ? 1 : 0;
+
+  await c.env.DB.prepare(
+    `INSERT INTO flash_sales (id, tenantId, productId, salePriceKobo, originalPriceKobo, startTime, endTime, quantityLimit, quantitySold, active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+  ).bind(id, tenantId, body.productId, body.salePriceKobo, product.priceKobo, startIso, endIso, body.quantityLimit ?? 9999, active).run();
+
+  return c.json({ success: true, data: { id, productId: body.productId, salePriceKobo: body.salePriceKobo, originalPriceKobo: product.priceKobo, startTime: startIso, endTime: endIso, active: active === 1 } }, 201);
+});
+
 // ── MV-E20: Flash Sales — list active flash sales for a tenant ────────────────
 app.get('/flash-sales', async (c) => {
   const tenantId = getTenantId(c);
@@ -3749,7 +3795,9 @@ app.get('/products/:id/availability', async (c) => {
 
   const now = new Date();
   const nowIso = now.toISOString();
-  const dayBit = 1 << now.getDay(); // bit 0=Sun
+  // availableDays bitmask convention: bit 0 = Monday, bit 6 = Sunday
+  // Formula: (getDay() + 6) % 7 → Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+  const dayBit = 1 << ((now.getDay() + 6) % 7);
   const fromOk = !product.availableFrom || nowIso >= product.availableFrom;
   const untilOk = !product.availableUntil || nowIso <= product.availableUntil;
   const dayOk = product.availableDays == null || (product.availableDays & dayBit) !== 0;
@@ -3760,7 +3808,8 @@ app.get('/products/:id/availability', async (c) => {
     for (let d = 1; d <= 7; d++) {
       const candidate = new Date(now);
       candidate.setDate(candidate.getDate() + d);
-      if ((product.availableDays & (1 << candidate.getDay())) !== 0) {
+      const candidateBit = 1 << ((candidate.getDay() + 6) % 7);
+      if ((product.availableDays & candidateBit) !== 0) {
         nextAvailable = candidate.toISOString().slice(0, 10);
         break;
       }
