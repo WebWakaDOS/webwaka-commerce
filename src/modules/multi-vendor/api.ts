@@ -25,6 +25,7 @@
 import { Hono } from 'hono';
 import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider, createAiClient } from '@webwaka/core';
 import { publishEvent } from '../../core/event-bus';
+import { notifyOrderPaid, notifyPayoutProcessed } from '../../core/central-mgmt';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
 import { getJwtSecret } from '../../utils/jwt-secret';
 import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
@@ -2246,6 +2247,22 @@ app.post('/paystack/webhook', async (c) => {
            WHERE tenant_id = ? AND payment_reference = ? AND status = 'held' AND hold_until <= ?`
         ).bind(now, tenantId, reference, now).run();
       }
+      // Notify central-mgmt ledger of paid order (non-fatal)
+      if (tenantId && reference) {
+        const orderRow = await c.env.DB.prepare(
+          `SELECT id, total_amount FROM orders WHERE payment_reference = ? AND tenant_id = ? LIMIT 1`
+        ).bind(reference, tenantId).first<{ id: string; total_amount: number }>();
+        if (orderRow && Number.isInteger(orderRow.total_amount) && orderRow.total_amount > 0) {
+          await notifyOrderPaid(
+            c.env,
+            orderRow.id,
+            tenantId,
+            orderRow.total_amount,
+            500, // 5% platform commission
+            reference,
+          ).catch((err) => console.error('[commerce] central-mgmt order.paid notify failed:', err));
+        }
+      }
     } else if (event === 'transfer.success') {
       const transferCode = data.transfer_code as string | undefined;
       if (transferCode) {
@@ -2253,6 +2270,20 @@ app.post('/paystack/webhook', async (c) => {
           `UPDATE payout_requests SET status = 'paid', processed_at = ?, updated_at = ?
            WHERE paystack_transfer_code = ?`
         ).bind(now, now, transferCode).run();
+        // Notify central-mgmt ledger of processed payout (non-fatal)
+        const payoutRow = await c.env.DB.prepare(
+          `SELECT id, vendor_id, tenant_id, amount_kobo FROM payout_requests WHERE paystack_transfer_code = ? LIMIT 1`
+        ).bind(transferCode).first<{ id: string; vendor_id: string; tenant_id: string; amount_kobo: number }>();
+        if (payoutRow && Number.isInteger(payoutRow.amount_kobo) && payoutRow.amount_kobo > 0) {
+          await notifyPayoutProcessed(
+            c.env,
+            payoutRow.id,
+            payoutRow.vendor_id,
+            payoutRow.tenant_id ?? tenantId ?? '',
+            payoutRow.amount_kobo,
+            transferCode,
+          ).catch((err) => console.error('[commerce] central-mgmt payout notify failed:', err));
+        }
       }
     } else if (event === 'transfer.failed' || event === 'transfer.reversed') {
       const transferCode = data.transfer_code as string | undefined;
