@@ -7,42 +7,6 @@ compatibility_date = "2024-03-14"
 [triggers]
 crons = ["0 * * * *", "0 7 * * *"]
 
-# ─── Staging Environment ──────────────────────────────────────────────────────
-[env.staging]
-name = "webwaka-commerce-api-staging"
-workers_dev = true
-
-kv_namespaces = [
-  { binding = "TENANT_CONFIG",  id = "018ac3a580104b8b8868712919be71bd" },
-  { binding = "EVENTS",         id = "ee8c49024b2d43a98c54962dba43f15b" },
-  { binding = "SESSIONS_KV",    id = "bde8befc71da40c5a5979ee35830022a" },
-  { binding = "CATALOG_CACHE",  id = "cc3f9d1e4a7b41e0891f2c3d5e6f7a8b" }
-]
-
-[[env.staging.d1_databases]]
-binding = "DB"
-database_name = "webwaka-commerce-db-staging"
-database_id   = "f39bc175-4485-482a-ae87-b1195ead0ef3"
-
-# CF Queues — event bus (P0-T01)
-# Create before deploy: wrangler queues create webwaka-commerce-events-staging
-# Staging queue producer
-[[env.staging.queues.producers]]
-binding = "COMMERCE_EVENTS"
-queue   = "webwaka-commerce-events-staging"
-
-# Staging queue consumer
-[[env.staging.queues.consumers]]
-queue               = "webwaka-commerce-events-staging"
-max_batch_size      = 10
-max_batch_timeout   = 5
-max_retries         = 3
-dead_letter_queue   = "webwaka-commerce-events-dlq-staging"
-
-# Staging secrets (set via: wrangler secret put <NAME> --env staging)
-# PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET, ALLOWED_ORIGINS,
-# OPENROUTER_API_KEY, KYCSALT
-
 # ─── Production Environment ───────────────────────────────────────────────────
 [env.production]
 name = "webwaka-commerce-api-prod"
