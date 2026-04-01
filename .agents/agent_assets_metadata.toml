@@ -24,3 +24,9 @@ id = "yOX9VyK3ZDUxC-7xmf7P0"
 uri = "file://docs/QA_PROMPTS.md"
 type = "text"
 title = "WebWaka Commerce — QA Verification Prompts (Copy-Paste Per Phase)"
+
+[[outputs]]
+id = "7_C54qaifr0n7hQAfd-ge"
+uri = "file://docs/WebWaka_Commerce_P14_Research_Report.md"
+type = "text"
+title = "WebWaka Commerce P14 — Deep Research Report (Architecture · Nigeria Market · 60 Enhancements)"
