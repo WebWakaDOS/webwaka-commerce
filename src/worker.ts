@@ -46,6 +46,8 @@ export interface Env {
   PREMBLY_APP_ID?: string;              // Prembly app-id (P09 CAC)
   ADMIN_PHONE?: string;                 // Marketplace admin WhatsApp/SMS for MANUAL_REVIEW alerts (P09)
   ASSETS?: Fetcher;                     // CF Pages static assets binding for SPA pass-through (P13-T03)
+  CENTRAL_MGMT_URL?: string;            // Central Management service URL for ledger events (P10.1)
+  INTER_SERVICE_SECRET?: string;        // Shared secret for inter-service authentication (P10.1)
 }
 
 const app = new Hono<{ Bindings: Env }>();
