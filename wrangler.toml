@@ -42,7 +42,11 @@ dead_letter_queue   = "webwaka-commerce-events-dlq-prod"
 # Production secrets (set via: wrangler secret put <NAME> --env production)
 # PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET,
 # ALLOWED_ORIGINS (e.g. "https://app.webwaka.com,https://pos.webwaka.com"),
-# OPENROUTER_API_KEY, KYCSALT
+# OPENROUTER_API_KEY, KYCSALT,
+# INTER_SERVICE_SECRET (T-FND-03): Shared secret for Service Binding auth with SA v2.
+#   Must match the INTER_SERVICE_SECRET set in webwaka-super-admin-v2.
+#   Set with: wrangler secret put INTER_SERVICE_SECRET --env production
+#   Generate a strong secret: openssl rand -hex 32
 
 # ─── Local Dev KV Seed (P0-T07) ───────────────────────────────────────────────
 # After `wrangler dev`, seed the demo tenant into TENANT_CONFIG KV:

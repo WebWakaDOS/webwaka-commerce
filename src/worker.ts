@@ -54,7 +54,10 @@ const app = new Hono<{ Bindings: Env }>();
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 // P0-T08: dynamic origin allowlist from env (replaced '*' hardcode)
-app.use('*', cors({
+// BUG-03 FIX (T-FND-03 QA): CORS is scoped to /api/*, /health, and /sitemap.xml only.
+// /internal/* routes are intentionally excluded — they are reachable exclusively
+// via Cloudflare Service Binding and must never be exposed to browser origins.
+const corsMiddleware = cors({
   origin: (origin, c) => {
     const allowed = (c.env?.ALLOWED_ORIGINS ?? '*').split(',').map((s: string) => s.trim());
     if (allowed.includes('*')) return origin; // dev mode / unconfigured
@@ -63,7 +66,11 @@ app.use('*', cors({
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Tenant-ID', 'x-tenant-id'],
   credentials: true,
-}));
+});
+app.use('/api/*', corsMiddleware);
+app.use('/health', corsMiddleware);
+app.use('/sitemap.xml', corsMiddleware);
+app.use('/webhooks/*', corsMiddleware);
 
 // ── Health check (public — no auth required) ─────────────────────────────────
 app.get('/health', (c) => {
@@ -301,31 +308,58 @@ app.post('/internal/provision-tenant', async (c) => {
       )
     }
 
-    // Build the canonical tenant configuration following the Tenant-as-Code schema
-    // (COMMERCE_TENANT_ONBOARDING_GUIDE.md, Section 1: Tenant JSON Templates)
+    // BUG-01 FIX (T-FND-03 QA): Build a TenantConfig that exactly matches the interface
+    // expected by createTenantResolverMiddleware (src/core/tenant/index.ts).
+    // The original implementation used a mismatched schema (id, name, type, modules, etc.)
+    // which caused all provisioned tenants to be rejected with 404 on any /api/* route.
+    //
+    // Canonical TenantConfig fields:
+    //   tenantId, domain, enabledModules (string[]), branding, permissions,
+    //   featureFlags, inventorySyncPreferences (optional)
+    const resolvedModules = modules as Record<string, { enabled?: boolean }> | undefined;
+    const enabledModules: string[] = [];
+    if (resolvedModules) {
+      if (resolvedModules.pos?.enabled !== false) enabledModules.push('retail_pos');
+      if (resolvedModules.single_vendor?.enabled !== false) enabledModules.push('single_vendor_storefront');
+      if (resolvedModules.multi_vendor?.enabled === true) enabledModules.push('multi_vendor_marketplace');
+    } else {
+      // Default: enable POS and single-vendor for all tenant types
+      enabledModules.push('retail_pos', 'single_vendor_storefront');
+      if (type === 'multi_vendor') enabledModules.push('multi_vendor_marketplace');
+    }
+
     const tenantConfig = {
-      id: tenantId,
-      name,
-      type,
+      // Required fields — must match TenantConfig interface exactly
+      tenantId,
       domain: domain ?? `${tenantId}.webwaka.app`,
-      currency: currency ?? 'NGN',
-      timezone: timezone ?? 'Africa/Lagos',
-      modules: modules ?? {
-        pos: { enabled: true, offline_mode: true },
-        single_vendor: { enabled: true, payment_gateway: 'paystack' },
+      enabledModules,
+      branding: {
+        primaryColor: theme?.primaryColor ?? '#2563eb',
+        logoUrl: theme?.logoUrl ?? `https://assets.webwaka.com/${tenantId}/logo.png`,
       },
-      syncPreferences: syncPreferences ?? {
+      permissions: {
+        admin: ['*'],
+        cashier: ['pos.*'],
+        customer: ['storefront.*'],
+      },
+      featureFlags: {
+        ai_recommendations: false,
+        offline_mode: true,
+        loyalty_program: false,
+      },
+      // Optional fields
+      inventorySyncPreferences: (syncPreferences as {
+        sync_pos_to_single_vendor: boolean;
+        sync_pos_to_multi_vendor: boolean;
+        sync_single_vendor_to_multi_vendor: boolean;
+        conflict_resolution: 'last_write_wins' | 'manual' | 'version_based';
+      } | undefined) ?? {
         sync_pos_to_single_vendor: true,
         sync_pos_to_multi_vendor: false,
         sync_single_vendor_to_multi_vendor: false,
-        conflict_resolution: 'last_write_wins',
+        conflict_resolution: 'last_write_wins' as const,
       },
-      theme: theme ?? {
-        primaryColor: '#2563eb',
-        logoUrl: `https://assets.webwaka.com/${tenantId}/logo.png`,
-      },
-      provisionedAt: Date.now(),
-    }
+    };
 
     // Atomically write tenant configuration to TENANT_CONFIG KV.
     // Key format: `tenant:{tenantId}` — matches createTenantResolverMiddleware lookup.
