@@ -1,6 +1,8 @@
 -- WebWaka Commerce Suite — Migration 008
--- COM-3 MV-4: Vendor Payouts, Settlement Escrow, Delivery Zones (Nigeria States/LGAs)
+-- COM-3 MV-4: Vendor Payouts, Settlement Escrow
 -- Run after 007_mv_orders.sql.
+-- NOTE: Delivery zones were extracted to webwaka-logistics (T-CVC-01).
+-- The delivery_zones table now lives in webwaka-logistics/migrations/002_delivery_zones.sql.
 -- All monetary values in kobo. Escrow hold: T+7 default (settlement_hold_days on vendors table).
 
 -- ════════════════════════════════════════════════════════════════════════════
@@ -64,30 +66,9 @@ CREATE INDEX IF NOT EXISTS idx_payout_requests_transfer
   WHERE paystack_transfer_code IS NOT NULL;
 
 -- ════════════════════════════════════════════════════════════════════════════
--- DELIVERY ZONES — Per-vendor Nigeria state/LGA shipping configuration
--- Supports: base_fee, per_kg_fee, free_above threshold, estimated delivery days.
--- Nigeria-First: state names match NIPOST/NBS naming convention.
--- ════════════════════════════════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS delivery_zones (
-  id                   TEXT PRIMARY KEY,          -- dz_{ts}_{rand}
-  tenant_id            TEXT NOT NULL,
-  vendor_id            TEXT NOT NULL,
-  state                TEXT NOT NULL,             -- e.g. 'Lagos', 'Abuja FCT', 'Kano', 'Rivers'
-  lga                  TEXT,                      -- LGA for granular rates (NULL = entire state)
-  base_fee             INTEGER NOT NULL DEFAULT 0,     -- kobo
-  per_kg_fee           INTEGER NOT NULL DEFAULT 0,     -- kobo per kg
-  free_above           INTEGER,                   -- kobo: free delivery when order_value >= this
-  is_active            INTEGER NOT NULL DEFAULT 1,
-  estimated_days_min   INTEGER NOT NULL DEFAULT 1,
-  estimated_days_max   INTEGER NOT NULL DEFAULT 3,
-  created_at           INTEGER NOT NULL,
-  updated_at           INTEGER NOT NULL,
-  UNIQUE(tenant_id, vendor_id, state, lga)       -- one zone per vendor/state/LGA combination
-);
-
-CREATE INDEX IF NOT EXISTS idx_delivery_zones_lookup
-  ON delivery_zones(tenant_id, vendor_id, state, is_active);
-
+-- DELIVERY ZONES — REMOVED (T-CVC-01)
+-- Extracted to webwaka-logistics. Commerce queries Logistics via Service Binding.
+-- See: webwaka-logistics/migrations/002_delivery_zones.sql
 -- ════════════════════════════════════════════════════════════════════════════
 -- PAYSTACK WEBHOOK LOG — Idempotency + audit trail for Paystack events
 -- ════════════════════════════════════════════════════════════════════════════

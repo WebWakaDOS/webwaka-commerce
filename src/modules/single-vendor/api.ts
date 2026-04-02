@@ -1275,21 +1275,21 @@ app.get('/shipping/estimate', async (c) => {
       const data = await resp.json<{ success: boolean; data: Record<string, unknown> }>();
       if (data.success && data.data) {
         // Normalise response: map base_fee -> fee_kobo for backward compatibility
-        return c.json({
-          success: true,
-          data: {
-            state, lga: lga ?? null,
-            fee_kobo: (data.data.total_fee as number) ?? 0,
-            base_fee: (data.data.base_fee as number) ?? 0,
-            per_kg_fee: (data.data.per_kg_fee as number) ?? 0,
-            weight_fee: (data.data.weight_fee as number) ?? 0,
-            is_free: (data.data.is_free as boolean) ?? false,
-            estimated_days_min: (data.data.estimated_days_min as number) ?? 1,
-            estimated_days_max: (data.data.estimated_days_max as number) ?? 7,
-            is_estimate: true,
-            source: 'logistics',
-          },
-        });
+        // Forward note field when no zone is configured for the region (T-CVC-01 QA)
+        const responseData: Record<string, unknown> = {
+          state, lga: lga ?? null,
+          fee_kobo: (data.data.total_fee as number) ?? 0,
+          base_fee: (data.data.base_fee as number) ?? 0,
+          per_kg_fee: (data.data.per_kg_fee as number) ?? 0,
+          weight_fee: (data.data.weight_fee as number) ?? 0,
+          is_free: (data.data.is_free as boolean) ?? false,
+          estimated_days_min: (data.data.estimated_days_min as number) ?? 1,
+          estimated_days_max: (data.data.estimated_days_max as number) ?? 7,
+          is_estimate: true,
+          source: 'logistics',
+        };
+        if (data.data.note) responseData.note = data.data.note;
+        return c.json({ success: true, data: responseData });
       }
     } catch (err) {
       console.error('[SV] Logistics Service Binding error:', err);

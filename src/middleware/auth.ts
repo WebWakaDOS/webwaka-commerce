@@ -29,7 +29,7 @@ export const jwtAuthMiddleware = coreJwtAuthMiddleware({
     { method: 'POST', path: '/api/single-vendor/checkout' },
     { method: 'GET',  path: '/api/single-vendor/orders/:id/track' },
     { method: 'GET',  path: '/api/single-vendor/shipping/estimate' },
-    { method: 'GET',  path: '/api/single-vendor/delivery-zones' },
+    // NOTE: /api/single-vendor/delivery-zones removed (T-CVC-01) — returns 410 Gone
     { method: 'POST', path: '/api/single-vendor/auth/login' },
     { method: 'POST', path: '/api/single-vendor/auth/request-otp' },
     { method: 'POST', path: '/api/single-vendor/auth/verify-otp' },
