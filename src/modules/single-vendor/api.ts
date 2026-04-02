@@ -1234,98 +1234,72 @@ app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
   }
 });
 
-// ── GET /delivery-zones — Public delivery zone list for SV tenant ─────────────
-app.get('/delivery-zones', async (c) => {
-  const tenantId = getTenantId(c);
-  try {
-    const { results } = await c.env.DB.prepare(
-      `SELECT id, state, lga, fee_kobo, estimated_days_min, estimated_days_max
-       FROM delivery_zones
-       WHERE tenant_id = ? AND is_active = 1 AND (vendor_id IS NULL OR vendor_id = '')
-       ORDER BY state ASC, lga ASC`,
-    ).bind(tenantId).all();
-    return c.json({ success: true, data: { zones: results } });
-  } catch (err) {
-    console.error('[SV] route error:', err);
-    return c.json({ success: true, data: { zones: [] } });
-  }
-});
+// ── GET /delivery-zones — REMOVED (T-CVC-01) ─────────────────────────────────
+// Delivery zone management has been extracted to webwaka-logistics.
+// Use the Logistics API: GET /api/delivery-zones?state=&vendor_id=
+// This stub returns a 410 Gone to prevent silent breakage.
+app.get('/delivery-zones', (c) => c.json({
+  success: false,
+  error: 'Delivery zones have been moved to the Logistics service. Use GET /api/delivery-zones on the Logistics worker.',
+  moved_to: 'webwaka-logistics /api/delivery-zones',
+}, 410));
 
-// ── POST /delivery-zones — Admin: create or update a delivery zone ─────────────
-app.post('/delivery-zones', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
-  const tenantId = getTenantId(c);
-  const body = await c.req.json<{
-    state: string; lga?: string; fee_kobo: number;
-    estimated_days_min?: number; estimated_days_max?: number; is_active?: boolean;
-  }>();
-  if (!body.state?.trim() || body.fee_kobo == null) {
-    return c.json({ success: false, error: 'state and fee_kobo are required' }, 400);
-  }
-  const now = Date.now();
-  const id = `zone_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO delivery_zones (id, tenant_id, state, lga, fee_kobo, estimated_days_min, estimated_days_max, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(
-      id, tenantId, body.state.trim(), body.lga?.trim() ?? null,
-      body.fee_kobo, body.estimated_days_min ?? 1, body.estimated_days_max ?? 7,
-      body.is_active !== false ? 1 : 0, now, now,
-    ).run();
-    return c.json({
-      success: true,
-      data: { id, state: body.state, lga: body.lga ?? null, fee_kobo: body.fee_kobo },
-    }, 201);
-  } catch (err) {
-    console.error('[SV] route error:', err);
-    return c.json({ success: false, error: 'Internal server error' }, 500);
-  }
-});
+// ── POST /delivery-zones — REMOVED (T-CVC-01) ────────────────────────────────
+// Use the Logistics API: POST /api/delivery-zones
+app.post('/delivery-zones', (c) => c.json({
+  success: false,
+  error: 'Delivery zone management has been moved to the Logistics service. Use POST /api/delivery-zones on the Logistics worker.',
+  moved_to: 'webwaka-logistics /api/delivery-zones',
+}, 410));
 
-// ── GET /shipping/estimate?state=&lga= — Shipping fee for address ──────────────
+// ── GET /shipping/estimate — Delegates to Logistics API (T-CVC-01) ───────────
+// Proxies to webwaka-logistics GET /api/delivery-zones/estimate via Service Binding.
+// Falls back gracefully if LOGISTICS_WORKER binding is not configured.
 app.get('/shipping/estimate', async (c) => {
   const tenantId = getTenantId(c);
   const state = c.req.query('state')?.trim();
   const lga = c.req.query('lga')?.trim();
+  const orderValue = c.req.query('order_value') ?? '0';
+  const weightKg = c.req.query('weight_kg') ?? '0';
   if (!state) return c.json({ success: false, error: 'state is required' }, 400);
-  try {
-    type ZoneRow = { fee_kobo: number; estimated_days_min: number; estimated_days_max: number };
-    let zone: ZoneRow | null = null;
-    // Try LGA-specific first
-    if (lga) {
-      zone = await c.env.DB.prepare(
-        `SELECT fee_kobo, estimated_days_min, estimated_days_max
-         FROM delivery_zones
-         WHERE tenant_id = ? AND state = ? AND lga = ? AND is_active = 1
-           AND (vendor_id IS NULL OR vendor_id = '') LIMIT 1`,
-      ).bind(tenantId, state, lga).first<ZoneRow>();
+  // Delegate to Logistics worker via Service Binding (T-CVC-01)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const params = new URLSearchParams({ state, order_value: orderValue, weight_kg: weightKg });
+      if (lga) params.set('lga', lga);
+      const resp = await logisticsWorker.fetch(
+        `http://internal/api/delivery-zones/estimate?${params.toString()}`,
+        { headers: { 'x-tenant-id': tenantId ?? '' } },
+      );
+      const data = await resp.json<{ success: boolean; data: Record<string, unknown> }>();
+      if (data.success && data.data) {
+        // Normalise response: map base_fee -> fee_kobo for backward compatibility
+        return c.json({
+          success: true,
+          data: {
+            state, lga: lga ?? null,
+            fee_kobo: (data.data.total_fee as number) ?? 0,
+            base_fee: (data.data.base_fee as number) ?? 0,
+            per_kg_fee: (data.data.per_kg_fee as number) ?? 0,
+            weight_fee: (data.data.weight_fee as number) ?? 0,
+            is_free: (data.data.is_free as boolean) ?? false,
+            estimated_days_min: (data.data.estimated_days_min as number) ?? 1,
+            estimated_days_max: (data.data.estimated_days_max as number) ?? 7,
+            is_estimate: true,
+            source: 'logistics',
+          },
+        });
+      }
+    } catch (err) {
+      console.error('[SV] Logistics Service Binding error:', err);
     }
-    // Fall back to state-level
-    if (!zone) {
-      zone = await c.env.DB.prepare(
-        `SELECT fee_kobo, estimated_days_min, estimated_days_max
-         FROM delivery_zones
-         WHERE tenant_id = ? AND state = ? AND (lga IS NULL OR lga = '') AND is_active = 1
-           AND (vendor_id IS NULL OR vendor_id = '') LIMIT 1`,
-      ).bind(tenantId, state).first<ZoneRow>();
-    }
-    return c.json({
-      success: true,
-      data: {
-        state, lga: lga ?? null,
-        fee_kobo: zone?.fee_kobo ?? 0,
-        estimated_days_min: zone?.estimated_days_min ?? 1,
-        estimated_days_max: zone?.estimated_days_max ?? 7,
-        is_estimate: true,
-      },
-    });
-  } catch (err) {
-    console.error('[SV] route error:', err);
-    return c.json({
-      success: true,
-      data: { state, lga: lga ?? null, fee_kobo: 0, estimated_days_min: 1, estimated_days_max: 7, is_estimate: true },
-    });
   }
+  // Graceful fallback: return zero-fee estimate if Logistics binding unavailable
+  return c.json({
+    success: true,
+    data: { state, lga: lga ?? null, fee_kobo: 0, estimated_days_min: 1, estimated_days_max: 7, is_estimate: true, source: 'fallback' },
+  });
 });
 
 // ── GET /products/:id/reviews — Public product reviews (APPROVED only, paginated) ─

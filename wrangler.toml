@@ -39,6 +39,13 @@ max_batch_timeout   = 5
 max_retries         = 5
 dead_letter_queue   = "webwaka-commerce-events-dlq-prod"
 
+# T-CVC-01: Service Binding to webwaka-logistics for centralised delivery zone queries.
+# Commerce checkout delegates GET /shipping/estimate to the Logistics worker.
+[[env.production.services]]
+binding = "LOGISTICS_WORKER"
+service = "webwaka-logistics-api-prod"
+environment = "production"
+
 # Production secrets (set via: wrangler secret put <NAME> --env production)
 # PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET,
 # ALLOWED_ORIGINS (e.g. "https://app.webwaka.com,https://pos.webwaka.com"),

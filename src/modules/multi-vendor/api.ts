@@ -2312,86 +2312,27 @@ app.post('/paystack/webhook', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MV-4: DELIVERY ZONES — Nigeria States/LGAs per-vendor shipping rates
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const NIGERIA_STATES = new Set([
-  'Abia', 'Adamawa', 'Akwa Ibom', 'Anambra', 'Bauchi', 'Bayelsa', 'Benue', 'Borno',
-  'Cross River', 'Delta', 'Ebonyi', 'Edo', 'Ekiti', 'Enugu', 'Gombe', 'Imo',
-  'Jigawa', 'Kaduna', 'Kano', 'Katsina', 'Kebbi', 'Kogi', 'Kwara', 'Lagos',
-  'Nasarawa', 'Niger', 'Ogun', 'Ondo', 'Osun', 'Oyo', 'Plateau', 'Rivers',
-  'Sokoto', 'Taraba', 'Yobe', 'Zamfara', 'Abuja FCT',
-]);
+// MV-4: DELIVERY ZONES — REMOVED (T-CVC-01)
+// Delivery zone management has been extracted to webwaka-logistics.
+// Single source of truth: webwaka-logistics GET/POST /api/delivery-zones
+// ============================================================
+// NIGERIA_STATES removed — now lives in webwaka-logistics/src/worker.ts
 
 /**
- * POST /delivery-zones — Create or update a delivery zone for a vendor.
- * Requires X-Admin-Key header matching env ADMIN_KEY or vendor JWT with matching vendor_id.
- * Body: { vendor_id, state, lga?, base_fee, per_kg_fee?, free_above?, estimated_days_min?, estimated_days_max? }
+ * POST /delivery-zones — REMOVED (T-CVC-01)
+ * Delivery zone management has been extracted to webwaka-logistics.
+ * Use POST /api/delivery-zones on the Logistics worker.
  */
-app.post('/delivery-zones', async (c) => {
-  const tenantId = getTenantId(c);
-  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
-  const vendor = await authenticateVendor(c);
-  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
-  const jwtVendorId = vendor.vendorId;
-  const body = await c.req.json<{
-    vendor_id: string;
-    state: string;
-    lga?: string;
-    base_fee: number;
-    per_kg_fee?: number;
-    free_above?: number;
-    estimated_days_min?: number;
-    estimated_days_max?: number;
-    is_active?: boolean;
-  }>();
-
-  if (!body.vendor_id) return c.json({ success: false, error: 'vendor_id is required' }, 400);
-  if (body.vendor_id !== jwtVendorId) {
-    return c.json({ success: false, error: 'Forbidden: vendor_id does not match token' }, 403);
-  }
-  if (!body.state?.trim()) return c.json({ success: false, error: 'state is required' }, 400);
-  if (!NIGERIA_STATES.has(body.state.trim())) {
-    return c.json({ success: false, error: `Invalid Nigerian state: ${body.state}` }, 400);
-  }
-  if (typeof body.base_fee !== 'number' || body.base_fee < 0) {
-    return c.json({ success: false, error: 'base_fee must be a non-negative number (kobo)' }, 400);
-  }
-
-  const now = Date.now();
-  const dzId = `dz_${now}_${Math.random().toString(36).slice(2, 9)}`;
-
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO delivery_zones
-         (id, tenant_id, vendor_id, state, lga, base_fee, per_kg_fee, free_above,
-          is_active, estimated_days_min, estimated_days_max, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(tenant_id, vendor_id, state, lga)
-       DO UPDATE SET base_fee=excluded.base_fee, per_kg_fee=excluded.per_kg_fee,
-                     free_above=excluded.free_above, is_active=excluded.is_active,
-                     estimated_days_min=excluded.estimated_days_min,
-                     estimated_days_max=excluded.estimated_days_max,
-                     updated_at=excluded.updated_at`
-    ).bind(
-      dzId, tenantId, body.vendor_id, body.state.trim(), body.lga?.trim() ?? null,
-      body.base_fee, body.per_kg_fee ?? 0, body.free_above ?? null,
-      body.is_active !== false ? 1 : 0,
-      body.estimated_days_min ?? 1, body.estimated_days_max ?? 3,
-      now, now,
-    ).run();
-
-    return c.json({ success: true, data: { id: dzId, vendor_id: body.vendor_id, state: body.state, lga: body.lga ?? null, base_fee: body.base_fee } }, 201);
-  } catch (err) {
-    console.error('[MV] route error:', err);
-    return c.json({ success: false, error: 'Internal server error' }, 500);
-  }
-});
+app.post('/delivery-zones', (c) => c.json({
+  success: false,
+  error: 'Delivery zone management has been moved to the Logistics service. Use POST /api/delivery-zones on the Logistics worker.',
+  moved_to: 'webwaka-logistics /api/delivery-zones',
+}, 410));
 
 /**
- * GET /shipping/estimate — Calculate shipping fee for a vendor, state, and order value.
- * Query: ?vendor_id=X&state=Y&lga=Z&order_value=V&weight_kg=W
- * Returns fee breakdown + estimated days. Returns 0 fee if no zone found (free/unlimited delivery).
+ * GET /shipping/estimate — Delegates to Logistics API (T-CVC-01)
+ * Proxies to webwaka-logistics GET /api/delivery-zones/estimate via Service Binding.
+ * Falls back gracefully if LOGISTICS_WORKER binding is not configured.
  */
 app.get('/shipping/estimate', async (c) => {
   const tenantId = getTenantId(c);
@@ -2399,65 +2340,38 @@ app.get('/shipping/estimate', async (c) => {
   const vendorId = c.req.query('vendor_id');
   const state = c.req.query('state');
   const lga = c.req.query('lga');
-  const orderValue = Number(c.req.query('order_value') ?? '0');
-  const weightKg = Number(c.req.query('weight_kg') ?? '0');
-
+  const orderValue = c.req.query('order_value') ?? '0';
+  const weightKg = c.req.query('weight_kg') ?? '0';
   if (!vendorId) return c.json({ success: false, error: 'vendor_id query param is required' }, 400);
   if (!state) return c.json({ success: false, error: 'state query param is required' }, 400);
-
-  try {
-    // Try LGA-specific zone first, then state-wide
-    let zone = lga
-      ? await c.env.DB.prepare(
-          `SELECT * FROM delivery_zones
-           WHERE tenant_id=? AND vendor_id=? AND state=? AND lga=? AND is_active=1`
-        ).bind(tenantId, vendorId, state, lga).first<{
-          base_fee: number; per_kg_fee: number; free_above: number | null;
-          estimated_days_min: number; estimated_days_max: number;
-        }>()
-      : null;
-
-    if (!zone) {
-      zone = await c.env.DB.prepare(
-        `SELECT * FROM delivery_zones
-         WHERE tenant_id=? AND vendor_id=? AND state=? AND lga IS NULL AND is_active=1`
-      ).bind(tenantId, vendorId, state).first<{
-        base_fee: number; per_kg_fee: number; free_above: number | null;
-        estimated_days_min: number; estimated_days_max: number;
-      }>();
+  // Delegate to Logistics worker via Service Binding (T-CVC-01)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const params = new URLSearchParams({ vendor_id: vendorId, state, order_value: orderValue, weight_kg: weightKg });
+      if (lga) params.set('lga', lga);
+      const resp = await logisticsWorker.fetch(
+        `http://internal/api/delivery-zones/estimate?${params.toString()}`,
+        { headers: { 'x-tenant-id': tenantId } },
+      );
+      const data = await resp.json<{ success: boolean; data: Record<string, unknown> }>();
+      if (data.success && data.data) {
+        return c.json({ success: true, data: { ...data.data, source: 'logistics' } });
+      }
+    } catch (err) {
+      console.error('[MV] Logistics Service Binding error:', err);
     }
-
-    if (!zone) {
-      return c.json({
-        success: true,
-        data: {
-          vendor_id: vendorId, state, lga: lga ?? null,
-          base_fee: 0, weight_fee: 0, total_fee: 0, is_free: false,
-          note: 'No delivery zone configured for this region',
-        },
-      });
-    }
-
-    const isFree = zone.free_above !== null && orderValue >= zone.free_above;
-    const weightFee = Math.round(weightKg * zone.per_kg_fee);
-    const totalFee = isFree ? 0 : zone.base_fee + weightFee;
-
-    return c.json({
-      success: true,
-      data: {
-        vendor_id: vendorId, state, lga: lga ?? null,
-        base_fee: zone.base_fee, per_kg_fee: zone.per_kg_fee,
-        weight_kg: weightKg, weight_fee: weightFee,
-        free_above: zone.free_above,
-        is_free: isFree, total_fee: totalFee,
-        estimated_days_min: zone.estimated_days_min,
-        estimated_days_max: zone.estimated_days_max,
-      },
-    });
-  } catch (err) {
-    console.error('[MV] route error:', err);
-    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
+  // Graceful fallback: return zero-fee estimate if Logistics binding unavailable
+  return c.json({
+    success: true,
+    data: {
+      vendor_id: vendorId, state, lga: lga ?? null,
+      base_fee: 0, weight_fee: 0, total_fee: 0, is_free: false,
+      note: 'No delivery zone configured for this region',
+      source: 'fallback',
+    },
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

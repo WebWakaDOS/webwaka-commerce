@@ -3836,7 +3836,10 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
   });
 });
 
-// ── Suite 4: Shipping estimate (9 tests) ─────────────────────────────────────
+// ── Suite 4: Shipping estimate (T-CVC-01 — delegates to Logistics) ───────────
+// After T-CVC-01, /shipping/estimate delegates to the LOGISTICS_WORKER Service
+// Binding. In unit tests the binding is absent, so the graceful fallback path
+// is exercised (returns zero-fee estimate with source='fallback').
 describe('MV-4 GET /shipping/estimate', () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -3867,78 +3870,62 @@ describe('MV-4 GET /shipping/estimate', () => {
     expect(d.error).toMatch(/state/i);
   });
 
-  it('returns 200 with zero fee note when no zone configured for vendor+state', async () => {
-    mockDb.first.mockResolvedValue(null);
+  it('returns 200 with fallback zero-fee when LOGISTICS_WORKER binding is absent (T-CVC-01)', async () => {
+    // In unit tests LOGISTICS_WORKER is not bound; the handler falls back gracefully.
     const res = await multiVendorRouter.fetch(
       makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Kano'),
       mockEnv as any,
     );
     expect(res.status).toBe(200);
     const d = await res.json() as any;
+    expect(d.success).toBe(true);
     expect(d.data.total_fee).toBe(0);
-    expect(d.data.note).toMatch(/No delivery zone/i);
+    expect(d.data.source).toBe('fallback');
   });
 
-  it('returns base_fee + weight_fee when zone found and free_above not met', async () => {
-    mockDb.first.mockResolvedValue({
-      base_fee: 150000, per_kg_fee: 20000, free_above: 5000000,
-      estimated_days_min: 1, estimated_days_max: 2,
-    });
+  it('returns 200 with fallback zero-fee for any vendor+state when binding absent', async () => {
     const res = await multiVendorRouter.fetch(
       makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos&weight_kg=2&order_value=500000'),
       mockEnv as any,
     );
     const d = await res.json() as any;
-    expect(d.data.base_fee).toBe(150000);
-    expect(d.data.weight_fee).toBe(40000); // 2kg * 20000
-    expect(d.data.total_fee).toBe(190000);
-    expect(d.data.is_free).toBe(false);
+    expect(d.success).toBe(true);
+    expect(d.data.total_fee).toBe(0);
+    expect(d.data.source).toBe('fallback');
   });
 
-  it('returns total_fee=0 and is_free=true when order_value >= free_above', async () => {
-    mockDb.first.mockResolvedValue({
-      base_fee: 150000, per_kg_fee: 20000, free_above: 2000000,
-      estimated_days_min: 1, estimated_days_max: 3,
-    });
+  it('returns 200 with fallback when order_value exceeds any threshold (binding absent)', async () => {
     const res = await multiVendorRouter.fetch(
       makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos&order_value=2000000'),
       mockEnv as any,
     );
     const d = await res.json() as any;
-    expect(d.data.is_free).toBe(true);
-    expect(d.data.total_fee).toBe(0);
+    expect(d.success).toBe(true);
+    expect(d.data.source).toBe('fallback');
   });
 
-  it('returns estimated_days_min and estimated_days_max from zone config', async () => {
-    mockDb.first.mockResolvedValue({
-      base_fee: 100000, per_kg_fee: 0, free_above: null,
-      estimated_days_min: 2, estimated_days_max: 5,
-    });
+  it('returns 200 fallback for Rivers state (binding absent)', async () => {
     const res = await multiVendorRouter.fetch(
       makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Rivers'),
       mockEnv as any,
     );
     const d = await res.json() as any;
-    expect(d.data.estimated_days_min).toBe(2);
-    expect(d.data.estimated_days_max).toBe(5);
+    expect(d.success).toBe(true);
+    expect(d.data.source).toBe('fallback');
   });
 
-  it('returns per_kg_fee=0 when weight_kg not provided', async () => {
-    mockDb.first.mockResolvedValue({
-      base_fee: 100000, per_kg_fee: 15000, free_above: null,
-      estimated_days_min: 1, estimated_days_max: 3,
-    });
+  it('returns 200 fallback when weight_kg not provided (binding absent)', async () => {
     const res = await multiVendorRouter.fetch(
       makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos'),
       mockEnv as any,
     );
     const d = await res.json() as any;
-    expect(d.data.weight_fee).toBe(0);
-    expect(d.data.total_fee).toBe(100000);
+    expect(d.success).toBe(true);
+    expect(d.data.total_fee).toBe(0);
+    expect(d.data.source).toBe('fallback');
   });
 
-  it('includes vendor_id and state in response for client correlation', async () => {
-    mockDb.first.mockResolvedValue(null);
+  it('includes vendor_id and state in fallback response for client correlation', async () => {
     const res = await multiVendorRouter.fetch(
       makeRequest('GET', '/shipping/estimate?vendor_id=vnd_99&state=Abuja FCT'),
       mockEnv as any,
@@ -3948,22 +3935,44 @@ describe('MV-4 GET /shipping/estimate', () => {
     expect(d.data.state).toBe('Abuja FCT');
   });
 
-  it('returns is_free=false when free_above is null', async () => {
-    mockDb.first.mockResolvedValue({
-      base_fee: 200000, per_kg_fee: 0, free_above: null,
-      estimated_days_min: 1, estimated_days_max: 3,
-    });
+  it('returns 200 fallback for Lagos with large order_value (binding absent)', async () => {
     const res = await multiVendorRouter.fetch(
       makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos&order_value=9999999'),
       mockEnv as any,
     );
     const d = await res.json() as any;
+    expect(d.success).toBe(true);
+    expect(d.data.source).toBe('fallback');
+  });
+
+  it('delegates to LOGISTICS_WORKER when binding is present (T-CVC-01)', async () => {
+    // Simulate a LOGISTICS_WORKER Service Binding returning a real zone estimate.
+    const mockLogisticsResp = {
+      success: true,
+      data: { vendor_id: 'vnd_1', state: 'Lagos', lga: null, base_fee: 150000, per_kg_fee: 20000,
+              weight_kg: 2, weight_fee: 40000, free_above: 5000000, is_free: false,
+              total_fee: 190000, estimated_days_min: 1, estimated_days_max: 2 },
+    };
+    const mockLogisticsWorker = {
+      fetch: vi.fn().mockResolvedValue(new Response(JSON.stringify(mockLogisticsResp), { status: 200 })),
+    };
+    const envWithBinding = { ...mockEnv, LOGISTICS_WORKER: mockLogisticsWorker };
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/shipping/estimate?vendor_id=vnd_1&state=Lagos&weight_kg=2&order_value=500000'),
+      envWithBinding as any,
+    );
+    expect(res.status).toBe(200);
+    const d = await res.json() as any;
+    expect(d.data.source).toBe('logistics');
+    expect(d.data.total_fee).toBe(190000);
     expect(d.data.is_free).toBe(false);
-    expect(d.data.total_fee).toBe(200000);
+    expect(mockLogisticsWorker.fetch).toHaveBeenCalledOnce();
   });
 });
 
-// ── Suite 5: Delivery zones creation (6 tests) ───────────────────────────────
+// ── Suite 5: Delivery zones creation (T-CVC-01 — moved to Logistics) ────────────────────────────
+// After T-CVC-01, POST /delivery-zones returns 410 Gone.
+// Delivery zone management lives exclusively in webwaka-logistics.
 describe('MV-4 POST /delivery-zones', () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -3974,28 +3983,50 @@ describe('MV-4 POST /delivery-zones', () => {
     mockDb.first.mockResolvedValue(null);
   });
 
-  it('returns 401 when no vendor JWT provided', async () => {
+  it('returns 410 Gone for any POST /delivery-zones request (T-CVC-01: moved to Logistics)', async () => {
     const res = await multiVendorRouter.fetch(
       makeRequest('POST', '/delivery-zones', { vendor_id: 'vnd_1', state: 'Lagos', base_fee: 100000 }),
       mockEnv as any,
     );
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(410);
+    const d = await res.json() as any;
+    expect(d.success).toBe(false);
+    expect(d.moved_to).toMatch(/webwaka-logistics/i);
   });
 
-  it('returns 400 when state is missing', async () => {
+  it('returns 410 Gone even with valid vendor JWT (T-CVC-01)', async () => {
     const token = await makeVendorToken('vnd_1', 'tnt_test');
     const req = new Request('http://localhost/delivery-zones', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ vendor_id: 'vnd_1', base_fee: 100000 }),
+      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: 150000 }),
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
-    expect(res.status).toBe(400);
-    const d = await res.json() as any;
-    expect(d.error).toMatch(/state/i);
+    expect(res.status).toBe(410);
   });
 
-  it('returns 400 when state is not a valid Nigeria state', async () => {
+  it('returns 410 Gone with error message pointing to Logistics service', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/delivery-zones', { vendor_id: 'vnd_1', state: 'Rivers', base_fee: 200000 }),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(410);
+    const d = await res.json() as any;
+    expect(d.error).toMatch(/Logistics service/i);
+  });
+
+  it('returns 410 Gone for Lagos state (T-CVC-01)', async () => {
+    const token = await makeVendorToken('vnd_1', 'tnt_test');
+    const req = new Request('http://localhost/delivery-zones', {
+      method: 'POST',
+      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: 150000, per_kg_fee: 20000 }),
+    });
+    const res = await multiVendorRouter.fetch(req, mockEnv as any);
+    expect(res.status).toBe(410);
+  });
+
+  it('returns 410 Gone for invalid state (T-CVC-01)', async () => {
     const token = await makeVendorToken('vnd_1', 'tnt_test');
     const req = new Request('http://localhost/delivery-zones', {
       method: 'POST',
@@ -4003,37 +4034,10 @@ describe('MV-4 POST /delivery-zones', () => {
       body: JSON.stringify({ vendor_id: 'vnd_1', state: 'California', base_fee: 100000 }),
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
-    expect(res.status).toBe(400);
-    const d = await res.json() as any;
-    expect(d.error).toMatch(/Invalid Nigerian state/i);
+    expect(res.status).toBe(410);
   });
 
-  it('returns 403 when vendor_id in body does not match JWT', async () => {
-    const token = await makeVendorToken('vnd_other', 'tnt_test');
-    const req = new Request('http://localhost/delivery-zones', {
-      method: 'POST',
-      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: 100000 }),
-    });
-    const res = await multiVendorRouter.fetch(req, mockEnv as any);
-    expect(res.status).toBe(403);
-  });
-
-  it('creates delivery zone with valid payload and returns dz_ prefixed id', async () => {
-    const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/delivery-zones', {
-      method: 'POST',
-      headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: 150000, per_kg_fee: 20000, estimated_days_min: 1, estimated_days_max: 2 }),
-    });
-    const res = await multiVendorRouter.fetch(req, mockEnv as any);
-    expect(res.status).toBe(201);
-    const d = await res.json() as any;
-    expect(d.data.id).toMatch(/^dz_/);
-    expect(d.data.state).toBe('Lagos');
-  });
-
-  it('returns 400 when base_fee is negative', async () => {
+  it('returns 410 Gone for negative base_fee (T-CVC-01)', async () => {
     const token = await makeVendorToken('vnd_1', 'tnt_test');
     const req = new Request('http://localhost/delivery-zones', {
       method: 'POST',
@@ -4041,7 +4045,7 @@ describe('MV-4 POST /delivery-zones', () => {
       body: JSON.stringify({ vendor_id: 'vnd_1', state: 'Lagos', base_fee: -100 }),
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(410);
   });
 });
 
