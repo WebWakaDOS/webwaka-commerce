@@ -262,6 +262,84 @@ app.post('/webhooks/paystack', async (c) => {
   return c.json({ received: true }, 200);
 });
 
+// ── Internal: Tenant Provisioning (T-FND-03) ────────────────────────────────
+// Called exclusively by Super Admin V2 via Cloudflare Service Binding.
+// Atomically writes tenant configuration to TENANT_CONFIG KV.
+// Security: Validates X-Internal-Secret header against INTER_SERVICE_SECRET env var.
+app.post('/internal/provision-tenant', async (c) => {
+  // Security gate: reject any call that does not carry the correct inter-service secret.
+  // Service Binding calls arrive with no external network exposure, but we still
+  // enforce the shared secret for defence-in-depth.
+  const internalSecret = c.env.INTER_SERVICE_SECRET
+  const providedSecret = c.req.header('X-Internal-Secret')
+
+  if (!internalSecret || providedSecret !== internalSecret) {
+    console.error('[PROVISION] Unauthorized internal provisioning attempt')
+    return c.json({ success: false, error: 'Unauthorized' }, 401)
+  }
+
+  try {
+    const body = await c.req.json() as {
+      tenantId: string
+      name: string
+      type: 'retail' | 'multi_vendor' | 'vendor'
+      domain?: string
+      currency?: string
+      timezone?: string
+      modules?: Record<string, unknown>
+      syncPreferences?: Record<string, unknown>
+      theme?: { primaryColor?: string; logoUrl?: string }
+    }
+
+    const { tenantId, name, type, domain, currency, timezone, modules, syncPreferences, theme } = body
+
+    // Validate required fields — strict tenant_id isolation
+    if (!tenantId || !name || !type) {
+      return c.json(
+        { success: false, error: 'Missing required fields: tenantId, name, type' },
+        400,
+      )
+    }
+
+    // Build the canonical tenant configuration following the Tenant-as-Code schema
+    // (COMMERCE_TENANT_ONBOARDING_GUIDE.md, Section 1: Tenant JSON Templates)
+    const tenantConfig = {
+      id: tenantId,
+      name,
+      type,
+      domain: domain ?? `${tenantId}.webwaka.app`,
+      currency: currency ?? 'NGN',
+      timezone: timezone ?? 'Africa/Lagos',
+      modules: modules ?? {
+        pos: { enabled: true, offline_mode: true },
+        single_vendor: { enabled: true, payment_gateway: 'paystack' },
+      },
+      syncPreferences: syncPreferences ?? {
+        sync_pos_to_single_vendor: true,
+        sync_pos_to_multi_vendor: false,
+        sync_single_vendor_to_multi_vendor: false,
+        conflict_resolution: 'last_write_wins',
+      },
+      theme: theme ?? {
+        primaryColor: '#2563eb',
+        logoUrl: `https://assets.webwaka.com/${tenantId}/logo.png`,
+      },
+      provisionedAt: Date.now(),
+    }
+
+    // Atomically write tenant configuration to TENANT_CONFIG KV.
+    // Key format: `tenant:{tenantId}` — matches createTenantResolverMiddleware lookup.
+    await c.env.TENANT_CONFIG.put(`tenant:${tenantId}`, JSON.stringify(tenantConfig))
+
+    console.log(`[PROVISION] Tenant ${tenantId} (${name}) written to TENANT_CONFIG KV`)
+
+    return c.json({ success: true, tenantId, config: tenantConfig }, 201)
+  } catch (err) {
+    console.error('[PROVISION] Error provisioning tenant:', err)
+    return c.json({ success: false, error: 'Internal server error' }, 500)
+  }
+})
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.notFound((c) => {
   return c.json(
