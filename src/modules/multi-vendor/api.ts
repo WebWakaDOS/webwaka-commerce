@@ -3903,6 +3903,576 @@ app.get('/products/:id/availability', async (c) => {
   return c.json({ success: true, data: { available, availableFrom: product.availableFrom, availableUntil: product.availableUntil, availableDays: product.availableDays, nextAvailable } });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// T-COM-05: AUTOMATED RMA WORKFLOW
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Status machine:
+//   REQUESTED
+//     → VENDOR_APPROVED → LABEL_GENERATED → RECEIVED → REFUNDED
+//     → VENDOR_DISPUTED → ADMIN_REVIEW → REFUNDED | REJECTED
+//
+// Architecture invariants:
+//   • Escrow hold/release — emitted as VENDOR_PAYOUT_HOLD / VENDOR_PAYOUT_RELEASE
+//     events to COMMERCE_EVENTS; consumed by Fintech / Central Mgmt worker.
+//   • Reverse-pickup label — obtained exclusively from LOGISTICS_WORKER Service
+//     Binding. No distance or fee calculation performed here.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const RMA_VALID_REASONS = ['DAMAGED', 'WRONG_ITEM', 'NOT_AS_DESCRIBED', 'CHANGE_OF_MIND', 'OTHER'] as const;
+const RMA_RETURN_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * POST /rma — Customer initiates a return request
+ * Auth: Bearer JWT, role = 'customer'
+ *
+ * Flow after creation:
+ *   1. Emits RMA_REQUESTED to COMMERCE_EVENTS (vendor dashboard picks it up).
+ *   2. Emits VENDOR_PAYOUT_HOLD to freeze the vendor's settlement escrow until
+ *      the return is resolved. The Fintech / Central Mgmt worker handles the hold.
+ */
+app.post('/rma', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'customer') {
+    return c.json({ success: false, error: 'Customer authentication required' }, 401);
+  }
+
+  const body = await c.req.json<{
+    orderId: string;
+    vendorId: string;
+    reason: string;
+    description: string;
+    evidenceUrls?: string[];
+  }>();
+
+  if (!body.orderId?.trim()) return c.json({ success: false, error: 'orderId is required' }, 400);
+  if (!body.vendorId?.trim()) return c.json({ success: false, error: 'vendorId is required' }, 400);
+  if (!body.reason?.trim() || !RMA_VALID_REASONS.includes(body.reason as typeof RMA_VALID_REASONS[number])) {
+    return c.json({ success: false, error: `reason must be one of: ${RMA_VALID_REASONS.join(', ')}` }, 400);
+  }
+  if (!body.description?.trim()) return c.json({ success: false, error: 'description is required' }, 400);
+
+  try {
+    // Verify the order belongs to this customer and is in a returnable state
+    const order = await c.env.DB.prepare(
+      `SELECT id, customer_email, vendor_id, marketplace_order_id, order_status, total_amount, created_at
+       FROM orders WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.orderId, tenantId).first<{
+      id: string; customer_email: string | null; vendor_id: string | null;
+      marketplace_order_id: string | null; order_status: string | null;
+      total_amount: number; created_at: number;
+    }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    const customerEmail = String(claims.sub ?? claims.email ?? '');
+    if (order.customer_email && order.customer_email !== customerEmail) {
+      return c.json({ success: false, error: 'You are not the buyer of this order' }, 403);
+    }
+    if (order.vendor_id && order.vendor_id !== body.vendorId) {
+      return c.json({ success: false, error: 'vendorId does not match the order' }, 400);
+    }
+
+    // Enforce 7-day return window (waived if order.created_at is 0, e.g. test rows)
+    const now = Date.now();
+    if (order.created_at > 0 && now - order.created_at > RMA_RETURN_WINDOW_MS) {
+      return c.json({
+        success: false,
+        error: 'Return window has expired. Returns must be requested within 7 days of order placement.',
+      }, 422);
+    }
+
+    // Prevent duplicate open RMA for the same order+vendor
+    const existing = await c.env.DB.prepare(
+      `SELECT id FROM rma_requests
+       WHERE order_id = ? AND vendor_id = ? AND tenant_id = ? AND status NOT IN ('REFUNDED','REJECTED')`,
+    ).bind(body.orderId, body.vendorId, tenantId).first<{ id: string }>();
+    if (existing) {
+      return c.json({ success: false, error: `An active RMA (${existing.id}) already exists for this order and vendor` }, 409);
+    }
+
+    const rmaId = `rma_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+    await c.env.DB.prepare(
+      `INSERT INTO rma_requests
+         (id, tenant_id, order_id, marketplace_order_id, vendor_id, customer_email,
+          reason, description, evidence_urls_json, status, refund_amount_kobo, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'REQUESTED', ?, ?, ?)`,
+    ).bind(
+      rmaId, tenantId, body.orderId, order.marketplace_order_id ?? null,
+      body.vendorId, order.customer_email ?? customerEmail,
+      body.reason, body.description.trim(),
+      body.evidenceUrls ? JSON.stringify(body.evidenceUrls) : null,
+      order.total_amount,
+      now, now,
+    ).run();
+
+    // ── Event 1: notify vendor dashboard / workflow engine ───────────────────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_req_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.RMA_REQUESTED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: {
+        rmaId, orderId: body.orderId, vendorId: body.vendorId,
+        reason: body.reason, tenantId,
+      },
+    }).catch(() => {});
+
+    // ── Event 2: VENDOR_PAYOUT_HOLD → Fintech / Central Mgmt freezes escrow ─
+    // Architecture invariant: we emit the event; Fintech handles the actual hold.
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_payout_hold_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.VENDOR_PAYOUT_HOLD,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: {
+        rmaId, orderId: body.orderId, vendorId: body.vendorId,
+        amountKobo: order.total_amount, tenantId,
+      },
+    }).catch(() => {});
+
+    return c.json({ success: true, data: { rmaId, status: 'REQUESTED' } }, 201);
+  } catch (err) {
+    console.error('[MV][RMA] POST /rma error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /rma/:id — Customer or vendor reads RMA status
+ * Auth: Bearer JWT (role = customer | vendor) or admin key
+ */
+app.get('/rma/:id', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const rmaId = c.req.param('id');
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  const adminKey = c.req.header('x-admin-key');
+  const isAdmin = adminKey && c.env.ADMIN_API_KEY && adminKey === c.env.ADMIN_API_KEY;
+
+  if (!token && !isAdmin) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email, reason,
+              description, evidence_urls_json, status, vendor_note, admin_note, admin_resolution,
+              return_label_url, return_tracking_id, refund_amount_kobo, refund_reference,
+              created_at, updated_at, resolved_at
+       FROM rma_requests WHERE id = ? AND tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<Record<string, unknown>>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+
+    // Non-admin: verify the caller has standing (is the customer or the vendor)
+    if (!isAdmin && token) {
+      const claims = await verifyJwt(token, getJwtSecret(c.env));
+      if (!claims) return c.json({ success: false, error: 'Invalid token' }, 401);
+      const role = String(claims.role);
+      if (role === 'customer') {
+        const email = String(claims.sub ?? claims.email ?? '');
+        if (rma.customer_email !== email) return c.json({ success: false, error: 'Access denied' }, 403);
+      } else if (role === 'vendor') {
+        if (rma.vendor_id !== String(claims.sub)) return c.json({ success: false, error: 'Access denied' }, 403);
+      } else {
+        return c.json({ success: false, error: 'Insufficient permissions' }, 403);
+      }
+    }
+
+    return c.json({ success: true, data: rma });
+  } catch (err) {
+    console.error('[MV][RMA] GET /rma/:id error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /rma/:id/vendor-approve — Vendor accepts the return request
+ * Auth: Bearer JWT, role = 'vendor'
+ *
+ * Flow:
+ *   1. Updates status → VENDOR_APPROVED.
+ *   2. Calls LOGISTICS_WORKER Service Binding to generate a reverse-pickup label.
+ *      Architecture invariant: label generation is 100% delegated to webwaka-logistics.
+ *   3. Updates status → LABEL_GENERATED (or stays VENDOR_APPROVED if no binding).
+ *   4. Emits RMA_APPROVED + RMA_REVERSE_PICKUP_REQUESTED events.
+ */
+app.post('/rma/:id/vendor-approve', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'vendor') {
+    return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  }
+
+  const rmaId = c.req.param('id');
+  const body = await c.req.json<{ note?: string }>().catch(() => ({ note: undefined }));
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email, reason,
+              status, refund_amount_kobo
+       FROM rma_requests
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<{
+      id: string; order_id: string; marketplace_order_id: string | null;
+      vendor_id: string; customer_email: string; reason: string;
+      status: string; refund_amount_kobo: number;
+    }>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+    if (rma.vendor_id !== String(claims.sub)) return c.json({ success: false, error: 'Access denied' }, 403);
+    if (rma.status !== 'REQUESTED') {
+      return c.json({ success: false, error: `Cannot approve RMA in status: ${rma.status}` }, 409);
+    }
+
+    const now = Date.now();
+
+    // ── Step 1: VENDOR_APPROVED ──────────────────────────────────────────────
+    await c.env.DB.prepare(
+      `UPDATE rma_requests SET status = 'VENDOR_APPROVED', vendor_note = ?, updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.note ?? null, now, rmaId, tenantId).run();
+
+    // ── Step 2: Request reverse-pickup label from LOGISTICS_WORKER ───────────
+    // Architecture invariant: label URL and tracking ID come exclusively from the
+    // logistics service. We do NOT generate labels or calculate return routes here.
+    let labelUrl: string | null = null;
+    let trackingId: string | null = null;
+    let finalStatus = 'VENDOR_APPROVED';
+
+    const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+    if (logisticsWorker) {
+      try {
+        const resp = await logisticsWorker.fetch(
+          'http://internal/api/reverse-pickup',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+            body: JSON.stringify({
+              rmaId,
+              orderId: rma.order_id,
+              marketplaceOrderId: rma.marketplace_order_id,
+              vendorId: rma.vendor_id,
+              tenantId,
+            }),
+          },
+        );
+        const result = await resp.json<{
+          success: boolean;
+          data?: { label_url?: string; tracking_id?: string };
+        }>();
+        if (result.success && result.data) {
+          labelUrl = result.data.label_url ?? null;
+          trackingId = result.data.tracking_id ?? null;
+          finalStatus = 'LABEL_GENERATED';
+          await c.env.DB.prepare(
+            `UPDATE rma_requests SET status = 'LABEL_GENERATED', return_label_url = ?,
+                                     return_tracking_id = ?, updated_at = ?
+             WHERE id = ? AND tenant_id = ?`,
+          ).bind(labelUrl, trackingId, now, rmaId, tenantId).run();
+        }
+      } catch (logisticsErr) {
+        console.warn('[MV][RMA] Logistics reverse-pickup call failed (non-fatal):', logisticsErr);
+      }
+    }
+
+    // ── Step 3: Emit RMA_APPROVED event ─────────────────────────────────────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_appr_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.RMA_APPROVED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: { rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId },
+    }).catch(() => {});
+
+    // ── Step 4: Emit RMA_REVERSE_PICKUP_REQUESTED → Logistics worker ─────────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_rpick_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.RMA_REVERSE_PICKUP_REQUESTED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: {
+        rmaId, orderId: rma.order_id, vendorId: rma.vendor_id,
+        labelUrl, trackingId, tenantId,
+      },
+    }).catch(() => {});
+
+    return c.json({
+      success: true,
+      data: { rmaId, status: finalStatus, labelUrl, trackingId },
+    });
+  } catch (err) {
+    console.error('[MV][RMA] vendor-approve error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /rma/:id/vendor-dispute — Vendor disputes the return (e.g. item not defective)
+ * Auth: Bearer JWT, role = 'vendor'
+ *
+ * Transitions: REQUESTED → VENDOR_DISPUTED → admin arbitration
+ * Emits: RMA_DISPUTED (admin dashboard picks it up for ADMIN_REVIEW)
+ */
+app.post('/rma/:id/vendor-dispute', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'vendor') {
+    return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  }
+
+  const rmaId = c.req.param('id');
+  const body = await c.req.json<{ note: string }>();
+  if (!body.note?.trim()) return c.json({ success: false, error: 'note is required when disputing a return' }, 400);
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT id, order_id, vendor_id, status FROM rma_requests WHERE id = ? AND tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<{ id: string; order_id: string; vendor_id: string; status: string }>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+    if (rma.vendor_id !== String(claims.sub)) return c.json({ success: false, error: 'Access denied' }, 403);
+    if (rma.status !== 'REQUESTED') {
+      return c.json({ success: false, error: `Cannot dispute RMA in status: ${rma.status}` }, 409);
+    }
+
+    const now = Date.now();
+
+    await c.env.DB.prepare(
+      `UPDATE rma_requests SET status = 'VENDOR_DISPUTED', vendor_note = ?, updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.note.trim(), now, rmaId, tenantId).run();
+
+    // Move to ADMIN_REVIEW so an admin can arbitrate
+    await c.env.DB.prepare(
+      `UPDATE rma_requests SET status = 'ADMIN_REVIEW', updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(now, rmaId, tenantId).run();
+
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_disp_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.RMA_DISPUTED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: { rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId },
+    }).catch(() => {});
+
+    return c.json({ success: true, data: { rmaId, status: 'ADMIN_REVIEW' } });
+  } catch (err) {
+    console.error('[MV][RMA] vendor-dispute error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /admin/rma — List RMA requests (admin only)
+ * Query params: status (default: REQUESTED), vendor_id, limit (default: 100)
+ */
+app.get('/admin/rma', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const status = c.req.query('status') ?? 'REQUESTED';
+  const vendorId = c.req.query('vendor_id');
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10) || 100, 200);
+
+  try {
+    let sql = `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email,
+                      reason, description, evidence_urls_json, status, vendor_note,
+                      admin_note, admin_resolution, return_label_url, return_tracking_id,
+                      refund_amount_kobo, refund_reference, created_at, updated_at, resolved_at
+               FROM rma_requests
+               WHERE tenant_id = ? AND status = ?`;
+    const binds: unknown[] = [tenantId, status];
+    if (vendorId) { sql += ' AND vendor_id = ?'; binds.push(vendorId); }
+    sql += ` ORDER BY created_at DESC LIMIT ${limit}`;
+
+    const { results } = await c.env.DB.prepare(sql).bind(...binds).all();
+    return c.json({ success: true, data: results, count: results.length });
+  } catch (err) {
+    console.error('[MV][RMA] GET /admin/rma error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /admin/rma/:id/resolve — Admin arbitrates a disputed RMA
+ * Auth: Admin key + role SUPER_ADMIN | TENANT_ADMIN
+ * Body: { resolution: 'APPROVE_RETURN' | 'REJECT_RETURN', adminNote?: string, refundAmountKobo?: number }
+ *
+ * APPROVE_RETURN:
+ *   - Sets status → REFUNDED
+ *   - Initiates Paystack refund (if PAYSTACK_SECRET present)
+ *   - Emits RMA_REFUND_INITIATED → Fintech releases / re-applies escrow correctly
+ *   - Emits VENDOR_PAYOUT_HOLD (confirmed deduction signal to Fintech)
+ *
+ * REJECT_RETURN:
+ *   - Sets status → REJECTED
+ *   - Emits VENDOR_PAYOUT_RELEASE → Fintech releases the payout hold back to vendor
+ *   - Emits RMA_REJECTED
+ */
+app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const rmaId = c.req.param('id');
+  const body = await c.req.json<{
+    resolution: string;
+    adminNote?: string;
+    refundAmountKobo?: number;
+  }>();
+
+  const validResolutions = ['APPROVE_RETURN', 'REJECT_RETURN'] as const;
+  if (!body.resolution || !validResolutions.includes(body.resolution as typeof validResolutions[number])) {
+    return c.json({ success: false, error: `resolution must be one of: ${validResolutions.join(', ')}` }, 400);
+  }
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT r.id, r.order_id, r.vendor_id, r.customer_email, r.status, r.refund_amount_kobo,
+              o.paystack_reference, o.payment_reference
+       FROM rma_requests r
+       LEFT JOIN orders o ON r.order_id = o.id
+       WHERE r.id = ? AND r.tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<{
+      id: string; order_id: string; vendor_id: string; customer_email: string;
+      status: string; refund_amount_kobo: number;
+      paystack_reference: string | null; payment_reference: string | null;
+    }>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+    const terminal = ['REFUNDED', 'REJECTED'];
+    if (terminal.includes(rma.status)) {
+      return c.json({ success: false, error: `RMA already in terminal status: ${rma.status}` }, 409);
+    }
+
+    const now = Date.now();
+    const refundKobo = body.refundAmountKobo ?? rma.refund_amount_kobo;
+
+    if (body.resolution === 'APPROVE_RETURN') {
+      // Initiate Paystack refund (non-blocking — Fintech event is the source of truth)
+      const ref = rma.paystack_reference ?? rma.payment_reference;
+      let refundRef: string | null = null;
+      if (ref && c.env.PAYSTACK_SECRET) {
+        try {
+          const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+          await paymentProvider.initiateRefund(ref, refundKobo > 0 ? refundKobo : undefined);
+          refundRef = `psref_${rmaId}`;
+        } catch { /* non-fatal */ }
+      }
+
+      await c.env.DB.prepare(
+        `UPDATE rma_requests
+         SET status = 'REFUNDED', admin_note = ?, admin_resolution = 'APPROVE_RETURN',
+             refund_amount_kobo = ?, refund_reference = ?, resolved_at = ?, updated_at = ?
+         WHERE id = ? AND tenant_id = ?`,
+      ).bind(body.adminNote ?? null, refundKobo, refundRef, now, now, rmaId, tenantId).run();
+
+      // ── RMA_REFUND_INITIATED → Fintech applies the actual deduction ──────
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_rma_rfnd_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.RMA_REFUND_INITIATED,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id,
+          refundAmountKobo: refundKobo, tenantId,
+        },
+      }).catch(() => {});
+
+      // ── VENDOR_PAYOUT_HOLD (confirmed) → Fintech permanently deducts from payout ─
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_phold_conf_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.VENDOR_PAYOUT_HOLD,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id,
+          amountKobo: refundKobo, confirmed: true, tenantId,
+        },
+      }).catch(() => {});
+
+      return c.json({
+        success: true,
+        data: { rmaId, status: 'REFUNDED', refundAmountKobo: refundKobo },
+      });
+    } else {
+      // REJECT_RETURN
+      await c.env.DB.prepare(
+        `UPDATE rma_requests
+         SET status = 'REJECTED', admin_note = ?, admin_resolution = 'REJECT_RETURN',
+             resolved_at = ?, updated_at = ?
+         WHERE id = ? AND tenant_id = ?`,
+      ).bind(body.adminNote ?? null, now, now, rmaId, tenantId).run();
+
+      // ── VENDOR_PAYOUT_RELEASE → Fintech releases the hold back to vendor ──
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_prel_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.VENDOR_PAYOUT_RELEASE,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId,
+        },
+      }).catch(() => {});
+
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_rma_rej_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.RMA_REJECTED,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId,
+        },
+      }).catch(() => {});
+
+      return c.json({ success: true, data: { rmaId, status: 'REJECTED' } });
+    }
+  } catch (err) {
+    console.error('[MV][RMA] admin/resolve error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 export { app as multiVendorRouter };
 
 /**

@@ -300,4 +300,18 @@ export const CommerceEvents = {
   STOCK_ADJUSTED: 'stock.adjusted',
   ORDER_FULFILLMENT_ASSIGNED: 'order.fulfillment_assigned',
   ORDER_PACKED: 'order.packed',
+  // T-COM-05: RMA (Return Merchandise Authorization) lifecycle events
+  RMA_REQUESTED: 'rma.requested',
+  RMA_APPROVED: 'rma.approved',
+  RMA_DISPUTED: 'rma.disputed',
+  RMA_REVERSE_PICKUP_REQUESTED: 'rma.reverse_pickup_requested',
+  RMA_RECEIVED: 'rma.received',
+  RMA_REFUND_INITIATED: 'rma.refund_initiated',
+  RMA_REJECTED: 'rma.rejected',
+  // Cross-service escrow events consumed by Fintech/Central Mgmt
+  VENDOR_PAYOUT_HOLD: 'vendor.payout.hold',
+  VENDOR_PAYOUT_RELEASE: 'vendor.payout.release',
+  // Pre-existing dispute lifecycle (completing the enum)
+  DISPUTE_OPENED: 'dispute.opened',
+  DISPUTE_RESOLVED: 'dispute.resolved',
 } as const;

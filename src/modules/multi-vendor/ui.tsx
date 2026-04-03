@@ -977,3 +977,475 @@ export const VendorBrandingEditor: React.FC<{ vendorToken: string; tenantId: str
     </div>
   );
 };
+
+// ─── T-COM-05: RMA Panel (Customer) ───────────────────────────────────────────
+
+const RMA_REASONS: Record<string, string> = {
+  DAMAGED: 'Item arrived damaged',
+  WRONG_ITEM: 'Wrong item received',
+  NOT_AS_DESCRIBED: 'Not as described',
+  CHANGE_OF_MIND: 'Change of mind',
+  OTHER: 'Other',
+};
+
+const RMA_STATUS_LABELS: Record<string, { label: string; color: string }> = {
+  REQUESTED:       { label: 'Return Requested',    color: '#b45309' },
+  VENDOR_APPROVED: { label: 'Vendor Approved',     color: '#1d4ed8' },
+  LABEL_GENERATED: { label: 'Return Label Ready',  color: '#0369a1' },
+  RECEIVED:        { label: 'Item Received',        color: '#6d28d9' },
+  REFUNDED:        { label: 'Refunded',             color: '#065f46' },
+  VENDOR_DISPUTED: { label: 'Vendor Disputed',      color: '#dc2626' },
+  ADMIN_REVIEW:    { label: 'Under Admin Review',   color: '#9333ea' },
+  REJECTED:        { label: 'Return Rejected',      color: '#6b7280' },
+};
+
+/**
+ * RmaPanel — Customer-facing: initiate a return for a given order.
+ *
+ * Props:
+ *   customerToken  Bearer JWT with role=customer
+ *   tenantId       Marketplace tenant
+ *   orderId        The order to return (must be within 7-day window)
+ *   vendorId       The vendor who fulfilled that order
+ *   apiBase        Base URL for the multi-vendor API (default: /api/multi-vendor)
+ */
+export const RmaPanel: React.FC<{
+  customerToken: string;
+  tenantId: string;
+  orderId: string;
+  vendorId: string;
+  apiBase?: string;
+}> = ({ customerToken, tenantId, orderId, vendorId, apiBase = '/api/multi-vendor' }) => {
+  const [reason, setReason] = useState('DAMAGED');
+  const [description, setDescription] = useState('');
+  const [evidenceUrls, setEvidenceUrls] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [result, setResult] = useState<null | { rmaId: string; status: string }>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loadedRma, setLoadedRma] = useState<Record<string, unknown> | null>(null);
+  const [loadingStatus, setLoadingStatus] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!description.trim()) { setError('Please describe the issue.'); return; }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await fetch(`${apiBase}/rma`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-tenant-id': tenantId,
+          Authorization: `Bearer ${customerToken}`,
+        },
+        body: JSON.stringify({
+          orderId, vendorId, reason, description: description.trim(),
+          evidenceUrls: evidenceUrls.split('\n').map(u => u.trim()).filter(Boolean),
+        }),
+      });
+      const data = await res.json() as { success: boolean; data?: { rmaId: string; status: string }; error?: string };
+      if (!data.success) { setError(data.error ?? 'Request failed.'); return; }
+      setResult(data.data!);
+    } catch {
+      setError('Network error. Please try again.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const checkStatus = async () => {
+    if (!result?.rmaId) return;
+    setLoadingStatus(true);
+    try {
+      const res = await fetch(`${apiBase}/rma/${result.rmaId}`, {
+        headers: { 'x-tenant-id': tenantId, Authorization: `Bearer ${customerToken}` },
+      });
+      const data = await res.json() as { success: boolean; data?: Record<string, unknown> };
+      if (data.success) setLoadedRma(data.data ?? null);
+    } catch { /* non-fatal */ } finally { setLoadingStatus(false); }
+  };
+
+  const currentStatus = (loadedRma?.status as string | undefined) ?? result?.status;
+  const statusInfo = currentStatus ? RMA_STATUS_LABELS[currentStatus] : undefined;
+
+  if (result) {
+    return (
+      <div style={{ maxWidth: '480px', padding: '1rem', fontFamily: 'system-ui, sans-serif' }}>
+        <div style={{ background: '#d1fae5', border: '1px solid #6ee7b7', borderRadius: '8px', padding: '1rem', marginBottom: '1rem' }}>
+          <div style={{ fontWeight: 700, color: '#065f46', marginBottom: '4px' }}>Return Request Submitted</div>
+          <div style={{ fontSize: '0.85rem', color: '#047857' }}>
+            RMA ID: <strong>{result.rmaId}</strong>
+          </div>
+        </div>
+        {statusInfo && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '0.75rem' }}>
+            <span style={{
+              display: 'inline-block', padding: '3px 10px', borderRadius: '999px',
+              background: `${statusInfo.color}18`, color: statusInfo.color,
+              fontSize: '0.82rem', fontWeight: 600,
+            }}>
+              {statusInfo.label}
+            </span>
+          </div>
+        )}
+        {!!loadedRma?.return_label_url && (
+          <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: '6px', padding: '0.75rem', marginBottom: '0.75rem' }}>
+            <div style={{ fontWeight: 600, color: '#1d4ed8', marginBottom: '4px', fontSize: '0.9rem' }}>
+              Return Shipping Label Ready
+            </div>
+            <a
+              href={String(loadedRma.return_label_url)}
+              target="_blank" rel="noopener noreferrer"
+              style={{ color: '#2563eb', fontSize: '0.85rem', textDecoration: 'underline' }}
+            >
+              Download Return Label
+            </a>
+            {!!loadedRma.return_tracking_id && (
+              <div style={{ fontSize: '0.8rem', color: '#6b7280', marginTop: '4px' }}>
+                Tracking: {String(loadedRma.return_tracking_id)}
+              </div>
+            )}
+          </div>
+        )}
+        {!!loadedRma?.refund_reference && (
+          <div style={{ background: '#d1fae5', border: '1px solid #6ee7b7', borderRadius: '6px', padding: '0.75rem', marginBottom: '0.75rem', fontSize: '0.85rem' }}>
+            Refund processed. Reference: <strong>{String(loadedRma.refund_reference)}</strong>
+          </div>
+        )}
+        <button
+          onClick={checkStatus}
+          disabled={loadingStatus}
+          style={{ padding: '0.45rem 1rem', background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '6px', cursor: 'pointer', fontSize: '0.85rem' }}
+        >
+          {loadingStatus ? 'Refreshing…' : 'Refresh Status'}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={handleSubmit} style={{ maxWidth: '480px', padding: '1rem', fontFamily: 'system-ui, sans-serif' }}>
+      <h3 style={{ margin: '0 0 1rem', fontSize: '1.1rem', fontWeight: 700 }}>Request a Return</h3>
+      <p style={{ fontSize: '0.85rem', color: '#6b7280', marginBottom: '1rem' }}>
+        Returns must be requested within 7 days of order placement.
+        Our team will review your request within 48 hours.
+      </p>
+      {error && (
+        <div style={{ background: '#fee2e2', color: '#dc2626', borderRadius: '6px', padding: '0.6rem 0.9rem', marginBottom: '0.75rem', fontSize: '0.85rem' }}>
+          {error}
+        </div>
+      )}
+      <label style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem', marginBottom: '4px' }}>Reason</label>
+      <select
+        value={reason}
+        onChange={e => setReason(e.target.value)}
+        style={{ width: '100%', padding: '0.5rem', border: '1px solid #d1d5db', borderRadius: '6px', marginBottom: '0.75rem', fontSize: '0.9rem' }}
+      >
+        {Object.entries(RMA_REASONS).map(([val, label]) => (
+          <option key={val} value={val}>{label}</option>
+        ))}
+      </select>
+      <label style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem', marginBottom: '4px' }}>Description</label>
+      <textarea
+        value={description}
+        onChange={e => setDescription(e.target.value)}
+        placeholder="Describe the issue in detail…"
+        rows={4}
+        style={{ width: '100%', padding: '0.5rem', border: '1px solid #d1d5db', borderRadius: '6px', marginBottom: '0.75rem', fontSize: '0.9rem', resize: 'vertical', boxSizing: 'border-box' }}
+      />
+      <label style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem', marginBottom: '4px' }}>
+        Photo / Video URLs <span style={{ fontWeight: 400, color: '#6b7280' }}>(one per line, optional)</span>
+      </label>
+      <textarea
+        value={evidenceUrls}
+        onChange={e => setEvidenceUrls(e.target.value)}
+        placeholder="https://…&#10;https://…"
+        rows={3}
+        style={{ width: '100%', padding: '0.5rem', border: '1px solid #d1d5db', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.85rem', resize: 'vertical', boxSizing: 'border-box' }}
+      />
+      <button
+        type="submit"
+        disabled={submitting}
+        style={{ padding: '0.6rem 1.25rem', background: submitting ? '#9ca3af' : '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', cursor: submitting ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.9rem' }}
+      >
+        {submitting ? 'Submitting…' : 'Submit Return Request'}
+      </button>
+    </form>
+  );
+};
+
+// ─── T-COM-05: VendorRmaPanel (Vendor dashboard) ──────────────────────────────
+
+/**
+ * VendorRmaPanel — Vendor-facing: list and action pending RMAs.
+ *
+ * Props:
+ *   vendorToken  Bearer JWT with role=vendor
+ *   vendorId     Authenticated vendor's ID
+ *   tenantId     Marketplace tenant
+ *   apiBase      Base URL for the multi-vendor API
+ */
+export const VendorRmaPanel: React.FC<{
+  vendorToken: string;
+  vendorId: string;
+  tenantId: string;
+  apiBase?: string;
+}> = ({ vendorToken, vendorId, tenantId, apiBase = '/api/multi-vendor' }) => {
+  const [rmaList, setRmaList] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [actionNote, setActionNote] = useState<Record<string, string>>({});
+  const [actionStatus, setActionStatus] = useState<Record<string, string>>({});
+
+  const loadRmas = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${apiBase}/admin/rma?status=REQUESTED`, {
+        headers: { 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}`, 'x-admin-key': '' },
+      });
+      const data = await res.json() as { success: boolean; data?: Record<string, unknown>[] };
+      if (data.success) {
+        const vendorRmas = (data.data ?? []).filter(r => r['vendor_id'] === vendorId);
+        setRmaList(vendorRmas);
+      }
+    } catch { /* non-fatal */ } finally { setLoading(false); }
+  }, [apiBase, tenantId, vendorToken, vendorId]);
+
+  useEffect(() => { void loadRmas(); }, [loadRmas]);
+
+  const act = async (rmaId: string, action: 'vendor-approve' | 'vendor-dispute') => {
+    const note = actionNote[rmaId] ?? '';
+    if (action === 'vendor-dispute' && !note.trim()) {
+      setActionStatus(prev => ({ ...prev, [rmaId]: 'Please add a note explaining the dispute.' }));
+      return;
+    }
+    try {
+      const res = await fetch(`${apiBase}/rma/${rmaId}/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}` },
+        body: JSON.stringify({ note }),
+      });
+      const data = await res.json() as { success: boolean; data?: Record<string, unknown>; error?: string };
+      if (data.success) {
+        setActionStatus(prev => ({ ...prev, [rmaId]: `Done — RMA is now: ${data.data?.status}` }));
+        void loadRmas();
+      } else {
+        setActionStatus(prev => ({ ...prev, [rmaId]: data.error ?? 'Action failed.' }));
+      }
+    } catch {
+      setActionStatus(prev => ({ ...prev, [rmaId]: 'Network error.' }));
+    }
+  };
+
+  return (
+    <div style={{ maxWidth: '720px', padding: '1rem', fontFamily: 'system-ui, sans-serif' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+        <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Return Requests</h3>
+        <button onClick={loadRmas} disabled={loading} style={{ padding: '0.35rem 0.75rem', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem' }}>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+
+      {rmaList.length === 0 && !loading && (
+        <p style={{ color: '#6b7280', fontSize: '0.9rem' }}>No pending return requests.</p>
+      )}
+
+      {rmaList.map(rma => {
+        const id = String(rma['id']);
+        const statusInfo = RMA_STATUS_LABELS[String(rma['status'])] ?? { label: String(rma['status']), color: '#374151' };
+        return (
+          <div key={id} style={{ border: '1px solid #e5e7eb', borderRadius: '8px', padding: '0.9rem', marginBottom: '0.75rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+              <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{id}</span>
+              <span style={{
+                padding: '2px 10px', borderRadius: '999px',
+                background: `${statusInfo.color}18`, color: statusInfo.color,
+                fontSize: '0.78rem', fontWeight: 600,
+              }}>
+                {statusInfo.label}
+              </span>
+            </div>
+            <div style={{ fontSize: '0.85rem', color: '#374151', marginBottom: '4px' }}>
+              Order: <strong>{String(rma['order_id'])}</strong>
+              &nbsp;·&nbsp;Reason: <strong>{RMA_REASONS[String(rma['reason'])] ?? String(rma['reason'])}</strong>
+            </div>
+            <div style={{ fontSize: '0.83rem', color: '#6b7280', marginBottom: '0.75rem' }}>
+              {String(rma['description'])}
+            </div>
+            {actionStatus[id] && (
+              <div style={{ background: '#f3f4f6', color: '#374151', borderRadius: '6px', padding: '0.4rem 0.7rem', marginBottom: '0.6rem', fontSize: '0.82rem' }}>
+                {actionStatus[id]}
+              </div>
+            )}
+            {String(rma['status']) === 'REQUESTED' && (
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <div style={{ flex: 1, minWidth: '180px' }}>
+                  <input
+                    type="text"
+                    placeholder="Note (required for dispute)"
+                    value={actionNote[id] ?? ''}
+                    onChange={e => setActionNote(prev => ({ ...prev, [id]: e.target.value }))}
+                    style={{ width: '100%', padding: '0.4rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.83rem', boxSizing: 'border-box' }}
+                  />
+                </div>
+                <button
+                  onClick={() => void act(id, 'vendor-approve')}
+                  style={{ padding: '0.4rem 0.9rem', background: '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.82rem' }}
+                >
+                  Approve Return
+                </button>
+                <button
+                  onClick={() => void act(id, 'vendor-dispute')}
+                  style={{ padding: '0.4rem 0.9rem', background: '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.82rem' }}
+                >
+                  Dispute Return
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// ─── T-COM-05: AdminRmaPanel (Super Admin dispute resolution) ─────────────────
+
+/**
+ * AdminRmaPanel — Admin-facing: arbitrate disputed RMAs.
+ *
+ * Props:
+ *   adminKey    x-admin-key header value
+ *   adminToken  Bearer JWT with role SUPER_ADMIN | TENANT_ADMIN
+ *   tenantId    Marketplace tenant
+ *   status      Which status bucket to show (default: ADMIN_REVIEW)
+ *   apiBase     Base URL for the multi-vendor API
+ */
+export const AdminRmaPanel: React.FC<{
+  adminKey: string;
+  adminToken: string;
+  tenantId: string;
+  status?: string;
+  apiBase?: string;
+}> = ({ adminKey, adminToken, tenantId, status = 'ADMIN_REVIEW', apiBase = '/api/multi-vendor' }) => {
+  const [rmaList, setRmaList] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [adminNote, setAdminNote] = useState<Record<string, string>>({});
+  const [resolveStatus, setResolveStatus] = useState<Record<string, string>>({});
+
+  const loadRmas = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${apiBase}/admin/rma?status=${encodeURIComponent(status)}`, {
+        headers: {
+          'x-tenant-id': tenantId,
+          Authorization: `Bearer ${adminToken}`,
+          'x-admin-key': adminKey,
+        },
+      });
+      const data = await res.json() as { success: boolean; data?: Record<string, unknown>[] };
+      if (data.success) setRmaList(data.data ?? []);
+    } catch { /* non-fatal */ } finally { setLoading(false); }
+  }, [apiBase, tenantId, adminToken, adminKey, status]);
+
+  useEffect(() => { void loadRmas(); }, [loadRmas]);
+
+  const resolve = async (rmaId: string, resolution: 'APPROVE_RETURN' | 'REJECT_RETURN') => {
+    try {
+      const res = await fetch(`${apiBase}/admin/rma/${rmaId}/resolve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-tenant-id': tenantId,
+          Authorization: `Bearer ${adminToken}`,
+          'x-admin-key': adminKey,
+        },
+        body: JSON.stringify({ resolution, adminNote: adminNote[rmaId] }),
+      });
+      const data = await res.json() as { success: boolean; data?: Record<string, unknown>; error?: string };
+      if (data.success) {
+        setResolveStatus(prev => ({ ...prev, [rmaId]: `Resolved: ${data.data?.status}` }));
+        void loadRmas();
+      } else {
+        setResolveStatus(prev => ({ ...prev, [rmaId]: data.error ?? 'Failed.' }));
+      }
+    } catch {
+      setResolveStatus(prev => ({ ...prev, [rmaId]: 'Network error.' }));
+    }
+  };
+
+  return (
+    <div style={{ maxWidth: '800px', padding: '1rem', fontFamily: 'system-ui, sans-serif' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+        <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Disputed Returns — Admin Arbitration</h3>
+        <button onClick={loadRmas} disabled={loading} style={{ padding: '0.35rem 0.75rem', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem' }}>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+
+      {rmaList.length === 0 && !loading && (
+        <p style={{ color: '#6b7280', fontSize: '0.9rem' }}>No RMAs awaiting admin review.</p>
+      )}
+
+      {rmaList.map(rma => {
+        const id = String(rma['id']);
+        const statusInfo = RMA_STATUS_LABELS[String(rma['status'])] ?? { label: String(rma['status']), color: '#374151' };
+        return (
+          <div key={id} style={{ border: '1px solid #e5e7eb', borderRadius: '8px', padding: '1rem', marginBottom: '0.75rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+              <span style={{ fontWeight: 700, fontSize: '0.9rem' }}>{id}</span>
+              <span style={{
+                padding: '2px 10px', borderRadius: '999px',
+                background: `${statusInfo.color}18`, color: statusInfo.color,
+                fontSize: '0.78rem', fontWeight: 600,
+              }}>
+                {statusInfo.label}
+              </span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px', fontSize: '0.83rem', color: '#374151', marginBottom: '0.6rem' }}>
+              <div>Order: <strong>{String(rma['order_id'])}</strong></div>
+              <div>Vendor: <strong>{String(rma['vendor_id'])}</strong></div>
+              <div>Customer: <strong>{String(rma['customer_email'])}</strong></div>
+              <div>Reason: <strong>{RMA_REASONS[String(rma['reason'])] ?? String(rma['reason'])}</strong></div>
+            </div>
+            <div style={{ background: '#f9fafb', borderRadius: '6px', padding: '0.6rem', marginBottom: '0.6rem', fontSize: '0.83rem', color: '#374151' }}>
+              <strong>Customer:</strong> {String(rma['description'])}
+            </div>
+            {!!rma['vendor_note'] && (
+              <div style={{ background: '#fff7ed', borderRadius: '6px', padding: '0.6rem', marginBottom: '0.6rem', fontSize: '0.83rem', color: '#92400e' }}>
+                <strong>Vendor dispute note:</strong> {String(rma['vendor_note'])}
+              </div>
+            )}
+            {resolveStatus[id] && (
+              <div style={{ background: '#f3f4f6', color: '#374151', borderRadius: '6px', padding: '0.4rem 0.7rem', marginBottom: '0.6rem', fontSize: '0.82rem' }}>
+                {resolveStatus[id]}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div style={{ flex: 1, minWidth: '200px' }}>
+                <input
+                  type="text"
+                  placeholder="Admin note (shown to both parties)"
+                  value={adminNote[id] ?? ''}
+                  onChange={e => setAdminNote(prev => ({ ...prev, [id]: e.target.value }))}
+                  style={{ width: '100%', padding: '0.4rem', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '0.83rem', boxSizing: 'border-box' }}
+                />
+              </div>
+              <button
+                onClick={() => void resolve(id, 'APPROVE_RETURN')}
+                style={{ padding: '0.4rem 0.9rem', background: '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.82rem' }}
+              >
+                Approve Return
+              </button>
+              <button
+                onClick={() => void resolve(id, 'REJECT_RETURN')}
+                style={{ padding: '0.4rem 0.9rem', background: '#6b7280', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.82rem' }}
+              >
+                Reject Return
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
