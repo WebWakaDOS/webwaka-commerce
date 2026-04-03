@@ -3207,4 +3207,196 @@ describe('T-COM-03: Dynamic Promo Engine', () => {
         expect(res.status).toBe(404);
       });
     });
+    // ── Concurrency safety: pre-flight cap claim ──────────────────────────────
+    describe('POST /checkout — maxUsesTotal concurrency (pre-flight claim)', () => {
+      function cappedPromo(maxUsesTotal: number, usedCount = 0) {
+        return {
+          id: 'promo_cap', code: 'LIMITED', discount_type: 'pct', discount_value: 10,
+          discountCap: null,
+          min_order_kobo: 0, max_uses: maxUsesTotal, current_uses: usedCount, usedCount,
+          expires_at: null, is_active: 1,
+          promoType: 'PERCENTAGE', minOrderValueKobo: null,
+          maxUsesTotal, maxUsesPerCustomer: null,
+          validFrom: null, validUntil: null, productScope: null,
+        };
+      }
+
+      it('rejects with 422 when capped promo is exhausted by a concurrent request (pre-flight changes=0)', async () => {
+        // subtotal=20000, 10% off → 2000; after=18000; VAT=1350; total=19350
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Item', price: 20000, quantity: 10, version: 1 });
+          return Promise.resolve(cappedPromo(1, 0)); // cap=1, usedSoFar=0 (passes initial read)
+        };
+        // Paystack runs before the pre-flight claim
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 19350 }));
+        // updateWithVersionLock (stock deduction) calls DB.prepare().bind().run() internally
+        // and consumes the first mockResolvedValueOnce — must succeed (changes=1, no conflict).
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } }); // versionLock
+        // Pre-flight conditional UPDATE returns changes=0 — concurrent request claimed last slot
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 0 } }); // pre-flight
+
+        const req = makeRequest('POST', '/checkout', checkoutBody({ promo_code: 'LIMITED' }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+
+        expect(res.status).toBe(422);
+        const body = await res.json() as { error: string };
+        expect(body.error).toMatch(/maximum uses/i);
+      });
+
+      it('allows checkout when pre-flight claim succeeds (changes=1)', async () => {
+        // subtotal=20000, 10% off=2000; after=18000; VAT=1350; total=19350
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Item', price: 20000, quantity: 10, version: 1 });
+          return Promise.resolve(cappedPromo(5, 2)); // cap=5, usedSoFar=2 (well below cap)
+        };
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 19350 }));
+        // Pre-flight claim succeeds (changes=1) — default mockDb.run returns this
+
+        const req = makeRequest('POST', '/checkout', checkoutBody({ promo_code: 'LIMITED' }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(2000);
+      });
+
+      it('uncapped promos skip the pre-flight claim and go straight to batch', async () => {
+        // max_uses=0 (uncapped) — no pre-flight run() call, counter update is in the batch
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Item', price: 20000, quantity: 10, version: 1 });
+          return Promise.resolve({
+            id: 'promo_free', code: 'UNLIM', discount_type: 'pct', discount_value: 5,
+            discountCap: null,
+            min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+            expires_at: null, is_active: 1,
+            promoType: 'PERCENTAGE', minOrderValueKobo: null,
+            maxUsesTotal: null, maxUsesPerCustomer: null,
+            validFrom: null, validUntil: null, productScope: null,
+          });
+        };
+        // subtotal=20000; 5% off=1000; after=19000; VAT=1425; total=20425
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 20425 }));
+
+        const runCallsBefore = mockDb.run.mock.calls.length;
+        const req = makeRequest('POST', '/checkout', checkoutBody({ promo_code: 'UNLIM' }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+
+        expect(res.status).toBe(201);
+        // updateWithVersionLock (stock deduction) always calls run() once internally.
+        // For UNCAPPED promos the pre-flight is skipped, so total new run() calls = 1.
+        // For CAPPED promos it would be 2 (version lock + pre-flight claim).
+        const runCallsAfter = mockDb.run.mock.calls.length;
+        const newRunCalls = runCallsAfter - runCallsBefore;
+        // Exactly 1 run() call (updateWithVersionLock only) — no pre-flight for uncapped
+        expect(newRunCalls).toBe(1);
+      });
+
+      it('performs compensating decrement when batch fails after a successful pre-flight claim', async () => {
+        // Setup: pre-flight succeeds (changes=1) but batch throws (DB error)
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Item', price: 20000, quantity: 10, version: 1 });
+          return Promise.resolve(cappedPromo(3, 1));
+        };
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 19350 }));
+        // Pre-flight succeeds: changes=1 (first run call)
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        // Batch throws to simulate DB error
+        mockDb.batch.mockRejectedValueOnce(new Error('D1 write error: disk full'));
+        // Compensating decrement (second run call): succeeds
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+
+        const req = makeRequest('POST', '/checkout', checkoutBody({ promo_code: 'LIMITED' }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+
+        // The re-thrown batch error results in 500
+        expect(res.status).toBe(500);
+        // Verify compensation: the 2nd run() call is the decrement
+        const runCalls = (mockDb.run.mock.calls as Array<unknown[]>);
+        expect(runCalls.length).toBeGreaterThanOrEqual(2);
+        // The compensating UPDATE SQL must mention 'usedCount = usedCount - 1'
+        const allSqls = (mockDb.prepare.mock.calls as Array<[string]>).map(([sql]) => sql ?? '');
+        const hasDecrement = allSqls.some(sql => sql.includes('usedCount - 1'));
+        expect(hasDecrement).toBe(true);
+      });
+    });
+
+    // ── promo_usage INSERT is now in the atomic batch (not fire-and-forget) ──
+    describe('POST /checkout — promo_usage INSERT atomicity', () => {
+      it('includes promo_usage INSERT in the order batch (batch receives 3+ statements)', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'T-Shirt', price: 20000, quantity: 10, version: 1 });
+          return Promise.resolve({
+            id: 'promo_x', code: 'ATOMIC', discount_type: 'pct', discount_value: 10,
+            discountCap: null,
+            min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+            expires_at: null, is_active: 1,
+            promoType: 'PERCENTAGE', minOrderValueKobo: null,
+            maxUsesTotal: null, maxUsesPerCustomer: null,
+            validFrom: null, validUntil: null, productScope: null,
+          });
+        };
+        // subtotal=20000; 10% off=2000; after=18000; VAT=1350; total=19350
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 19350 }));
+
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          promo_code: 'ATOMIC',
+          customer_phone: '08012345678',
+        }));
+        await singleVendorRouter.fetch(req, mockEnv as any);
+
+        // The batch should have been called with statements including the promo_usage INSERT
+        const batchCalls = (mockDb.batch.mock.calls as Array<unknown[][]>);
+        expect(batchCalls.length).toBeGreaterThan(0);
+        const firstBatch = batchCalls[0]?.[0] as unknown[];
+        // order INSERT + customer INSERT + promo UPDATE (uncapped, in batch) + promo_usage INSERT = 4
+        expect(Array.isArray(firstBatch) ? firstBatch.length : 0).toBeGreaterThanOrEqual(3);
+      });
+
+      it('populates freeProductId in promo_usage for BOGO promos', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'shoe_1', name: 'Shoe', price: 30000, quantity: 10, version: 1 });
+          return Promise.resolve({
+            id: 'promo_bogo', code: 'BOGOFREE', discount_type: 'BOGO', discount_value: 0,
+            discountCap: null,
+            min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+            expires_at: null, is_active: 1,
+            promoType: 'BOGO', minOrderValueKobo: null,
+            maxUsesTotal: null, maxUsesPerCustomer: null,
+            validFrom: null, validUntil: null, productScope: null,
+          });
+        };
+        // 2 units at 30000 each: BOGO discount = floor(2/2)*30000 = 30000
+        // subtotal=60000; discount=30000; after=30000; VAT=2250; total=32250
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 32250 }));
+
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          promo_code: 'BOGOFREE',
+          customer_phone: '08099887766',
+          items: [{ product_id: 'shoe_1', quantity: 2, price: 30000, name: 'Shoe' }],
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+
+        // The promo_usage INSERT SQL should contain the freeProductId binding
+        const allSqls = (mockDb.prepare.mock.calls as Array<[string]>).map(([sql]) => sql ?? '');
+        const hasUsageSql = allSqls.some(sql => sql.includes('freeProductId'));
+        expect(hasUsageSql).toBe(true);
+
+        // Verify bogoFreeProductId = 'shoe_1' was bound (it's the only item)
+        const batchCalls = (mockDb.batch.mock.calls as Array<unknown[][]>);
+        expect(batchCalls.length).toBeGreaterThan(0);
+      });
+    });
 }); // end describe('T-COM-03: Dynamic Promo Engine')

@@ -375,6 +375,9 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     let freeShipping = false;
     interface SvPromoRow { id: string; discount_type: string; discount_value: number; promoType: string | null }
     let promoRow: SvPromoRow | null = null;
+    // Hoisted so the pre-flight cap-claim can reference them after the promo block
+    let promoCapForClaim: number | null = null;   // null = uncapped
+    let bogoFreeProductId: string | null = null;  // populated for BOGO promo usage records
 
     if (body.promo_code && body.promo_code.trim() !== '') {
       interface EnhancedPromoRow {
@@ -410,6 +413,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       const usageCap = promo.maxUsesTotal ?? (promo.max_uses > 0 ? promo.max_uses : null);
       const usedSoFar = promo.usedCount > 0 ? promo.usedCount : promo.current_uses;
       if (usageCap !== null && usedSoFar >= usageCap) return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
+      promoCapForClaim = usageCap; // hoist for the post-Paystack pre-flight claim
 
       // 4. Per-customer usage cap
       if (promo.maxUsesPerCustomer !== null && promo.maxUsesPerCustomer > 0) {
@@ -435,11 +439,14 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         let bogoScope: string[] | null = null;
         try { bogoScope = promo.productScope ? (JSON.parse(promo.productScope) as string[]) : null; } catch { /* no-op */ }
         let bogoDiscount = 0;
+        let bogoTopContrib = 0;
         for (let i = 0; i < body.items.length; i++) {
           const item = body.items[i]!;
           if (bogoScope && !bogoScope.includes(item.product_id)) continue;
           const pairsQty = Math.floor(item.quantity / 2);
-          bogoDiscount += pairsQty * (dbProducts[i]?.price ?? item.price);
+          const contrib = pairsQty * (dbProducts[i]?.price ?? item.price);
+          bogoDiscount += contrib;
+          if (contrib > bogoTopContrib) { bogoTopContrib = contrib; bogoFreeProductId = item.product_id; }
         }
         discountKobo = Math.min(bogoDiscount, subtotal);
       } else {
@@ -549,6 +556,31 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       }
     }
 
+    // ── Pre-flight promo usage claim (TOCTOU-safe for capped promos) ─────────
+    // Problem: we read usedCount/current_uses above and then verify Paystack
+    // (~200 ms). Two concurrent requests can both pass the cap check, both
+    // verify, and both increment — exceeding the cap.
+    // Fix: run a conditional UPDATE *before* inserting the order. If another
+    // concurrent request already exhausted the cap, changes===0 and we reject.
+    let promoPreClaimed = false;
+    if (promoRow && promoCapForClaim !== null) {
+      const claimResult = await c.env.DB.prepare(
+        `UPDATE promo_codes
+           SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ?
+         WHERE id = ? AND tenant_id = ?
+           AND (
+             (maxUsesTotal IS NOT NULL AND usedCount < maxUsesTotal)
+             OR (maxUsesTotal IS NULL AND max_uses > 0 AND current_uses < max_uses)
+           )`,
+      ).bind(now, promoRow.id, tenantId).run();
+
+      if (claimResult.meta.changes === 0) {
+        // Cap was hit by a concurrent request between our read and this write
+        return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
+      }
+      promoPreClaimed = true;
+    }
+
     // ── Insert order + customer + promo atomically ────────────────────────────
     const stmts = [
       c.env.DB.prepare(
@@ -573,7 +605,8 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       ).bind(custId, tenantId, contactName, body.customer_email ?? null, body.customer_phone ?? null, now, now, now),
     ];
 
-    if (promoRow) {
+    if (promoRow && !promoPreClaimed) {
+      // Uncapped promos are incremented here (inside the atomic batch)
       stmts.push(
         c.env.DB.prepare(
           'UPDATE promo_codes SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ? WHERE id = ? AND tenant_id = ?'
@@ -581,7 +614,37 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       );
     }
 
-    await c.env.DB.batch(stmts);
+    // Track per-customer promo usage atomically with the order (not fire-and-forget)
+    if (promoRow) {
+      const promoCustomerKey = body.customer_phone ?? body.customer_email ?? '';
+      if (promoCustomerKey) {
+        const puId = `pu_${now}_${Math.random().toString(36).slice(2, 9)}`;
+        stmts.push(
+          c.env.DB.prepare(
+            `INSERT INTO promo_usage (id, promoId, customerId, tenantId, usedAt, freeProductId)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          ).bind(puId, promoRow.id, promoCustomerKey, tenantId, new Date(now).toISOString(), bogoFreeProductId)
+        );
+      }
+    }
+
+    try {
+      await c.env.DB.batch(stmts);
+    } catch (batchErr: unknown) {
+      // Compensating decrement: if the pre-flight promo slot claim already committed
+      // but the order batch failed (DB error, duplicate orderId, etc.), we must roll
+      // back the usage counter so the promo can be legitimately used in a retry.
+      if (promoPreClaimed && promoRow) {
+        await c.env.DB.prepare(
+          'UPDATE promo_codes SET current_uses = current_uses - 1, usedCount = usedCount - 1, updated_at = ? WHERE id = ? AND tenant_id = ?',
+        ).bind(now, promoRow.id, tenantId).run().catch(() => {
+          // Compensation failure is non-fatal from the user's perspective —
+          // operations can reconcile the counter via the admin dashboard.
+          console.error('[SV][checkout] promo compensation decrement failed', batchErr);
+        });
+      }
+      throw batchErr;
+    }
 
     // ── Micro-Hub Fulfillment Routing (T-COM-01) ──────────────────────────────
     // If featureFlags.micro_hub_routing is enabled for this tenant, route the
@@ -649,17 +712,6 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         } catch { /* non-fatal: routing failure must not block order confirmation */ }
       })();
     })();
-
-    // ── Track promo usage per customer (non-fatal) ────────────────────────────
-    if (promoRow) {
-      const promoCustomerKey = body.customer_phone ?? body.customer_email ?? '';
-      if (promoCustomerKey) {
-        const puId = `pu_${now}_${Math.random().toString(36).slice(2, 9)}`;
-        c.env.DB.prepare(
-          'INSERT OR IGNORE INTO promo_usage (id, promoId, customerId, tenantId, usedAt) VALUES (?, ?, ?, ?, ?)'
-        ).bind(puId, promoRow.id, promoCustomerKey, tenantId, new Date(now).toISOString()).run().catch(() => {});
-      }
-    }
 
     // ── Award loyalty points in customer_loyalty table (POS-E10, non-blocking) ─
     void (async () => {
