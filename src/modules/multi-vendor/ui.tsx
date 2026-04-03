@@ -1187,10 +1187,11 @@ export const RmaPanel: React.FC<{
  */
 export const VendorRmaPanel: React.FC<{
   vendorToken: string;
-  vendorId: string;
+  /** @deprecated Server enforces vendor isolation from JWT — no longer consumed by this panel. */
+  vendorId?: string;
   tenantId: string;
   apiBase?: string;
-}> = ({ vendorToken, vendorId, tenantId, apiBase = '/api/multi-vendor' }) => {
+}> = ({ vendorToken, tenantId, apiBase = '/api/multi-vendor' }) => {
   const [rmaList, setRmaList] = useState<Record<string, unknown>[]>([]);
   const [loading, setLoading] = useState(false);
   const [actionNote, setActionNote] = useState<Record<string, string>>({});
@@ -1199,16 +1200,15 @@ export const VendorRmaPanel: React.FC<{
   const loadRmas = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${apiBase}/admin/rma?status=REQUESTED`, {
-        headers: { 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}`, 'x-admin-key': '' },
+      // Uses the vendor-scoped endpoint — no admin key required.
+      // Server enforces vendor_id from the JWT (tenancy invariant).
+      const res = await fetch(`${apiBase}/vendor/rma?status=REQUESTED`, {
+        headers: { 'x-tenant-id': tenantId, Authorization: `Bearer ${vendorToken}` },
       });
       const data = await res.json() as { success: boolean; data?: Record<string, unknown>[] };
-      if (data.success) {
-        const vendorRmas = (data.data ?? []).filter(r => r['vendor_id'] === vendorId);
-        setRmaList(vendorRmas);
-      }
+      if (data.success) setRmaList(data.data ?? []);
     } catch { /* non-fatal */ } finally { setLoading(false); }
-  }, [apiBase, tenantId, vendorToken, vendorId]);
+  }, [apiBase, tenantId, vendorToken]);
 
   useEffect(() => { void loadRmas(); }, [loadRmas]);
 

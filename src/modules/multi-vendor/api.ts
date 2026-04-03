@@ -4264,16 +4264,13 @@ app.post('/rma/:id/vendor-dispute', async (c) => {
 
     const now = Date.now();
 
+    // Single atomic UPDATE: REQUESTED → ADMIN_REVIEW with vendor_note captured.
+    // The RMA_DISPUTED event (below) signals the dispute path to consumers.
+    // VENDOR_DISPUTED is never a persistent DB state — it exists only in the event stream.
     await c.env.DB.prepare(
-      `UPDATE rma_requests SET status = 'VENDOR_DISPUTED', vendor_note = ?, updated_at = ?
+      `UPDATE rma_requests SET status = 'ADMIN_REVIEW', vendor_note = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ?`,
     ).bind(body.note.trim(), now, rmaId, tenantId).run();
-
-    // Move to ADMIN_REVIEW so an admin can arbitrate
-    await c.env.DB.prepare(
-      `UPDATE rma_requests SET status = 'ADMIN_REVIEW', updated_at = ?
-       WHERE id = ? AND tenant_id = ?`,
-    ).bind(now, rmaId, tenantId).run();
 
     await publishEvent(c.env.COMMERCE_EVENTS, {
       id: `evt_rma_disp_${now}_${rmaId}`,
@@ -4292,8 +4289,54 @@ app.post('/rma/:id/vendor-dispute', async (c) => {
 });
 
 /**
+ * GET /vendor/rma — Vendor lists their own RMA requests
+ * Auth: Bearer JWT, role = 'vendor'
+ * Query params: status (default: REQUESTED), limit (default: 50)
+ *
+ * Tenancy invariant: the vendor JWT's sub claim is used as the vendor_id filter —
+ * a vendor can never see another vendor's RMAs through this endpoint.
+ */
+app.get('/vendor/rma', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'vendor') {
+    return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  }
+
+  // TENANCY INVARIANT: vendor_id comes exclusively from the verified JWT, never from
+  // query params, so a vendor can never request another vendor's RMAs.
+  const vendorId = String(claims.sub);
+  const status = c.req.query('status') ?? 'REQUESTED';
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 100);
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email,
+              reason, description, evidence_urls_json, status, vendor_note,
+              return_label_url, return_tracking_id, refund_amount_kobo,
+              created_at, updated_at
+       FROM rma_requests
+       WHERE tenant_id = ? AND vendor_id = ? AND status = ?
+       ORDER BY created_at DESC
+       LIMIT ${limit}`,
+    ).bind(tenantId, vendorId, status).all();
+
+    return c.json({ success: true, data: results, count: results.length });
+  } catch (err) {
+    console.error('[MV][RMA] GET /vendor/rma error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
  * GET /admin/rma — List RMA requests (admin only)
- * Query params: status (default: REQUESTED), vendor_id, limit (default: 100)
+ * Query params: status (default: ADMIN_REVIEW), vendor_id, limit (default: 100)
  */
 app.get('/admin/rma', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
@@ -4303,7 +4346,9 @@ app.get('/admin/rma', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
   const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
 
-  const status = c.req.query('status') ?? 'REQUESTED';
+  // Default to ADMIN_REVIEW — that is the actionable queue for admins (disputed RMAs).
+  // Pass ?status=REQUESTED for newly-created RMAs, ?status=REFUNDED for audit, etc.
+  const status = c.req.query('status') ?? 'ADMIN_REVIEW';
   const vendorId = c.req.query('vendor_id');
   const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10) || 100, 200);
 

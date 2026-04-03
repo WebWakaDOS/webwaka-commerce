@@ -5151,6 +5151,101 @@ describe('T-COM-05: Automated RMA Workflow', () => {
     const [callUrl] = (mockLogisticsWorker.fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string];
     expect(callUrl).toContain('reverse-pickup');
   });
+
+  // ── Bug-fix regressions ───────────────────────────────────────────────────────
+
+  it('[Bug #1 fix] vendor-dispute issues a SINGLE DB write (no double-write)', async () => {
+    // Regression: previously two UPDATEs were issued — first to VENDOR_DISPUTED
+    // then immediately overwritten to ADMIN_REVIEW. Fixed: single atomic UPDATE.
+    const token = await makeVendorToken('vnd_seller', 'tnt_test');
+    mockDb.first.mockResolvedValueOnce({ ...MOCK_RMA });
+    await multiVendorRouter.fetch(
+      makeAuthRequest('POST', '/rma/rma_test_123/vendor-dispute', token, { note: 'Item was in perfect condition.' }),
+      mockEnv as any,
+    );
+    // Exactly one DB UPDATE should have been issued
+    expect(mockDb.run).toHaveBeenCalledTimes(1);
+  });
+
+  it('[Bug #1 fix] vendor-dispute response is ADMIN_REVIEW (not VENDOR_DISPUTED)', async () => {
+    const token = await makeVendorToken('vnd_seller', 'tnt_test');
+    mockDb.first.mockResolvedValueOnce({ ...MOCK_RMA });
+    const res = await multiVendorRouter.fetch(
+      makeAuthRequest('POST', '/rma/rma_test_123/vendor-dispute', token, { note: 'Item condition disputed.' }),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    // VENDOR_DISPUTED must not be the persisted status — it is ADMIN_REVIEW
+    expect(data.data.status).toBe('ADMIN_REVIEW');
+    expect(data.data.status).not.toBe('VENDOR_DISPUTED');
+  });
+
+  // ── GET /vendor/rma ───────────────────────────────────────────────────────────
+
+  it('[Bug #2 fix] vendor lists own RMAs via /vendor/rma — no admin key needed', async () => {
+    const token = await makeVendorToken('vnd_seller', 'tnt_test');
+    mockDb.all.mockResolvedValueOnce({ results: [MOCK_RMA] });
+    const res = await multiVendorRouter.fetch(
+      makeAuthRequest('GET', '/vendor/rma?status=REQUESTED', token),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.success).toBe(true);
+    expect(Array.isArray(data.data)).toBe(true);
+  });
+
+  it('[Bug #2 fix] GET /vendor/rma rejects customer JWT with 401', async () => {
+    const customerToken = await makeCustomerToken('buyer@example.com');
+    const res = await multiVendorRouter.fetch(
+      makeAuthRequest('GET', '/vendor/rma', customerToken),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('[Bug #2 fix] GET /vendor/rma rejects unauthenticated request with 401', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('GET', '/vendor/rma'),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('[Bug #3 fix] vendor_id scoped server-side: DB query uses JWT sub not query param', async () => {
+    // Architecture invariant: vendor_id in the WHERE clause comes from claims.sub,
+    // NOT from any query parameter. A vendor cannot forge another vendor's RMA list.
+    const token = await makeVendorToken('vnd_seller', 'tnt_test');
+    mockDb.all.mockResolvedValueOnce({ results: [] });
+
+    // Even if an attacker adds ?vendor_id=vnd_other to the URL, server ignores it
+    const res = await multiVendorRouter.fetch(
+      makeAuthRequest('GET', '/vendor/rma?status=REQUESTED&vendor_id=vnd_other', token),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(200);
+
+    // Verify the DB was called with the JWT's vendor_id (vnd_seller), not vnd_other
+    const bindArgs = (mockDb.bind as ReturnType<typeof vi.fn>).mock.calls.at(-1) as unknown[];
+    // bindArgs = [tenantId, vendorId, status] — vendorId must be 'vnd_seller' from JWT
+    expect(bindArgs).toContain('vnd_seller');
+    expect(bindArgs).not.toContain('vnd_other');
+  });
+
+  it('[Bug #3 fix] GET /vendor/rma returns only the JWT vendor\'s RMAs (ADMIN_REVIEW too)', async () => {
+    const token = await makeVendorToken('vnd_seller', 'tnt_test');
+    const disputedRma = { ...MOCK_RMA, status: 'ADMIN_REVIEW', vendor_note: 'Disputed.' };
+    mockDb.all.mockResolvedValueOnce({ results: [disputedRma] });
+    const res = await multiVendorRouter.fetch(
+      makeAuthRequest('GET', '/vendor/rma?status=ADMIN_REVIEW', token),
+      mockEnv as any,
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.count).toBe(1);
+    expect(data.data[0].status).toBe('ADMIN_REVIEW');
+  });
 });
 
 
