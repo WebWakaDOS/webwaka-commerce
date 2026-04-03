@@ -27,7 +27,7 @@ export const jwtAuthMiddleware = coreJwtAuthMiddleware({
     { method: 'GET',  path: '/api/single-vendor/cart/:token' },
     { method: 'POST', path: '/api/single-vendor/promo/validate' },
     { method: 'POST', path: '/api/single-vendor/checkout' },
-    { method: 'GET',  path: '/api/single-vendor/orders/:id/track' },
+    { method: 'GET',  path: '/api/single-vendor/orders/:id/track' }, // T-CVC-02: redirects to Logistics portal
     { method: 'GET',  path: '/api/single-vendor/shipping/estimate' },
     // NOTE: /api/single-vendor/delivery-zones removed (T-CVC-01) — returns 410 Gone
     { method: 'POST', path: '/api/single-vendor/auth/login' },
@@ -45,7 +45,7 @@ export const jwtAuthMiddleware = coreJwtAuthMiddleware({
     { method: 'POST', path: '/api/multi-vendor/cart' },
     { method: 'GET',  path: '/api/multi-vendor/cart/:token' },
     { method: 'POST', path: '/api/multi-vendor/checkout' },
-    { method: 'GET',  path: '/api/multi-vendor/orders/track' },
+    { method: 'GET',  path: '/api/multi-vendor/orders/track' }, // T-CVC-02: redirects to Logistics portal
     { method: 'GET',  path: '/api/multi-vendor/shipping/estimate' },
     // Vendor OTP auth — two canonical paths (MV-1 + MV-2 alias)
     { method: 'POST', path: '/api/multi-vendor/auth/vendor-request-otp' },

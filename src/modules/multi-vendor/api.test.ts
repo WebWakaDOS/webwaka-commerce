@@ -1337,9 +1337,27 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       { id: 'ord_2', vendor_id: 'vnd_2', order_status: 'confirmed', payment_status: 'pending', total_amount: 1500000 },
     ];
 
-    it('returns 200 with order status for a valid marketplace_order_id', async () => {
+    it('redirects to Logistics portal for a valid marketplace_order_id (T-CVC-02)', async () => {
+      mockDb.first.mockResolvedValue({ id: 'mkp_order_abc123' });
+      const mockLogisticsWorker = {
+        fetch: vi.fn().mockResolvedValue(new Response(JSON.stringify({
+          success: true,
+          data: { trackingUrl: 'https://logistics.webwaka.ng/track?token=signed-token-123' }
+        }), { status: 200 })),
+      };
+      const envWithBinding = { ...mockEnv, LOGISTICS_WORKER: mockLogisticsWorker };
+      const res = await multiVendorRouter.fetch(
+        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_order_abc123'),
+        envWithBinding as any,
+      );
+      expect(res.status).toBe(302);
+      expect(res.headers.get('Location')).toBe('https://logistics.webwaka.ng/track?token=signed-token-123');
+    });
+
+    it('falls back to Commerce status when Logistics is unavailable (T-CVC-02)', async () => {
       mockDb.first.mockResolvedValue(umbrellaRow);
       mockDb.all.mockResolvedValue({ results: childOrders });
+      // No LOGISTICS_WORKER in mockEnv
       const res = await multiVendorRouter.fetch(
         makeRequest('GET', '/orders/track?marketplace_order_id=mkp_order_abc123'),
         mockEnv as any,
@@ -1347,10 +1365,8 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(res.status).toBe(200);
       const data = await res.json() as any;
       expect(data.success).toBe(true);
+      expect(data.note).toBe('logistics_unavailable');
       expect(data.data.marketplace_order_id).toBe('mkp_order_abc123');
-      expect(data.data.payment_status).toBe('pending');
-      expect(data.data.order_status).toBe('confirmed');
-      expect(data.data.vendor_orders).toHaveLength(2);
     });
 
     it('returns 404 when marketplace_order_id is not found', async () => {

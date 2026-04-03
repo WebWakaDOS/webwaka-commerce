@@ -48,6 +48,8 @@ export interface Env {
   ASSETS?: Fetcher;                     // CF Pages static assets binding for SPA pass-through (P13-T03)
   CENTRAL_MGMT_URL?: string;            // Central Management service URL for ledger events (P10.1)
   INTER_SERVICE_SECRET?: string;        // Shared secret for inter-service authentication (P10.1)
+  LOGISTICS_WORKER?: Fetcher;           // Service Binding to webwaka-logistics (T-CVC-01, T-CVC-02)
+  TRACKING_SECRET?: string;             // HMAC-SHA256 secret for signing tracking tokens (T-CVC-02)
 }
 
 const app = new Hono<{ Bindings: Env }>();

@@ -1894,10 +1894,10 @@ app.get('/catalog', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * GET /orders/track?marketplace_order_id=... — Public buyer order tracking
- * Returns the umbrella order status + per-vendor child order statuses.
- * No authentication required — marketplace_order_id acts as the lookup key.
- * NDPR: only returns status fields, no PII beyond masked email.
+ * GET /orders/track?marketplace_order_id=... — T-CVC-02: Redirect to Logistics tracking portal
+ * Obtains a signed tracking token from Logistics via Service Binding, then redirects
+ * the customer to the Logistics tracking portal URL.
+ * Falls back to Commerce-native status when Logistics is unavailable.
  */
 app.get('/orders/track', async (c) => {
   const tenantId = getTenantId(c);
@@ -1907,6 +1907,43 @@ app.get('/orders/track', async (c) => {
     return c.json({ success: false, error: 'marketplace_order_id is required' }, 400);
   }
 
+  // Verify order exists and belongs to this tenant before issuing a token
+  try {
+    const umbrella = await c.env.DB.prepare(
+      `SELECT id FROM marketplace_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    ).bind(mkpOrderId, tenantId).first<{ id: string }>();
+    if (!umbrella) return c.json({ success: false, error: 'Order not found' }, 404);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Order not found' }, 404);
+  }
+
+  // Delegate to Logistics for a signed tracking token (T-CVC-02)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const resp = await logisticsWorker.fetch(
+        new Request('https://logistics.internal/internal/tracking-token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${c.env.INTER_SERVICE_SECRET ?? ''}`,
+          },
+          body: JSON.stringify({ orderId: mkpOrderId, tenantId, sourceModule: 'multi-vendor' }),
+        }),
+      );
+      if (resp.ok) {
+        const json = await resp.json<{ success: boolean; data?: { trackingUrl?: string } }>();
+        if (json.success && json.data?.trackingUrl) {
+          return c.redirect(json.data.trackingUrl, 302);
+        }
+      }
+    } catch (err) {
+      console.error('[MV] Logistics tracking-token fetch failed:', err);
+    }
+  }
+
+  // Fallback: return Commerce-native status when Logistics is unavailable
   try {
     const umbrella = await c.env.DB.prepare(
       `SELECT id, payment_status, order_status, vendor_count, total_amount,
@@ -1918,7 +1955,6 @@ app.get('/orders/track', async (c) => {
       vendor_count: number; total_amount: number;
       customer_email: string; created_at: number; updated_at: number;
     }>();
-
     if (!umbrella) return c.json({ success: false, error: 'Order not found' }, 404);
 
     const { results: childOrders } = await c.env.DB.prepare(
@@ -1950,6 +1986,7 @@ app.get('/orders/track', async (c) => {
         updated_at: umbrella.updated_at,
         vendor_orders: childOrders,
       },
+      note: 'logistics_unavailable',
     });
   } catch (err) {
     console.error('[MV] route error:', err);

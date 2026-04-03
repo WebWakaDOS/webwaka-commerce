@@ -659,22 +659,60 @@ app.get('/orders/:id/delivery-options', async (c) => {
   }
 });
 
-// ── GET /orders/:id/track — Public order tracking (no customer auth required) ─
-// Must be BEFORE /orders/:id to prevent ":id" from matching the track path
+// ── GET /orders/:id/track — T-CVC-02: Redirect to Logistics tracking portal ───
+// Must be BEFORE /orders/:id to prevent ":id" from matching the track path.
+// Obtains a signed tracking token from Logistics via Service Binding, then
+// redirects the customer to the Logistics tracking portal URL.
 app.get('/orders/:id/track', async (c) => {
   const tenantId = getTenantId(c);
   const orderId = c.req.param('id');
+
+  // Verify order exists and belongs to this tenant before issuing a token
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
+    ).bind(orderId, tenantId).first<{ id: string }>();
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Order not found' }, 404);
+  }
+
+  // Delegate to Logistics for a signed tracking token (T-CVC-02)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const resp = await logisticsWorker.fetch(
+        new Request('https://logistics.internal/internal/tracking-token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${c.env.INTER_SERVICE_SECRET ?? ''}`,
+          },
+          body: JSON.stringify({ orderId, tenantId, sourceModule: 'single-vendor' }),
+        }),
+      );
+      if (resp.ok) {
+        const json = await resp.json<{ success: boolean; data?: { trackingUrl?: string } }>();
+        if (json.success && json.data?.trackingUrl) {
+          return c.redirect(json.data.trackingUrl, 302);
+        }
+      }
+    } catch (err) {
+      console.error('[SV] Logistics tracking-token fetch failed:', err);
+    }
+  }
+
+  // Fallback: return basic Commerce-side status when Logistics is unavailable
   try {
     const order = await c.env.DB.prepare(
       `SELECT id, order_status, payment_status, created_at, updated_at
-       FROM orders
-       WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
+       FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
     ).bind(orderId, tenantId).first<{
       id: string; order_status: string; payment_status: string;
       created_at: number; updated_at: number;
     }>();
     if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
-
     const STATUS_SEQUENCE = ['confirmed', 'processing', 'shipped', 'delivered'];
     const currentIdx = STATUS_SEQUENCE.indexOf(order.order_status);
     const timeline = STATUS_SEQUENCE.map((status, i) => ({
@@ -683,17 +721,10 @@ app.get('/orders/:id/track', async (c) => {
       completed: currentIdx === -1 ? false : i <= currentIdx,
       current: i === currentIdx,
     }));
-
     return c.json({
       success: true,
-      data: {
-        id: order.id,
-        order_status: order.order_status,
-        payment_status: order.payment_status,
-        timeline,
-        placed_at: order.created_at,
-        updated_at: order.updated_at,
-      },
+      data: { id: order.id, order_status: order.order_status, payment_status: order.payment_status, timeline, placed_at: order.created_at, updated_at: order.updated_at },
+      note: 'logistics_unavailable',
     });
   } catch (err) {
     console.error('[SV] route error:', err);
