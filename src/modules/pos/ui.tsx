@@ -278,7 +278,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
   // ── Phase 5: Active session / shift ──────────────────────────────────────
   const [activeSession, setActiveSession] = useState<PosSession | null | undefined>(undefined);
-  const [screen, setScreen] = useState<'pos' | 'dashboard' | 'orders' | 'stock-take'>('pos');
+  const [screen, setScreen] = useState<'pos' | 'dashboard' | 'orders' | 'stock-take' | 'pick-pack'>('pos');
   const [shiftCashierId, setShiftCashierId] = useState('');
   const [shiftCashierName, setShiftCashierName] = useState('');
   const [shiftFloat, setShiftFloat] = useState('');
@@ -299,6 +299,23 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [stockTakeSubmitting, setStockTakeSubmitting] = useState(false);
   const [stockTakeMsg, setStockTakeMsg] = useState<string | null>(null);
   const [stockTakePreviewMode, setStockTakePreviewMode] = useState(false);
+
+  // ── T-COM-01: Pick & Pack (Micro-Hub Fulfillment) ─────────────────────────
+  interface PickPackOrder {
+    id: string;
+    customer_phone: string | null;
+    customer_email: string | null;
+    items: Array<{ product_id: string; name: string; quantity: number; price: number }>;
+    total_amount: number;
+    fulfillment_status: string;
+    fulfillment_assigned_at: string;
+    delivery_address: { state?: string; lga?: string; street?: string } | null;
+  }
+  const [pickPackOrders, setPickPackOrders] = useState<PickPackOrder[]>([]);
+  const [pickPackLoading, setPickPackLoading] = useState(false);
+  const [pickPackError, setPickPackError] = useState<string | null>(null);
+  const [pickPackOutletId, setPickPackOutletId] = useState('');
+  const [pickPackActionLoading, setPickPackActionLoading] = useState<string | null>(null);
 
   // ── Phase 7 (P07): Recent Orders tab ─────────────────────────────────────
   interface RecentOrder { id: string; order_status: string; total_amount: number; payment_method: string; created_at: string | number; customer_phone?: string; items_json?: string; receiptJson?: string }
@@ -1457,6 +1474,169 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     );
   }
 
+  // ── T-COM-01: Pick & Pack screen — micro-hub fulfillment queue ──────────────
+  if (screen === 'pick-pack') {
+    const loadQueue = async () => {
+      if (!pickPackOutletId.trim()) { setPickPackError('Enter an Outlet ID to load the queue.'); return; }
+      setPickPackLoading(true);
+      setPickPackError(null);
+      try {
+        const token = sessionStorage.getItem('pos_session_token') ?? '';
+        const tenantId = sessionStorage.getItem('pos_tenant_id') ?? '';
+        const res = await fetch(`/api/pos/fulfillment-queue?outlet_id=${encodeURIComponent(pickPackOutletId.trim())}`, {
+          headers: { 'Authorization': `Bearer ${token}`, 'x-tenant-id': tenantId },
+        });
+        const data = await res.json() as { success: boolean; data?: PickPackOrder[]; error?: string };
+        if (!data.success) throw new Error(data.error ?? 'Failed to load queue');
+        setPickPackOrders(data.data ?? []);
+      } catch (e) {
+        setPickPackError(e instanceof Error ? e.message : 'Failed to load queue');
+      } finally {
+        setPickPackLoading(false);
+      }
+    };
+
+    const transition = async (orderId: string, action: 'start' | 'packed') => {
+      setPickPackActionLoading(orderId);
+      try {
+        const token = sessionStorage.getItem('pos_session_token') ?? '';
+        const tenantId = sessionStorage.getItem('pos_tenant_id') ?? '';
+        const res = await fetch(`/api/pos/fulfillment-queue/${encodeURIComponent(orderId)}/${action}`, {
+          method: 'PATCH',
+          headers: { 'Authorization': `Bearer ${token}`, 'x-tenant-id': tenantId, 'Content-Type': 'application/json' },
+        });
+        const data = await res.json() as { success: boolean; error?: string };
+        if (!data.success) throw new Error(data.error ?? `Failed to ${action}`);
+        await loadQueue();
+      } catch (e) {
+        setPickPackError(e instanceof Error ? e.message : `Failed to update order`);
+      } finally {
+        setPickPackActionLoading(null);
+      }
+    };
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
+        <header style={{ padding: '0.75rem 1rem', backgroundColor: '#000', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <h1 style={{ margin: 0, fontSize: '1rem' }}>WebWaka POS — Pick &amp; Pack</h1>
+          <div style={{ marginLeft: 'auto' }}>
+            <button
+              onClick={() => setScreen('pos')}
+              style={{ padding: '0.35rem 0.65rem', background: '#374151', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.78rem' }}
+            >
+              ← Back to POS
+            </button>
+          </div>
+        </header>
+
+        <div style={{ padding: '1rem', borderBottom: '1px solid #e5e7eb', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            value={pickPackOutletId}
+            onChange={e => setPickPackOutletId(e.target.value)}
+            placeholder="Outlet ID (e.g. out_123_abc)"
+            style={{ flex: 1, minWidth: '200px', padding: '0.45rem 0.6rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.85rem' }}
+          />
+          <button
+            onClick={loadQueue}
+            disabled={pickPackLoading}
+            style={{ padding: '0.45rem 0.9rem', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.85rem', fontWeight: 600 }}
+          >
+            {pickPackLoading ? 'Loading…' : 'Load Queue'}
+          </button>
+        </div>
+
+        {pickPackError && (
+          <div role="alert" style={{ margin: '0.75rem 1rem', padding: '0.65rem 0.85rem', background: '#fee2e2', color: '#991b1b', borderRadius: '4px', fontSize: '0.85rem' }}>
+            {pickPackError}
+          </div>
+        )}
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
+          {pickPackOrders.length === 0 && !pickPackLoading && !pickPackError && (
+            <p style={{ color: '#6b7280', textAlign: 'center', marginTop: '3rem' }}>
+              No pending pick-pack orders for this outlet.
+            </p>
+          )}
+          {pickPackOrders.map(order => (
+            <div
+              key={order.id}
+              style={{ border: '1px solid #e5e7eb', borderRadius: '8px', padding: '1rem', marginBottom: '1rem', background: '#fff' }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                <div>
+                  <span style={{ fontSize: '0.78rem', color: '#6b7280', fontFamily: 'monospace' }}>{order.id}</span>
+                  <span style={{
+                    marginLeft: '0.5rem', padding: '0.15rem 0.5rem', borderRadius: '12px', fontSize: '0.72rem', fontWeight: 600,
+                    background: order.fulfillment_status === 'assigned' ? '#fef3c7' : '#d1fae5',
+                    color: order.fulfillment_status === 'assigned' ? '#92400e' : '#065f46',
+                  }}>
+                    {order.fulfillment_status === 'assigned' ? 'Awaiting Pick' : 'Picking'}
+                  </span>
+                </div>
+                <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#111827' }}>
+                  ₦{(order.total_amount / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}
+                </span>
+              </div>
+
+              <div style={{ fontSize: '0.8rem', color: '#374151', marginBottom: '0.5rem' }}>
+                {order.customer_phone && <span>📱 {order.customer_phone}</span>}
+                {order.customer_email && <span style={{ marginLeft: '0.5rem' }}>✉ {order.customer_email}</span>}
+                {order.delivery_address && (
+                  <span style={{ marginLeft: '0.5rem', color: '#6b7280' }}>
+                    📍 {[order.delivery_address.street, order.delivery_address.lga, order.delivery_address.state].filter(Boolean).join(', ')}
+                  </span>
+                )}
+              </div>
+
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem', marginBottom: '0.75rem' }}>
+                <thead>
+                  <tr style={{ background: '#f9fafb' }}>
+                    <th style={{ textAlign: 'left', padding: '0.35rem 0.5rem', borderBottom: '1px solid #e5e7eb' }}>Item</th>
+                    <th style={{ textAlign: 'right', padding: '0.35rem 0.5rem', borderBottom: '1px solid #e5e7eb' }}>Qty</th>
+                    <th style={{ textAlign: 'right', padding: '0.35rem 0.5rem', borderBottom: '1px solid #e5e7eb' }}>Price</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {order.items.map((item, idx) => (
+                    <tr key={idx} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                      <td style={{ padding: '0.35rem 0.5rem' }}>{item.name ?? item.product_id}</td>
+                      <td style={{ padding: '0.35rem 0.5rem', textAlign: 'right', fontWeight: 600 }}>{item.quantity}</td>
+                      <td style={{ padding: '0.35rem 0.5rem', textAlign: 'right', color: '#6b7280' }}>₦{((item.price ?? 0) / 100).toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                {order.fulfillment_status === 'assigned' && (
+                  <button
+                    onClick={() => transition(order.id, 'start')}
+                    disabled={pickPackActionLoading === order.id}
+                    aria-label={`Start picking order ${order.id}`}
+                    style={{ padding: '0.45rem 0.9rem', background: '#f59e0b', color: '#000', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.85rem', fontWeight: 600 }}
+                  >
+                    {pickPackActionLoading === order.id ? 'Updating…' : '▶ Start Picking'}
+                  </button>
+                )}
+                {order.fulfillment_status === 'picking' && (
+                  <button
+                    onClick={() => transition(order.id, 'packed')}
+                    disabled={pickPackActionLoading === order.id}
+                    aria-label={`Mark order ${order.id} as packed`}
+                    style={{ padding: '0.45rem 0.9rem', background: '#16a34a', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.85rem', fontWeight: 600 }}
+                  >
+                    {pickPackActionLoading === order.id ? 'Updating…' : '✓ Mark as Packed'}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   // ── Phase 5: DashboardScreen — session history + low-stock ────────────────
   if (screen === 'dashboard') {
     return (
@@ -2048,6 +2228,21 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               Stock Take
             </button>
           </RequireRole>
+        ); })()}
+
+        {/* Pick & Pack — micro-hub fulfillment queue (ADMIN + STAFF) */}
+        {(() => { const s = screen as string; return (
+          <button
+            onClick={() => setScreen(s === 'pick-pack' ? 'pos' : 'pick-pack')}
+            aria-label="Open pick and pack fulfillment queue"
+            style={{
+              padding: '0.35rem 0.65rem', background: s === 'pick-pack' ? '#059669' : '#374151', color: '#fff',
+              border: 'none', borderRadius: '4px', cursor: 'pointer',
+              fontSize: '0.78rem', whiteSpace: 'nowrap',
+            }}
+          >
+            📦 Pick &amp; Pack
+          </button>
         ); })()}
 
         {/* Cashier info + Close Shift — Close Shift is ADMIN only */}

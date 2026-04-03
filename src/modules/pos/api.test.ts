@@ -1000,6 +1000,204 @@ describe('COM-1: POS API', () => {
     });
   });
 
+  // ─── T-COM-01: Micro-Hub Outlet CRUD ─────────────────────────────────────────
+  describe('T-COM-01: Micro-Hub Outlet CRUD', () => {
+    beforeEach(() => {
+      vi.resetAllMocks();
+      _resetRateLimitStore();
+      mockDb.prepare.mockReturnThis();
+      mockDb.bind.mockReturnThis();
+      mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
+      mockDb.first.mockResolvedValue(null);
+      mockDb.all.mockResolvedValue({ results: [] });
+      mockDb.batch.mockResolvedValue([]);
+    });
+
+    it('POST /outlets rejects missing name', async () => {
+      const req = makeRequest('POST', '/outlets', { address: 'Lagos Island' });
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { success: boolean; error: string };
+      expect(body.success).toBe(false);
+      expect(body.error).toMatch(/name/i);
+    });
+
+    it('POST /outlets creates outlet and returns 201', async () => {
+      const req = makeRequest('POST', '/outlets', { name: 'Victoria Island Hub', address: 'VI Lagos', lat: 6.4281, lng: 3.4219 });
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(201);
+      const body = await res.json() as { success: boolean; data: { name: string; lat: number } };
+      expect(body.success).toBe(true);
+      expect(body.data.name).toBe('Victoria Island Hub');
+      expect(body.data.lat).toBe(6.4281);
+    });
+
+    it('POST /outlets trims name whitespace', async () => {
+      const req = makeRequest('POST', '/outlets', { name: '  Ikeja Hub  ' });
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(201);
+      const body = await res.json() as { success: boolean; data: { name: string } };
+      expect(body.data.name).toBe('Ikeja Hub');
+    });
+
+    it('GET /outlets returns list for tenant', async () => {
+      mockDb.all.mockResolvedValue({
+        results: [
+          { id: 'out_1', name: 'VI Hub', address: 'VI Lagos', lat: 6.43, lng: 3.42, active: 1, created_at: '2026-01-01' },
+        ],
+      });
+      const req = makeRequest('GET', '/outlets');
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { success: boolean; data: unknown[] };
+      expect(body.success).toBe(true);
+      expect(Array.isArray(body.data)).toBe(true);
+    });
+
+    it('PATCH /outlets/:id returns 404 for unknown outlet', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const req = makeRequest('PATCH', '/outlets/out_unknown', { name: 'New Name' });
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(404);
+    });
+
+    it('PATCH /outlets/:id updates outlet', async () => {
+      mockDb.first.mockResolvedValue({ id: 'out_1' });
+      const req = makeRequest('PATCH', '/outlets/out_1', { name: 'Updated Hub', active: false });
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { success: boolean; data: { updated: boolean } };
+      expect(body.success).toBe(true);
+      expect(body.data.updated).toBe(true);
+    });
+
+    it('GET /outlets enforces tenant isolation via bind', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      const req = makeRequest('GET', '/outlets', undefined, 'tnt_alpha');
+      await posRouter.fetch(req, mockEnv as any);
+      expect(mockDb.bind).toHaveBeenCalledWith('tnt_alpha');
+    });
+  });
+
+  // ─── T-COM-01: Fulfillment Queue ─────────────────────────────────────────────
+  describe('T-COM-01: Fulfillment Queue', () => {
+    beforeEach(() => {
+      vi.resetAllMocks();
+      _resetRateLimitStore();
+      mockDb.prepare.mockReturnThis();
+      mockDb.bind.mockReturnThis();
+      mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
+      mockDb.first.mockResolvedValue(null);
+      mockDb.all.mockResolvedValue({ results: [] });
+      mockDb.batch.mockResolvedValue([]);
+    });
+
+    it('GET /fulfillment-queue requires outlet_id param', async () => {
+      const req = makeRequest('GET', '/fulfillment-queue');
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { success: boolean; error: string };
+      expect(body.error).toMatch(/outlet_id/i);
+    });
+
+    it('GET /fulfillment-queue returns assigned orders for outlet', async () => {
+      mockDb.all.mockResolvedValue({
+        results: [{
+          id: 'ord_sv_1',
+          customer_phone: '08012345678',
+          customer_email: null,
+          items_json: '[{"product_id":"p1","name":"Bag","quantity":2,"price":5000}]',
+          total_amount: 10000,
+          fulfillment_status: 'assigned',
+          fulfillment_assigned_at: '2026-01-01T10:00:00Z',
+          delivery_address_json: '{"state":"Lagos","lga":"VI","street":"Ozumba Mbadiwe"}',
+        }],
+      });
+      const req = makeRequest('GET', '/fulfillment-queue?outlet_id=out_1');
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { success: boolean; data: Array<{ id: string; items: unknown[] }> };
+      expect(body.success).toBe(true);
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0]!.id).toBe('ord_sv_1');
+      expect(Array.isArray(body.data[0]!.items)).toBe(true);
+    });
+
+    it('GET /fulfillment-queue enforces tenant isolation', async () => {
+      mockDb.all.mockResolvedValue({ results: [] });
+      const req = makeRequest('GET', '/fulfillment-queue?outlet_id=out_1', undefined, 'tnt_beta');
+      await posRouter.fetch(req, mockEnv as any);
+      expect(mockDb.bind).toHaveBeenCalledWith('tnt_beta', 'out_1');
+    });
+
+    it('PATCH /fulfillment-queue/:id/start rejects 404 for unknown order', async () => {
+      mockDb.first.mockResolvedValue(null);
+      const req = makeRequest('PATCH', '/fulfillment-queue/ord_unknown/start');
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(404);
+    });
+
+    it('PATCH /fulfillment-queue/:id/start rejects wrong state', async () => {
+      mockDb.first.mockResolvedValue({ id: 'ord_sv_1', fulfillment_status: 'picking' });
+      const req = makeRequest('PATCH', '/fulfillment-queue/ord_sv_1/start');
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(409);
+      const body = await res.json() as { success: boolean; error: string };
+      expect(body.error).toMatch(/picking/);
+    });
+
+    it('PATCH /fulfillment-queue/:id/start transitions assigned → picking', async () => {
+      mockDb.first.mockResolvedValue({ id: 'ord_sv_1', fulfillment_status: 'assigned' });
+      const req = makeRequest('PATCH', '/fulfillment-queue/ord_sv_1/start');
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { success: boolean; data: { fulfillment_status: string } };
+      expect(body.success).toBe(true);
+      expect(body.data.fulfillment_status).toBe('picking');
+    });
+
+    it('PATCH /fulfillment-queue/:id/packed rejects wrong state (not picking)', async () => {
+      mockDb.first.mockResolvedValue({ id: 'ord_sv_2', fulfillment_status: 'assigned', fulfillment_outlet_id: 'out_1', total_amount: 5000, items_json: '[]', delivery_address_json: null });
+      const req = makeRequest('PATCH', '/fulfillment-queue/ord_sv_2/packed');
+      const res = await posRouter.fetch(req, mockEnv as any);
+      expect(res.status).toBe(409);
+      const body = await res.json() as { success: boolean; error: string };
+      expect(body.error).toMatch(/start picking/i);
+    });
+
+    it('PATCH /fulfillment-queue/:id/packed emits ORDER_PACKED and ORDER_READY_DELIVERY events', async () => {
+      const mockQueue = { send: vi.fn().mockResolvedValue(undefined) };
+      const envWithQueue = { ...mockEnv, COMMERCE_EVENTS: mockQueue };
+      mockDb.first
+        .mockResolvedValueOnce({ id: 'ord_sv_3', fulfillment_status: 'picking', fulfillment_outlet_id: 'out_1', total_amount: 20000, items_json: '[{"name":"Bag","quantity":1}]', delivery_address_json: null })
+        .mockResolvedValueOnce({ name: 'VI Hub', address: 'VI Lagos', lat: 6.43, lng: 3.42 });
+      const req = makeRequest('PATCH', '/fulfillment-queue/ord_sv_3/packed');
+      const res = await posRouter.fetch(req, envWithQueue as any);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { success: boolean; data: { events_emitted: string[] } };
+      expect(body.success).toBe(true);
+      expect(body.data.events_emitted).toContain('order.packed');
+      expect(body.data.events_emitted).toContain('order.ready_for_delivery');
+      expect(mockQueue.send).toHaveBeenCalledTimes(2);
+      const eventTypes = (mockQueue.send.mock.calls as Array<[{ type: string }]>).map(c => c[0].type);
+      expect(eventTypes).toContain('order.packed');
+      expect(eventTypes).toContain('order.ready_for_delivery');
+    });
+
+    it('PATCH /fulfillment-queue/:id/packed response includes fulfillment_packed_at', async () => {
+      const mockQueue = { send: vi.fn().mockResolvedValue(undefined) };
+      const envWithQueue = { ...mockEnv, COMMERCE_EVENTS: mockQueue };
+      mockDb.first
+        .mockResolvedValueOnce({ id: 'ord_sv_4', fulfillment_status: 'picking', fulfillment_outlet_id: null, total_amount: 5000, items_json: '[]', delivery_address_json: null })
+        .mockResolvedValueOnce(null);
+      const req = makeRequest('PATCH', '/fulfillment-queue/ord_sv_4/packed');
+      const res = await posRouter.fetch(req, envWithQueue as any);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { success: boolean; data: { fulfillment_packed_at: string } };
+      expect(typeof body.data.fulfillment_packed_at).toBe('string');
+    });
+  });
+
   // ─── Multi-tenancy isolation ──────────────────────────────────────────────────
   describe('Multi-tenancy isolation', () => {
     it('should isolate product data between tenants', async () => {

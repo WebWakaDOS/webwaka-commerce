@@ -1817,4 +1817,207 @@ app.get('/payment-status', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'])
   return c.json({ success: true, data: { confirmed: confirmed === '1', reference } });
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// MICRO-HUB FULFILLMENT ROUTING (T-COM-01)
+// Physical POS outlets act as e-commerce micro-fulfillment centres.
+// Online storefront orders are routed to the nearest outlet at checkout.
+// Cashiers pick/pack and emit order.ready_for_delivery to the logistics repo.
+// Invariants: [EVT] no dispatch logic here — logistics repo handles riders.
+//             [MTT] tenant_id enforced on every query.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ── POST /outlets — register a physical outlet as a fulfillment hub ───────────
+app.post('/outlets', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+  const body = await c.req.json<{ name: string; address?: string; lat?: number; lng?: number }>();
+  if (!body.name?.trim()) return c.json({ success: false, error: 'name is required' }, 400);
+  const id = `out_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    `INSERT INTO pos_outlets (id, tenant_id, name, address, lat, lng, active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+  ).bind(id, tenantId, body.name.trim(), body.address ?? null, body.lat ?? null, body.lng ?? null, now, now).run();
+  return c.json({ success: true, data: { id, name: body.name.trim(), address: body.address ?? null, lat: body.lat ?? null, lng: body.lng ?? null, active: true } }, 201);
+});
+
+// ── GET /outlets — list active outlets for this tenant ───────────────────────
+app.get('/outlets', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, name, address, lat, lng, active, created_at FROM pos_outlets WHERE tenant_id = ? ORDER BY name ASC`
+  ).bind(tenantId).all<{ id: string; name: string; address: string | null; lat: number | null; lng: number | null; active: number; created_at: string }>();
+  return c.json({ success: true, data: results ?? [] });
+});
+
+// ── PATCH /outlets/:id — update outlet fields (name, address, lat, lng, active) ─
+app.patch('/outlets/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+  const outletId = c.req.param('id');
+  const body = await c.req.json<{ name?: string; address?: string; lat?: number; lng?: number; active?: boolean }>();
+  const existing = await c.env.DB.prepare(
+    `SELECT id FROM pos_outlets WHERE id = ? AND tenant_id = ?`
+  ).bind(outletId, tenantId).first<{ id: string }>();
+  if (!existing) return c.json({ success: false, error: 'Outlet not found' }, 404);
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    `UPDATE pos_outlets SET
+       name    = COALESCE(?, name),
+       address = COALESCE(?, address),
+       lat     = COALESCE(?, lat),
+       lng     = COALESCE(?, lng),
+       active  = COALESCE(?, active),
+       updated_at = ?
+     WHERE id = ? AND tenant_id = ?`
+  ).bind(
+    body.name?.trim() ?? null,
+    body.address ?? null,
+    body.lat ?? null,
+    body.lng ?? null,
+    body.active !== undefined ? (body.active ? 1 : 0) : null,
+    now, outletId, tenantId,
+  ).run();
+  return c.json({ success: true, data: { id: outletId, updated: true } });
+});
+
+// ── GET /fulfillment-queue — orders assigned to an outlet, pending packing ────
+// STAFF can filter by their outlet_id; ADMIN sees all or filters by outlet_id.
+app.get('/fulfillment-queue', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+  const outletId = c.req.query('outlet_id');
+  if (!outletId) return c.json({ success: false, error: 'outlet_id query param required' }, 400);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, customer_phone, customer_email, items_json, total_amount, fulfillment_status,
+            fulfillment_assigned_at, created_at, delivery_address_json
+     FROM orders
+     WHERE tenant_id = ? AND fulfillment_outlet_id = ?
+       AND fulfillment_status IN ('assigned', 'picking')
+       AND deleted_at IS NULL
+     ORDER BY fulfillment_assigned_at ASC
+     LIMIT 50`
+  ).bind(tenantId, outletId).all<{
+    id: string; customer_phone: string | null; customer_email: string | null;
+    items_json: string; total_amount: number; fulfillment_status: string;
+    fulfillment_assigned_at: string; created_at: string; delivery_address_json: string | null;
+  }>();
+  const orders = (results ?? []).map(o => ({
+    ...o,
+    items: (() => { try { return JSON.parse(o.items_json ?? '[]'); } catch { return []; } })(),
+    delivery_address: (() => { try { return o.delivery_address_json ? JSON.parse(o.delivery_address_json) : null; } catch { return null; } })(),
+  }));
+  return c.json({ success: true, data: orders });
+});
+
+// ── PATCH /fulfillment-queue/:orderId/start — cashier begins picking items ────
+app.patch('/fulfillment-queue/:orderId/start', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+  const orderId = c.req.param('orderId');
+  const order = await c.env.DB.prepare(
+    `SELECT id, fulfillment_status FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+  ).bind(orderId, tenantId).first<{ id: string; fulfillment_status: string | null }>();
+  if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+  if (order.fulfillment_status !== 'assigned') {
+    return c.json({ success: false, error: `Cannot start picking: order is in '${order.fulfillment_status ?? 'unrouted'}' state` }, 409);
+  }
+  await c.env.DB.prepare(
+    `UPDATE orders SET fulfillment_status = 'picking', updated_at = ? WHERE id = ? AND tenant_id = ?`
+  ).bind(new Date().toISOString(), orderId, tenantId).run();
+  return c.json({ success: true, data: { orderId, fulfillment_status: 'picking' } });
+});
+
+// ── PATCH /fulfillment-queue/:orderId/packed — cashier marks order as packed ──
+// This is the critical invariant boundary: Commerce emits order.ready_for_delivery
+// and stops. Rider assignment, routing, and dispatch are handled by the logistics repo.
+app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+  const orderId = c.req.param('orderId');
+  const order = await c.env.DB.prepare(
+    `SELECT id, fulfillment_status, fulfillment_outlet_id, total_amount, items_json, delivery_address_json
+     FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+  ).bind(orderId, tenantId).first<{
+    id: string; fulfillment_status: string | null; fulfillment_outlet_id: string | null;
+    total_amount: number; items_json: string; delivery_address_json: string | null;
+  }>();
+  if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+  if (order.fulfillment_status !== 'picking') {
+    return c.json({ success: false, error: `Cannot mark packed: order is in '${order.fulfillment_status ?? 'unrouted'}' state. Start picking first.` }, 409);
+  }
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    `UPDATE orders SET fulfillment_status = 'packed', fulfillment_packed_at = ?, order_status = 'processing', updated_at = ?
+     WHERE id = ? AND tenant_id = ?`
+  ).bind(now, now, orderId, tenantId).run();
+
+  // ── [EVT] Emit order.ready_for_delivery — logistics repo handles rider dispatch ─
+  // Emit ORDER_PACKED (internal Commerce signal) and ORDER_READY_DELIVERY (logistics boundary).
+  const outletRow = order.fulfillment_outlet_id
+    ? await c.env.DB.prepare(
+        `SELECT name, address, lat, lng FROM pos_outlets WHERE id = ? AND tenant_id = ?`
+      ).bind(order.fulfillment_outlet_id, tenantId).first<{ name: string; address: string | null; lat: number | null; lng: number | null }>().catch(() => null)
+    : null;
+
+  let items: unknown[] = [];
+  try { items = JSON.parse(order.items_json ?? '[]'); } catch { /* no-op */ }
+
+  let deliveryAddress: unknown = null;
+  try { deliveryAddress = order.delivery_address_json ? JSON.parse(order.delivery_address_json) : null; } catch { /* no-op */ }
+
+  const packedEvt = {
+    id: `evt_pkd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    tenantId: tenantId!,
+    type: CommerceEvents.ORDER_PACKED,
+    sourceModule: 'pos',
+    timestamp: Date.now(),
+    payload: {
+      orderId,
+      tenantId,
+      outletId: order.fulfillment_outlet_id,
+      outletName: outletRow?.name ?? null,
+      packedAt: now,
+    },
+  };
+
+  const deliveryEvt = {
+    id: `evt_dlv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    tenantId: tenantId!,
+    type: CommerceEvents.ORDER_READY_DELIVERY,
+    sourceModule: 'pos',
+    timestamp: Date.now(),
+    payload: {
+      orderId,
+      tenantId,
+      sourceModule: 'pos',
+      pickupAddress: outletRow?.address ?? null,
+      pickupLat: outletRow?.lat ?? null,
+      pickupLng: outletRow?.lng ?? null,
+      outletId: order.fulfillment_outlet_id,
+      outletName: outletRow?.name ?? null,
+      deliveryAddress,
+      itemsSummary: `${items.length} item(s)`,
+      totalAmountKobo: order.total_amount,
+    },
+  };
+
+  // Fire both events; non-fatal (logistics repo retries via CF Queues at-least-once).
+  await Promise.allSettled([
+    publishEvent(c.env.COMMERCE_EVENTS, packedEvt),
+    publishEvent(c.env.COMMERCE_EVENTS, deliveryEvt),
+  ]);
+
+  return c.json({
+    success: true,
+    data: {
+      orderId,
+      fulfillment_status: 'packed',
+      fulfillment_packed_at: now,
+      events_emitted: [CommerceEvents.ORDER_PACKED, CommerceEvents.ORDER_READY_DELIVERY],
+    },
+  });
+});
+
 export { app as posRouter };

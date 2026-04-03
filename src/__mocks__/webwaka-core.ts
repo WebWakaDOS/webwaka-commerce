@@ -296,4 +296,6 @@ export const CommerceEvents = {
   FLASH_SALE_STARTED: 'flash_sale.started',
   FLASH_SALE_ENDED: 'flash_sale.ended',
   STOCK_ADJUSTED: 'stock.adjusted',
+  ORDER_FULFILLMENT_ASSIGNED: 'order.fulfillment_assigned',
+  ORDER_PACKED: 'order.packed',
 } as const;

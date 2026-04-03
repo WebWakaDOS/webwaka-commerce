@@ -1,4 +1,4 @@
-# WebWaka Commerce Suite — P13 Complete
+# WebWaka Commerce Suite — T-COM-01 Complete (858 tests)
 
 ## Project Overview
 AI-native, mobile-first, offline-first SaaS operating system and commerce platform for emerging markets (Nigeria/Africa). Includes POS, Single-Vendor Storefront, and Multi-Vendor Marketplace modules.
@@ -416,4 +416,4 @@ See `.env.example` for reference:
 - Receipt expanded: shows pts redeemed (red), pts earned (green), new balance, and tier.
 - All loyalty state cleared on hold, checkout, and receipt dismiss.
 
-**TypeScript clean (0 errors across all 18 test files and production source), 828/828 tests passing. P12 complete. P13 complete: AI product listing (MV-E18 `VendorProductEditor` + `POST /products/ai-suggest`), Flash Sales engine with countdown timer (MV-E12 `FlashSaleCountdown` + server-authoritative price override in checkout), Bulk pricing tier resolution in checkout (MV-E20), CSV product import (MV-E17), Vendor referral programme (MV-E19), Subscriptions with retry cron (SV-E14), OG meta edge rendering (SV-E15), NDPR export & soft-delete (SV-E18), COD deposit (SV-E11), Expense tracking (POS-E19), Product bundles (POS-E13), Supplier/PO (POS-E16), Agency banking (POS-E15), Paystack transfer webhook (POS-E12), Currency rounding (POS-E14), service worker v4 product image cache-first offline support (POS-E20).**
+**TypeScript clean (0 new errors), 858/858 tests passing. P12+P13 complete (see above). T-COM-01 complete: POS Micro-Hub Fulfillment — migration 021 (`pos_outlets` table + fulfillment columns on `orders`), outlet CRUD API (`POST/GET/PATCH /outlets`), fulfillment queue state machine (`GET /fulfillment-queue`, `PATCH /fulfillment-queue/:id/start`, `PATCH /fulfillment-queue/:id/packed`), Haversine geo-routing in SV checkout (featureFlag-gated, `featureFlags.micro_hub_routing`), two new `@webwaka/core` events (`ORDER_FULFILLMENT_ASSIGNED`, `ORDER_PACKED`), Pick & Pack POS UI screen + nav tab, 30 new tests (16 POS API + 9 SV Haversine + 4 SV integration + 1 mock constant).**

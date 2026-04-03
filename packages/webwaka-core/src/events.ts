@@ -25,6 +25,8 @@ export const CommerceEvents = {
   PURCHASE_ORDER_RECEIVED: 'purchase_order.received',
   FLASH_SALE_STARTED: 'flash_sale.started',
   FLASH_SALE_ENDED: 'flash_sale.ended',
+  ORDER_FULFILLMENT_ASSIGNED: 'order.fulfillment_assigned',
+  ORDER_PACKED: 'order.packed',
 } as const;
 
 export type CommerceEventType = typeof CommerceEvents[keyof typeof CommerceEvents];

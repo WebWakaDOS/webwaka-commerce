@@ -30,6 +30,22 @@ function evaluateLoyaltyTier(points: number, cfg: LoyaltyConfig): string {
   return sorted.find((t) => points >= t.minPoints)?.name ?? 'BRONZE';
 }
 
+/**
+ * Haversine great-circle distance between two WGS-84 coordinates.
+ * Returns distance in kilometres. Cloudflare Workers compatible (Math only).
+ * Used for micro-hub outlet routing (T-COM-01).
+ */
+export function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify';
 const DEFAULT_PAGE_SIZE = 24;
 const MAX_PAGE_SIZE = 100;
@@ -318,6 +334,8 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     ndpr_consent: boolean;
     promo_code?: string;
     delivery_address?: { state: string; lga: string; street: string };
+    delivery_lat?: number;
+    delivery_lng?: number;
     session_token?: string;
   }>();
 
@@ -562,6 +580,73 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     }
 
     await c.env.DB.batch(stmts);
+
+    // ── Micro-Hub Fulfillment Routing (T-COM-01) ──────────────────────────────
+    // If featureFlags.micro_hub_routing is enabled for this tenant, route the
+    // new storefront order to the nearest active POS outlet so cashiers can
+    // pick/pack locally instead of shipping from a central warehouse.
+    // [EVT] We assign and notify here; Commerce never does dispatch/rider logic.
+    // [MTT] All queries are scoped to tenantId.
+    (() => {
+      const tenantCfg = c.get('tenantConfig' as never) as { featureFlags?: Record<string, boolean> } | undefined;
+      if (!tenantCfg?.featureFlags?.micro_hub_routing) return;
+      (async () => {
+        try {
+          interface OutletRow { id: string; name: string; address: string | null; lat: number | null; lng: number | null }
+          const { results: outlets } = await c.env.DB.prepare(
+            `SELECT id, name, address, lat, lng FROM pos_outlets WHERE tenant_id = ? AND active = 1`
+          ).bind(tenantId).all<OutletRow>();
+          if (!outlets || outlets.length === 0) return;
+
+          let nearestId: string | null = null;
+          let nearestName: string | null = null;
+
+          const deliveryLat = typeof body.delivery_lat === 'number' ? body.delivery_lat : null;
+          const deliveryLng = typeof body.delivery_lng === 'number' ? body.delivery_lng : null;
+
+          if (deliveryLat !== null && deliveryLng !== null) {
+            // Choose nearest outlet by Haversine distance (requires lat/lng on outlet)
+            let minDist = Infinity;
+            for (const outlet of outlets) {
+              if (outlet.lat === null || outlet.lng === null) continue;
+              const dist = haversineDistanceKm(deliveryLat, deliveryLng, outlet.lat, outlet.lng);
+              if (dist < minDist) { minDist = dist; nearestId = outlet.id; nearestName = outlet.name; }
+            }
+            // Fallback: if no outlets have coordinates, take first active one
+            if (!nearestId && outlets[0]) { nearestId = outlets[0].id; nearestName = outlets[0].name; }
+          } else {
+            // No customer coordinates provided — assign to first active outlet (round-robin can be added later)
+            nearestId = outlets[0]!.id;
+            nearestName = outlets[0]!.name;
+          }
+
+          if (!nearestId) return;
+          const assignedAt = new Date().toISOString();
+          await c.env.DB.prepare(
+            `UPDATE orders SET fulfillment_outlet_id = ?, fulfillment_status = 'assigned',
+             fulfillment_assigned_at = ?, updated_at = ?
+             WHERE id = ? AND tenant_id = ?`
+          ).bind(nearestId, assignedAt, assignedAt, orderId, tenantId).run();
+
+          // [EVT] Notify the outlet that a new pick-pack job has been assigned
+          await publishEvent(c.env.COMMERCE_EVENTS, {
+            id: `evt_fla_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            tenantId: tenantId!,
+            type: CommerceEvents.ORDER_FULFILLMENT_ASSIGNED,
+            sourceModule: 'single-vendor',
+            timestamp: Date.now(),
+            payload: {
+              orderId,
+              tenantId,
+              outletId: nearestId,
+              outletName: nearestName,
+              itemCount: body.items.length,
+              assignedAt,
+            },
+          }).catch(() => { /* non-fatal */ });
+        } catch { /* non-fatal: routing failure must not block order confirmation */ }
+      })();
+    })();
 
     // ── Track promo usage per customer (non-fatal) ────────────────────────────
     if (promoRow) {
