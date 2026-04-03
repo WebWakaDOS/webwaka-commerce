@@ -14,7 +14,7 @@ import Dexie, { type Table } from 'dexie';
 export interface CommerceMutation {
   id?: number;
   tenantId: string;
-  entityType: 'order' | 'product' | 'cart' | 'vendor';
+  entityType: 'order' | 'product' | 'cart' | 'vendor' | 'receipt_notification';
   entityId: string;
   action: 'CREATE' | 'UPDATE' | 'DELETE';
   payload: unknown;

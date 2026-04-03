@@ -1201,6 +1201,114 @@ app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async 
 // OFFLINE SYNC
 // ──────────────────────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────────────────────
+// WHATSAPP DIGITAL RECEIPTS (T-COM-02)
+// Invariants:
+//   [REUSE]  Uses createSmsProvider from @webwaka/core — no new Termii client.
+//   [MTT]    Tenant-scoped order lookup; phone validated before dispatch.
+//   [OFFLN]  Offline callers queue via CommerceMutation('receipt_notification')
+//            and flush through POST /sync below.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a human-readable WhatsApp receipt message from an order row.
+ * Uses the same format as the receipt endpoint's whatsappText — keeps
+ * a single source of truth for the message template.
+ */
+function buildWhatsappReceiptText(order: {
+  id: string;
+  total_amount: number;
+  payment_method: string;
+  order_status: string;
+  created_at: number;
+  items_json: string | null;
+}): string {
+  const receiptId = `RCP_${order.id}`;
+  const orderDate = new Date(order.created_at).toLocaleDateString('en-NG', {
+    day: '2-digit', month: 'short', year: 'numeric',
+  });
+  const totalNaira = (order.total_amount / 100).toFixed(2);
+  let itemLines = '';
+  try {
+    const items = JSON.parse(order.items_json ?? '[]') as Array<{ name?: string; quantity?: number; price?: number }>;
+    itemLines = items.map(i => `  • ${i.name ?? 'Item'} ×${i.quantity ?? 1}  ₦${(((i.price ?? 0) * (i.quantity ?? 1)) / 100).toFixed(2)}`).join('\n');
+  } catch { /* no-op */ }
+
+  return [
+    `✅ *WebWaka POS Receipt*`,
+    `Receipt No: *${receiptId}*`,
+    `Date: ${orderDate}`,
+    ``,
+    ...(itemLines ? [itemLines, ``] : []),
+    `Total: *₦${totalNaira}*`,
+    `Payment: ${order.payment_method.toUpperCase()}`,
+    `Status: ${order.order_status}`,
+    ``,
+    `Thank you for shopping with us! 🛍`,
+  ].join('\n');
+}
+
+/** Normalise a Nigerian phone number to international format (+234…). */
+function normaliseNgPhone(raw: string): string | null {
+  const cleaned = raw.replace(/\s+/g, '').replace(/[-().]/g, '');
+  if (/^\+234\d{10}$/.test(cleaned)) return cleaned;
+  if (/^234\d{10}$/.test(cleaned)) return `+${cleaned}`;
+  if (/^0[789]\d{9}$/.test(cleaned)) return `+234${cleaned.slice(1)}`;
+  return null;
+}
+
+// POST /api/pos/receipts/send-whatsapp — dispatch WhatsApp receipt via Termii
+app.post('/receipts/send-whatsapp', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
+
+  let body: { order_id: string; customer_phone: string };
+  try { body = await c.req.json(); } catch { return c.json({ success: false, error: 'Invalid JSON body' }, 400); }
+
+  const { order_id, customer_phone } = body;
+  if (!order_id?.trim()) return c.json({ success: false, error: 'order_id is required' }, 400);
+  if (!customer_phone?.trim()) return c.json({ success: false, error: 'customer_phone is required' }, 400);
+
+  const phone = normaliseNgPhone(customer_phone.trim());
+  if (!phone) return c.json({ success: false, error: 'Invalid Nigerian phone number. Use 08012345678 or +2348012345678.' }, 422);
+
+  if (!c.env.TERMII_API_KEY) {
+    // TERMII_API_KEY not configured — non-fatal (log, return 200 with warning)
+    return c.json({ success: false, error: 'WhatsApp receipts not configured (TERMII_API_KEY missing)' }, 503);
+  }
+
+  // Fetch order — tenant-scoped
+  const order = await c.env.DB.prepare(
+    `SELECT id, total_amount, payment_method, order_status, created_at, items_json
+     FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+  ).bind(order_id.trim(), tenantId).first<{
+    id: string; total_amount: number; payment_method: string;
+    order_status: string; created_at: number; items_json: string | null;
+  }>();
+
+  if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+  const messageText = buildWhatsappReceiptText(order);
+
+  try {
+    const sms = createSmsProvider(c.env.TERMII_API_KEY);
+    const result = await sms.sendMessage(phone, messageText);
+    return c.json({
+      success: result.success,
+      data: {
+        messageId: result.messageId ?? null,
+        channel: result.channel,
+        phone,
+        order_id: order.id,
+      },
+      ...(result.success ? {} : { error: result.error ?? 'Delivery failed' }),
+    }, result.success ? 200 : 502);
+  } catch (err) {
+    console.error('[POS][whatsapp-receipt] send error:', err);
+    return c.json({ success: false, error: 'Failed to dispatch WhatsApp receipt' }, 503);
+  }
+});
+
 // POST /api/pos/sync — Offline mutation replay (idempotent)
 app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
@@ -1254,6 +1362,48 @@ app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (
         console.error('[POS][sync] mutation apply error:', err);
         failed.push(m.entity_id);
       }
+      continue;
+    }
+
+    // ── receipt_notification: flush queued WhatsApp receipt sends ───────────
+    // Queued when the POS was offline at the time of checkout. On reconnect,
+    // the background sync flushes these through here so the customer receives
+    // their receipt once the device comes back online.
+    if (m.entity_type === 'receipt_notification' && m.action === 'CREATE') {
+      const payload = m.payload as { order_id?: string; customer_phone?: string };
+      const { order_id: rOrderId, customer_phone: rPhone } = payload;
+      if (!rOrderId || !rPhone) { skipped.push(m.entity_id); continue; }
+
+      const normPhone = normaliseNgPhone(rPhone);
+      if (!normPhone) { skipped.push(m.entity_id); continue; }
+
+      if (!c.env.TERMII_API_KEY) { skipped.push(m.entity_id); continue; }
+
+      try {
+        const rOrder = await c.env.DB.prepare(
+          `SELECT id, total_amount, payment_method, order_status, created_at, items_json
+           FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+        ).bind(rOrderId, tenantId).first<{
+          id: string; total_amount: number; payment_method: string;
+          order_status: string; created_at: number; items_json: string | null;
+        }>();
+
+        if (!rOrder) { skipped.push(m.entity_id); continue; }
+
+        const msgText = buildWhatsappReceiptText(rOrder);
+        const sms = createSmsProvider(c.env.TERMII_API_KEY);
+        const result = await sms.sendMessage(normPhone, msgText);
+        if (result.success) {
+          applied.push(m.entity_id);
+        } else {
+          console.warn('[POS][sync] WhatsApp receipt failed:', result.error);
+          failed.push(m.entity_id);
+        }
+      } catch (err) {
+        console.error('[POS][sync] receipt_notification error:', err);
+        failed.push(m.entity_id);
+      }
+      continue;
     }
   }
 

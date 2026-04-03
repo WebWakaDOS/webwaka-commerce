@@ -155,13 +155,15 @@ export function createPaymentProvider(_secretKey: string): IPaymentProvider {
 // ── SMS provider stub ─────────────────────────────────────────────────────────
 
 export interface ISmsProvider {
-  sendOtp: (phone: string, message: string, channel?: string) => Promise<{ success: boolean }>;
+  sendOtp: (phone: string, message: string, channel?: string) => Promise<{ success: boolean; messageId?: string; channel?: string; error?: string }>;
+  sendMessage: (phone: string, message: string) => Promise<{ success: boolean; messageId?: string; channel?: string; error?: string }>;
 }
 
 /** Mock createSmsProvider — returns a provider that succeeds immediately. */
 export function createSmsProvider(_apiKey: string): ISmsProvider {
   return {
-    sendOtp: async (_phone: string, _message: string, _channel?: string) => ({ success: true }),
+    sendOtp: async (_phone: string, _message: string, _channel?: string) => ({ success: true, channel: 'whatsapp' }),
+    sendMessage: async (_phone: string, _message: string) => ({ success: true, channel: 'whatsapp', messageId: 'mock_msg_id' }),
   };
 }
 

@@ -259,6 +259,12 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
   const [receipt, setReceipt] = useState<ReceiptData | null>(null);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
 
+  // ── T-COM-02: WhatsApp digital receipt send state ─────────────────────────
+  type WaSendStatus = 'idle' | 'sending' | 'sent' | 'queued' | 'error';
+  const [waSendPhone, setWaSendPhone] = useState('');
+  const [waSendStatus, setWaSendStatus] = useState<WaSendStatus>('idle');
+  const [waSendError, setWaSendError] = useState<string | null>(null);
+
   // ── Barcode / search ─────────────────────────────────────────────────────
   const [barcodeInput, setBarcodeInput] = useState('');
   const [searchInput, setSearchInput] = useState('');
@@ -363,6 +369,16 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
     };
   }, [activeSession, resetInactivityTimer]);
+
+  // ── T-COM-02: Pre-fill WA phone from receipt customer_phone on checkout ───
+  useEffect(() => {
+    if (receipt) {
+      const phone = (receipt as { customer_phone?: string | null }).customer_phone ?? '';
+      setWaSendPhone(phone ?? '');
+      setWaSendStatus('idle');
+      setWaSendError(null);
+    }
+  }, [receipt]);
 
   // ── T-COM-01: Load POS outlets when cashier enters the Pick & Pack screen ──
   useEffect(() => {
@@ -1950,14 +1966,14 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
               🖨 Print
             </button>
 
-            {/* WhatsApp share */}
+            {/* WhatsApp share — opens wa.me link as fallback / self-serve */}
             <button
               onClick={() => {
                 const url = receipt.whatsapp_url
                   ?? `https://wa.me/?text=${encodeURIComponent(`WebWaka POS\nReceipt: #${receiptId}\nTotal: ₦${(totalKobo / 100).toFixed(2)}\nPayment: ${receipt.payment_method}\nThank you!`)}`;
                 window.open(url, '_blank', 'noopener');
               }}
-              aria-label="Share receipt via WhatsApp"
+              aria-label="Share receipt via WhatsApp (self-serve)"
               style={{
                 padding: '0.6rem 1rem',
                 background: '#25D366',
@@ -1968,7 +1984,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
                 fontSize: '0.85rem',
               }}
             >
-              WhatsApp
+              Share
             </button>
 
             {/* Void order */}
@@ -2011,6 +2027,127 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
             >
               New Sale
             </button>
+          </div>
+
+          {/* ── T-COM-02: WhatsApp Digital Receipt — API-driven send ──────── */}
+          {/* Sends a formatted receipt via Termii WhatsApp channel.           */}
+          {/* If offline, queues a receipt_notification mutation in Dexie so   */}
+          {/* the customer receives the receipt once the device reconnects.    */}
+          <div
+            className="no-print"
+            style={{
+              marginTop: '1.25rem',
+              borderTop: '1px dashed #e5e7eb',
+              paddingTop: '1rem',
+            }}
+          >
+            <p style={{ margin: '0 0 0.5rem', fontSize: '0.78rem', color: '#374151', fontWeight: 600 }}>
+              📱 Send Receipt via WhatsApp
+            </p>
+            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                type="tel"
+                value={waSendPhone}
+                onChange={e => setWaSendPhone(e.target.value)}
+                placeholder="08012345678"
+                disabled={waSendStatus === 'sending' || waSendStatus === 'sent'}
+                aria-label="Customer WhatsApp number for receipt"
+                style={{
+                  flex: 1, minWidth: '150px',
+                  padding: '0.4rem 0.55rem',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '4px',
+                  fontSize: '0.82rem',
+                }}
+              />
+              <button
+                disabled={waSendStatus === 'sending' || waSendStatus === 'sent' || !waSendPhone.trim()}
+                aria-label="Send WhatsApp receipt"
+                onClick={async () => {
+                  if (!waSendPhone.trim() || !orderId) return;
+                  setWaSendStatus('sending');
+                  setWaSendError(null);
+
+                  if (!isOnline) {
+                    // ── Offline path: queue in Dexie — flushed by background sync ──
+                    try {
+                      const { queueMutation } = await import('../../core/offline/db');
+                      await queueMutation(
+                        tenantId,
+                        'receipt_notification',
+                        `rn_${orderId}_${Date.now()}`,
+                        'CREATE',
+                        { order_id: orderId, customer_phone: waSendPhone.trim() },
+                      );
+                      setWaSendStatus('queued');
+                    } catch {
+                      setWaSendStatus('error');
+                      setWaSendError('Failed to queue receipt. Try again.');
+                    }
+                    return;
+                  }
+
+                  // ── Online path: call backend Termii endpoint ───────────────
+                  try {
+                    const token = sessionStorage.getItem('pos_session_token') ?? '';
+                    const res = await fetch('/api/pos/receipts/send-whatsapp', {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`,
+                        'x-tenant-id': tenantId,
+                      },
+                      body: JSON.stringify({ order_id: orderId, customer_phone: waSendPhone.trim() }),
+                    });
+                    const data = await res.json() as { success: boolean; error?: string };
+                    if (data.success) {
+                      setWaSendStatus('sent');
+                    } else {
+                      setWaSendStatus('error');
+                      setWaSendError(data.error ?? 'Failed to send WhatsApp receipt.');
+                    }
+                  } catch {
+                    setWaSendStatus('error');
+                    setWaSendError('Network error — please retry.');
+                  }
+                }}
+                style={{
+                  padding: '0.4rem 0.75rem',
+                  background: waSendStatus === 'sent' ? '#059669'
+                    : waSendStatus === 'sending' ? '#9ca3af'
+                    : '#128C7E',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: (waSendStatus === 'sending' || waSendStatus === 'sent' || !waSendPhone.trim()) ? 'not-allowed' : 'pointer',
+                  fontSize: '0.82rem',
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {waSendStatus === 'sending' ? 'Sending…'
+                  : waSendStatus === 'sent' ? '✓ Sent'
+                  : waSendStatus === 'queued' ? '⏳ Queued'
+                  : '📤 Send'}
+              </button>
+            </div>
+
+            {/* Status feedback */}
+            {waSendStatus === 'sent' && (
+              <p style={{ margin: '0.35rem 0 0', fontSize: '0.75rem', color: '#059669' }}>
+                ✅ Receipt sent to {waSendPhone}
+              </p>
+            )}
+            {waSendStatus === 'queued' && (
+              <p style={{ margin: '0.35rem 0 0', fontSize: '0.75rem', color: '#d97706' }}>
+                ⏳ Queued — will send when connection is restored.
+              </p>
+            )}
+            {waSendStatus === 'error' && waSendError && (
+              <p role="alert" style={{ margin: '0.35rem 0 0', fontSize: '0.75rem', color: '#dc2626' }}>
+                ⚠ {waSendError}
+              </p>
+            )}
           </div>
         </div>
       </div>

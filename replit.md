@@ -1,4 +1,4 @@
-# WebWaka Commerce Suite — T-COM-01 Complete (858 tests)
+# WebWaka Commerce Suite — T-COM-02 Complete (872 tests)
 
 ## Project Overview
 AI-native, mobile-first, offline-first SaaS operating system and commerce platform for emerging markets (Nigeria/Africa). Includes POS, Single-Vendor Storefront, and Multi-Vendor Marketplace modules.
@@ -416,4 +416,4 @@ See `.env.example` for reference:
 - Receipt expanded: shows pts redeemed (red), pts earned (green), new balance, and tier.
 - All loyalty state cleared on hold, checkout, and receipt dismiss.
 
-**TypeScript clean (0 new errors), 858/858 tests passing. P12+P13 complete (see above). T-COM-01 complete: POS Micro-Hub Fulfillment — migration 021 (`pos_outlets` table + fulfillment columns on `orders`), outlet CRUD API (`POST/GET/PATCH /outlets`), fulfillment queue state machine (`GET /fulfillment-queue`, `PATCH /fulfillment-queue/:id/start`, `PATCH /fulfillment-queue/:id/packed`), Haversine geo-routing in SV checkout (featureFlag-gated, `featureFlags.micro_hub_routing`), two new `@webwaka/core` events (`ORDER_FULFILLMENT_ASSIGNED`, `ORDER_PACKED`), Pick & Pack POS UI screen + nav tab, 30 new tests (16 POS API + 9 SV Haversine + 4 SV integration + 1 mock constant).**
+**TypeScript clean (0 new errors), 872/872 tests passing. P12+P13 complete (see above). T-COM-01 complete: POS Micro-Hub Fulfillment — migration 021 (`pos_outlets` table + fulfillment columns on `orders`), outlet CRUD API (`POST/GET/PATCH /outlets`), fulfillment queue state machine (`GET /fulfillment-queue`, `PATCH /fulfillment-queue/:id/start`, `PATCH /fulfillment-queue/:id/packed`), Haversine geo-routing in SV checkout (featureFlag-gated, `featureFlags.micro_hub_routing`), two new `@webwaka/core` events (`ORDER_FULFILLMENT_ASSIGNED`, `ORDER_PACKED`), Pick & Pack POS UI screen + nav tab, 30 new tests. T-COM-02 complete: POS WhatsApp Digital Receipts — `POST /api/pos/receipts/send-whatsapp` endpoint with `buildWhatsappReceiptText()` + `normaliseNgPhone()` helpers; `POST /sync` extended for `receipt_notification` entity type (queued offline, flushed on reconnect via Dexie background sync); POS receipt UI WhatsApp send panel (online + offline paths, status feedback); `ISmsProvider.sendMessage` added to mock; 14 new tests (9 endpoint + 5 sync).**

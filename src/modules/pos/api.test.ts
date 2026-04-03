@@ -1226,4 +1226,251 @@ describe('COM-1: POS API', () => {
       expect(mockDb.bind).toHaveBeenCalledWith('prod_1', 'tnt_isolate');
     });
   });
+
+  // ─── T-COM-02: WhatsApp Digital Receipts ─────────────────────────────────────
+  describe('T-COM-02: WhatsApp Digital Receipts', () => {
+    const envWithTermii = { ...mockEnv, TERMII_API_KEY: 'test_termii_key' };
+
+    describe('POST /receipts/send-whatsapp', () => {
+      it('returns 400 when order_id is missing', async () => {
+        const req = makeRequest('POST', '/receipts/send-whatsapp', { customer_phone: '08012345678' });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.success).toBe(false);
+        expect(body.error).toMatch(/order_id/i);
+      });
+
+      it('returns 400 when customer_phone is missing', async () => {
+        const req = makeRequest('POST', '/receipts/send-whatsapp', { order_id: 'ord_test_1' });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.success).toBe(false);
+        expect(body.error).toMatch(/customer_phone/i);
+      });
+
+      it('returns 422 for an invalid phone number format', async () => {
+        const req = makeRequest('POST', '/receipts/send-whatsapp', {
+          order_id: 'ord_test_1',
+          customer_phone: '123',
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(422);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.success).toBe(false);
+        expect(body.error).toMatch(/phone/i);
+      });
+
+      it('returns 503 when TERMII_API_KEY is not configured', async () => {
+        const req = makeRequest('POST', '/receipts/send-whatsapp', {
+          order_id: 'ord_test_1',
+          customer_phone: '08012345678',
+        });
+        const res = await posRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(503);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.success).toBe(false);
+        expect(body.error).toMatch(/TERMII/i);
+      });
+
+      it('returns 404 when order is not found for tenant', async () => {
+        mockDb.first.mockResolvedValueOnce(null);
+        const req = makeRequest('POST', '/receipts/send-whatsapp', {
+          order_id: 'ord_does_not_exist',
+          customer_phone: '08012345678',
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(404);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.success).toBe(false);
+        expect(body.error).toMatch(/not found/i);
+      });
+
+      it('sends message and returns 200 with messageId on success', async () => {
+        mockDb.first.mockResolvedValueOnce({
+          id: 'ord_wa_1',
+          total_amount: 250000,
+          payment_method: 'cash',
+          order_status: 'fulfilled',
+          created_at: Date.now() - 60000,
+          items_json: JSON.stringify([{ name: 'Jollof Rice', quantity: 2, price: 125000 }]),
+        });
+        const req = makeRequest('POST', '/receipts/send-whatsapp', {
+          order_id: 'ord_wa_1',
+          customer_phone: '08012345678',
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { messageId: string; phone: string; order_id: string; channel: string } };
+        expect(body.success).toBe(true);
+        expect(body.data.phone).toBe('+2348012345678');
+        expect(body.data.order_id).toBe('ord_wa_1');
+        expect(typeof body.data.messageId).toBe('string');
+      });
+
+      it('normalises +234 international prefix correctly', async () => {
+        mockDb.first.mockResolvedValueOnce({
+          id: 'ord_wa_2',
+          total_amount: 100000,
+          payment_method: 'transfer',
+          order_status: 'fulfilled',
+          created_at: Date.now(),
+          items_json: '[]',
+        });
+        const req = makeRequest('POST', '/receipts/send-whatsapp', {
+          order_id: 'ord_wa_2',
+          customer_phone: '+2347055556666',
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { phone: string } };
+        expect(body.data.phone).toBe('+2347055556666');
+      });
+
+      it('normalises 234XXXXXXXXXX (no plus) prefix correctly', async () => {
+        mockDb.first.mockResolvedValueOnce({
+          id: 'ord_wa_3',
+          total_amount: 50000,
+          payment_method: 'card',
+          order_status: 'fulfilled',
+          created_at: Date.now(),
+          items_json: '[]',
+        });
+        const req = makeRequest('POST', '/receipts/send-whatsapp', {
+          order_id: 'ord_wa_3',
+          customer_phone: '2348098765432',
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { phone: string } };
+        expect(body.data.phone).toBe('+2348098765432');
+      });
+
+      it('enforces tenant isolation — DB query binds tenant_id alongside order_id', async () => {
+        mockDb.first.mockResolvedValueOnce(null);
+        const req = makeRequest('POST', '/receipts/send-whatsapp', {
+          order_id: 'ord_other_tenant',
+          customer_phone: '08099990000',
+        }, 'tnt_isolated');
+        await posRouter.fetch(req, envWithTermii as any);
+        const bindCalls = (mockDb.bind.mock.calls as Array<unknown[]>);
+        const ordBindCall = bindCalls.find(args => args.includes('ord_other_tenant'));
+        expect(ordBindCall).toBeDefined();
+        const ordArgs = ordBindCall as string[];
+        expect(ordArgs).toContain('tnt_isolated');
+      });
+    });
+
+    describe('POST /sync with receipt_notification entity', () => {
+      it('applies a receipt_notification mutation via Termii on sync', async () => {
+        mockDb.first.mockResolvedValueOnce({
+          id: 'ord_sync_wa_1',
+          total_amount: 75000,
+          payment_method: 'cash',
+          order_status: 'fulfilled',
+          created_at: Date.now() - 120000,
+          items_json: JSON.stringify([{ name: 'Puff Puff', quantity: 3, price: 25000 }]),
+        });
+        const req = makeRequest('POST', '/sync', {
+          mutations: [{
+            entity_type: 'receipt_notification',
+            entity_id: 'rn_ord_sync_wa_1_1234567890',
+            action: 'CREATE',
+            payload: { order_id: 'ord_sync_wa_1', customer_phone: '08055556666' },
+            version: 1,
+          }],
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { applied: string[]; skipped: string[]; failed: string[] } };
+        expect(body.success).toBe(true);
+        expect(body.data.applied).toContain('rn_ord_sync_wa_1_1234567890');
+        expect(body.data.skipped).toHaveLength(0);
+        expect(body.data.failed).toHaveLength(0);
+      });
+
+      it('skips receipt_notification when payload has no phone', async () => {
+        const req = makeRequest('POST', '/sync', {
+          mutations: [{
+            entity_type: 'receipt_notification',
+            entity_id: 'rn_no_phone',
+            action: 'CREATE',
+            payload: { order_id: 'ord_abc', customer_phone: '' },
+            version: 1,
+          }],
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        const body = await res.json() as { success: boolean; data: { skipped: string[] } };
+        expect(body.data.skipped).toContain('rn_no_phone');
+      });
+
+      it('skips receipt_notification when TERMII_API_KEY is absent', async () => {
+        const req = makeRequest('POST', '/sync', {
+          mutations: [{
+            entity_type: 'receipt_notification',
+            entity_id: 'rn_no_key',
+            action: 'CREATE',
+            payload: { order_id: 'ord_abc', customer_phone: '08012345678' },
+            version: 1,
+          }],
+        });
+        const res = await posRouter.fetch(req, mockEnv as any);
+        const body = await res.json() as { success: boolean; data: { skipped: string[] } };
+        expect(body.data.skipped).toContain('rn_no_key');
+      });
+
+      it('skips receipt_notification when order not found for tenant', async () => {
+        mockDb.first.mockResolvedValueOnce(null);
+        const req = makeRequest('POST', '/sync', {
+          mutations: [{
+            entity_type: 'receipt_notification',
+            entity_id: 'rn_missing_order',
+            action: 'CREATE',
+            payload: { order_id: 'ord_ghost', customer_phone: '08012345678' },
+            version: 1,
+          }],
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        const body = await res.json() as { success: boolean; data: { skipped: string[] } };
+        expect(body.data.skipped).toContain('rn_missing_order');
+      });
+
+      it('handles mixed mutations — order CREATE + receipt_notification in one batch', async () => {
+        mockDb.first
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({
+            id: 'ord_sync_mix_1',
+            total_amount: 30000,
+            payment_method: 'cash',
+            order_status: 'fulfilled',
+            created_at: Date.now(),
+            items_json: '[]',
+          });
+        mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('POST', '/sync', {
+          mutations: [
+            {
+              entity_type: 'order',
+              entity_id: 'offline_order_mix',
+              action: 'CREATE',
+              payload: { items: [], subtotal: 30000, total_amount: 30000, payment_method: 'cash' },
+              version: 1,
+            },
+            {
+              entity_type: 'receipt_notification',
+              entity_id: 'rn_mix_1',
+              action: 'CREATE',
+              payload: { order_id: 'ord_sync_mix_1', customer_phone: '09011112222' },
+              version: 1,
+            },
+          ],
+        });
+        const res = await posRouter.fetch(req, envWithTermii as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { applied: string[] } };
+        expect(body.data.applied).toContain('rn_mix_1');
+      });
+    });
+  });
 });
