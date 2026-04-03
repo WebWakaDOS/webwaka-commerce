@@ -311,6 +311,9 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     fulfillment_assigned_at: string;
     delivery_address: { state?: string; lga?: string; street?: string } | null;
   }
+  interface PickPackOutlet { id: string; name: string; address: string | null }
+  const [pickPackOutlets, setPickPackOutlets] = useState<PickPackOutlet[]>([]);
+  const [pickPackOutletsLoading, setPickPackOutletsLoading] = useState(false);
   const [pickPackOrders, setPickPackOrders] = useState<PickPackOrder[]>([]);
   const [pickPackLoading, setPickPackLoading] = useState(false);
   const [pickPackError, setPickPackError] = useState<string | null>(null);
@@ -360,6 +363,58 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
       if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
     };
   }, [activeSession, resetInactivityTimer]);
+
+  // ── T-COM-01: Load POS outlets when cashier enters the Pick & Pack screen ──
+  useEffect(() => {
+    if (screen !== 'pick-pack') return;
+    let cancelled = false;
+    const load = async () => {
+      setPickPackOutletsLoading(true);
+      try {
+        const token = sessionStorage.getItem('pos_session_token') ?? '';
+        const tenantId = sessionStorage.getItem('pos_tenant_id') ?? '';
+        const res = await fetch('/api/pos/outlets', {
+          headers: { 'Authorization': `Bearer ${token}`, 'x-tenant-id': tenantId },
+        });
+        const data = await res.json() as { success: boolean; data?: PickPackOutlet[] };
+        if (!cancelled && data.success && Array.isArray(data.data)) {
+          setPickPackOutlets(data.data);
+          // Auto-select the only outlet so cashier does not have to choose
+          const sole = data.data.length === 1 ? data.data[0] : undefined;
+          if (sole) setPickPackOutletId(sole.id);
+        }
+      } catch { /* non-fatal — cashier can still select manually if list fails */ }
+      finally { if (!cancelled) setPickPackOutletsLoading(false); }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [screen]);
+
+  // ── T-COM-01: Auto-load queue when outlet selection changes ─────────────────
+  useEffect(() => {
+    if (screen !== 'pick-pack' || !pickPackOutletId) return;
+    let cancelled = false;
+    const load = async () => {
+      setPickPackLoading(true);
+      setPickPackError(null);
+      try {
+        const token = sessionStorage.getItem('pos_session_token') ?? '';
+        const tenantId = sessionStorage.getItem('pos_tenant_id') ?? '';
+        const res = await fetch(`/api/pos/fulfillment-queue?outlet_id=${encodeURIComponent(pickPackOutletId)}`, {
+          headers: { 'Authorization': `Bearer ${token}`, 'x-tenant-id': tenantId },
+        });
+        const data = await res.json() as { success: boolean; data?: PickPackOrder[]; error?: string };
+        if (!cancelled) {
+          if (!data.success) throw new Error(data.error ?? 'Failed to load queue');
+          setPickPackOrders(data.data ?? []);
+        }
+      } catch (e) {
+        if (!cancelled) setPickPackError(e instanceof Error ? e.message : 'Failed to load queue');
+      } finally { if (!cancelled) setPickPackLoading(false); }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [screen, pickPackOutletId]);
 
   // PIN digit entry handler
   const handlePinDigit = useCallback((digit: string) => {
@@ -1476,14 +1531,16 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
 
   // ── T-COM-01: Pick & Pack screen — micro-hub fulfillment queue ──────────────
   if (screen === 'pick-pack') {
-    const loadQueue = async () => {
-      if (!pickPackOutletId.trim()) { setPickPackError('Enter an Outlet ID to load the queue.'); return; }
+    // Outlets are loaded via useEffect above; queue auto-loads when outlet changes.
+    // Manual refresh after a state transition (start/packed).
+    const refreshQueue = async (outletId: string) => {
+      if (!outletId) return;
       setPickPackLoading(true);
       setPickPackError(null);
       try {
         const token = sessionStorage.getItem('pos_session_token') ?? '';
         const tenantId = sessionStorage.getItem('pos_tenant_id') ?? '';
-        const res = await fetch(`/api/pos/fulfillment-queue?outlet_id=${encodeURIComponent(pickPackOutletId.trim())}`, {
+        const res = await fetch(`/api/pos/fulfillment-queue?outlet_id=${encodeURIComponent(outletId)}`, {
           headers: { 'Authorization': `Bearer ${token}`, 'x-tenant-id': tenantId },
         });
         const data = await res.json() as { success: boolean; data?: PickPackOrder[]; error?: string };
@@ -1507,13 +1564,15 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         });
         const data = await res.json() as { success: boolean; error?: string };
         if (!data.success) throw new Error(data.error ?? `Failed to ${action}`);
-        await loadQueue();
+        await refreshQueue(pickPackOutletId);
       } catch (e) {
         setPickPackError(e instanceof Error ? e.message : `Failed to update order`);
       } finally {
         setPickPackActionLoading(null);
       }
     };
+
+    const selectedOutlet = pickPackOutlets.find(o => o.id === pickPackOutletId);
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
@@ -1529,22 +1588,47 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
           </div>
         </header>
 
-        <div style={{ padding: '1rem', borderBottom: '1px solid #e5e7eb', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          <input
-            type="text"
-            value={pickPackOutletId}
-            onChange={e => setPickPackOutletId(e.target.value)}
-            placeholder="Outlet ID (e.g. out_123_abc)"
-            style={{ flex: 1, minWidth: '200px', padding: '0.45rem 0.6rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.85rem' }}
-          />
+        {/* ── Outlet selector toolbar ─────────────────────────────────────── */}
+        <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid #e5e7eb', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap', background: '#f9fafb' }}>
+          {pickPackOutletsLoading ? (
+            <span style={{ fontSize: '0.83rem', color: '#6b7280' }}>Loading outlets…</span>
+          ) : pickPackOutlets.length === 0 ? (
+            <span style={{ fontSize: '0.83rem', color: '#92400e', background: '#fef3c7', padding: '0.3rem 0.6rem', borderRadius: '4px' }}>
+              No outlets configured. Ask your admin to add a POS outlet first.
+            </span>
+          ) : (
+            <>
+              <label htmlFor="pp-outlet-select" style={{ fontSize: '0.83rem', color: '#374151', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                Outlet:
+              </label>
+              <select
+                id="pp-outlet-select"
+                value={pickPackOutletId}
+                onChange={e => setPickPackOutletId(e.target.value)}
+                style={{ flex: 1, minWidth: '180px', padding: '0.42rem 0.6rem', border: '1px solid #d1d5db', borderRadius: '4px', fontSize: '0.85rem', background: '#fff' }}
+              >
+                {pickPackOutlets.length > 1 && <option value="">— Select outlet —</option>}
+                {pickPackOutlets.map(o => (
+                  <option key={o.id} value={o.id}>{o.name}{o.address ? ` · ${o.address}` : ''}</option>
+                ))}
+              </select>
+            </>
+          )}
           <button
-            onClick={loadQueue}
-            disabled={pickPackLoading}
-            style={{ padding: '0.45rem 0.9rem', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.85rem', fontWeight: 600 }}
+            onClick={() => refreshQueue(pickPackOutletId)}
+            disabled={pickPackLoading || !pickPackOutletId}
+            aria-label="Refresh fulfillment queue"
+            style={{ padding: '0.42rem 0.75rem', background: pickPackOutletId ? '#2563eb' : '#9ca3af', color: '#fff', border: 'none', borderRadius: '4px', cursor: pickPackOutletId ? 'pointer' : 'not-allowed', fontSize: '0.83rem', fontWeight: 600, whiteSpace: 'nowrap' }}
           >
-            {pickPackLoading ? 'Loading…' : 'Load Queue'}
+            {pickPackLoading ? 'Loading…' : '↻ Refresh'}
           </button>
         </div>
+
+        {selectedOutlet?.address && (
+          <div style={{ padding: '0.4rem 1rem', background: '#eff6ff', fontSize: '0.78rem', color: '#1e40af', borderBottom: '1px solid #bfdbfe' }}>
+            📍 {selectedOutlet.address}
+          </div>
+        )}
 
         {pickPackError && (
           <div role="alert" style={{ margin: '0.75rem 1rem', padding: '0.65rem 0.85rem', background: '#fee2e2', color: '#991b1b', borderRadius: '4px', fontSize: '0.85rem' }}>
@@ -1553,9 +1637,14 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
         )}
 
         <div style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
-          {pickPackOrders.length === 0 && !pickPackLoading && !pickPackError && (
-            <p style={{ color: '#6b7280', textAlign: 'center', marginTop: '3rem' }}>
-              No pending pick-pack orders for this outlet.
+          {!pickPackOutletId && !pickPackLoading && (
+            <p style={{ color: '#6b7280', textAlign: 'center', marginTop: '3rem', fontSize: '0.9rem' }}>
+              Select an outlet above to view its fulfillment queue.
+            </p>
+          )}
+          {pickPackOutletId && pickPackOrders.length === 0 && !pickPackLoading && !pickPackError && (
+            <p style={{ color: '#6b7280', textAlign: 'center', marginTop: '3rem', fontSize: '0.9rem' }}>
+              No pending pick-pack orders for this outlet. All caught up!
             </p>
           )}
           {pickPackOrders.map(order => (
