@@ -2061,7 +2061,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
                 }}
               />
               <button
-                disabled={waSendStatus === 'sending' || waSendStatus === 'sent' || !waSendPhone.trim()}
+                disabled={waSendStatus === 'sending' || waSendStatus === 'sent' || waSendStatus === 'queued' || !waSendPhone.trim()}
                 aria-label="Send WhatsApp receipt"
                 onClick={async () => {
                   if (!waSendPhone.trim() || !orderId) return;
@@ -2115,11 +2115,12 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
                   padding: '0.4rem 0.75rem',
                   background: waSendStatus === 'sent' ? '#059669'
                     : waSendStatus === 'sending' ? '#9ca3af'
+                    : waSendStatus === 'queued' ? '#d97706'
                     : '#128C7E',
                   color: '#fff',
                   border: 'none',
                   borderRadius: '4px',
-                  cursor: (waSendStatus === 'sending' || waSendStatus === 'sent' || !waSendPhone.trim()) ? 'not-allowed' : 'pointer',
+                  cursor: (waSendStatus === 'sending' || waSendStatus === 'sent' || waSendStatus === 'queued' || !waSendPhone.trim()) ? 'not-allowed' : 'pointer',
                   fontSize: '0.82rem',
                   fontWeight: 600,
                   whiteSpace: 'nowrap',
