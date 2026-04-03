@@ -800,6 +800,58 @@ app.get('/ledger', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// T-COM-04: SHIPPING COST HELPER — Queries Logistics Unified Delivery Zone API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Retrieve a vendor's shipping fee (in kobo) for a customer's delivery destination.
+ *
+ * Architecture invariant: shipping distances and zone fees are the sole
+ * responsibility of the webwaka-logistics service. This function MUST NOT
+ * calculate distances or flat-rate tables internally — it delegates 100% to the
+ * LOGISTICS_WORKER Service Binding and falls back gracefully to 0 when the
+ * binding is unavailable (test / local environments).
+ *
+ * @param logisticsWorker  Cloudflare Service Binding to webwaka-logistics
+ * @param tenantId         Marketplace tenant identifier
+ * @param vendorId         Vendor whose pickup zone is queried
+ * @param state            Customer delivery state (e.g. "Lagos")
+ * @param lga              Customer delivery LGA (optional refinement)
+ * @param orderValueKobo   Vendor sub-order value in kobo (for free-shipping thresholds)
+ * @returns                Shipping fee in kobo (integer, ≥ 0); 0 on any failure
+ */
+async function getVendorShippingCost(
+  logisticsWorker: Fetcher | undefined,
+  tenantId: string,
+  vendorId: string,
+  state: string,
+  lga: string | undefined,
+  orderValueKobo: number,
+): Promise<number> {
+  if (!logisticsWorker || !state) return 0;
+  try {
+    const params = new URLSearchParams({
+      vendor_id: vendorId,
+      state,
+      order_value: String(orderValueKobo),
+      weight_kg: '0',
+    });
+    if (lga) params.set('lga', lga);
+    const resp = await logisticsWorker.fetch(
+      `http://internal/api/delivery-zones/estimate?${params.toString()}`,
+      { headers: { 'x-tenant-id': tenantId } },
+    );
+    const data = await resp.json<{ success: boolean; data?: { total_fee?: number } }>();
+    if (data.success && data.data?.total_fee != null) {
+      return Math.max(0, Math.round(data.data.total_fee));
+    }
+  } catch {
+    // Non-fatal: logistics service unavailable → 0 shipping (customer notified via response note)
+  }
+  return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // PUBLIC CHECKOUT — NDPR required; Paystack verify added in MV-2
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -971,12 +1023,18 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   const mkpOrderId = `mkp_ord_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
   try {
-    // ── Build per-vendor breakdown (fetch commission_rates) ──────────────────
+    // ── Build per-vendor breakdown (fetch commission_rates + shipping costs) ─
     const breakdownMap: Record<string, {
       vendor_id: string; subtotal: number; commission: number; payout: number; commission_rate: number;
       settlement_id?: string; hold_until?: number; hold_days?: number;
       vendorName?: string; vendorPickupAddress?: string;
+      // T-COM-04: per-vendor shipping fee (kobo) from Logistics Unified Delivery Zone API
+      shippingKobo: number;
     }> = {};
+    // T-COM-04: Running total shipping across all vendor sub-orders
+    let totalShippingKobo = 0;
+    // T-COM-04: LOGISTICS_WORKER Service Binding (undefined in test/local envs — falls back to 0)
+    const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
 
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const vendorRow = await c.env.DB.prepare(
@@ -989,27 +1047,52 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       const rateBps = await resolveCommissionRate(c.env.DB, tenantId!, vendorId, firstItemCategory, vendorDefaultBps);
       const commissionKobo = Math.round(group.subtotal * rateBps / 10000);
       const payout = group.subtotal - commissionKobo;
+
+      // T-COM-04: Query Logistics Unified Delivery Zone service for this vendor's shipping fee.
+      // Architecture invariant: distances and zone fees are computed exclusively by
+      // webwaka-logistics. We query per-vendor and sum below.
+      const vendorShippingKobo = await getVendorShippingCost(
+        logisticsWorker,
+        tenantId!,
+        vendorId,
+        body.shipping_address?.state ?? '',
+        body.shipping_address?.lga,
+        group.subtotal,
+      );
+      totalShippingKobo += vendorShippingKobo;
+
       breakdownMap[vendorId] = {
         vendor_id: vendorId, subtotal: group.subtotal, commission: commissionKobo, payout, commission_rate: rateBps,
         vendorName: vendorRow?.name ?? vendorId,
+        shippingKobo: vendorShippingKobo,
         ...(vendorRow?.pickupAddress ? { vendorPickupAddress: vendorRow.pickupAddress } : {}),
       };
     }
 
     // ── Insert marketplace_orders umbrella ───────────────────────────────────
+    // total_amount includes subtotal + consolidated shipping from all vendors (T-COM-04)
+    const grandTotal = subtotal + totalShippingKobo;
+    // Shipping breakdown per vendor (shippingKobo per vendor_id) for customer receipt
+    const shippingBreakdown: Record<string, number> = {};
+    for (const [vid, bd] of Object.entries(breakdownMap)) {
+      shippingBreakdown[vid] = bd.shippingKobo;
+    }
+
     await c.env.DB.prepare(
       `INSERT INTO marketplace_orders
          (id, tenant_id, customer_email, customer_phone, items_json, vendor_count,
-          subtotal, total_amount, payment_method, payment_reference, payment_status,
+          subtotal, total_amount, total_shipping_kobo, shipping_breakdown_json,
+          payment_method, payment_reference, payment_status,
           order_status, channel, ndpr_consent, vendor_breakdown_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'confirmed', 'marketplace', 1, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'confirmed', 'marketplace', 1, ?, ?, ?)`
     ).bind(
       mkpOrderId, tenantId,
       body.customer_email.trim(),
       body.customer_phone?.trim() ?? null,
       JSON.stringify(body.items),
       vendorCount,
-      subtotal, subtotal,
+      subtotal, grandTotal,
+      totalShippingKobo, JSON.stringify(shippingBreakdown),
       body.payment_method, paymentRef,
       JSON.stringify(breakdownMap),
       now, now,
@@ -1022,16 +1105,21 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       vendorSubOrderIds[vendorId] = childId;
       const childSubtotal = group.subtotal;
 
+      // T-COM-04: child order total includes this vendor's shipping contribution
+      const childShippingKobo = breakdownMap[vendorId]?.shippingKobo ?? 0;
+      const childTotal = childSubtotal + childShippingKobo;
+
       await c.env.DB.prepare(
         `INSERT INTO orders
            (id, tenant_id, customer_email, items_json, subtotal, discount, total_amount,
-            payment_method, payment_status, order_status, channel, payment_reference,
+            shipping_kobo, payment_method, payment_status, order_status, channel, payment_reference,
             marketplace_order_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'pending', 'confirmed', 'marketplace', ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 'pending', 'confirmed', 'marketplace', ?, ?, ?, ?)`
       ).bind(
         childId, tenantId, body.customer_email.trim(),
         JSON.stringify(group.items),
-        childSubtotal, childSubtotal,
+        childSubtotal, childTotal,
+        childShippingKobo,
         body.payment_method, paymentRef,
         mkpOrderId,
         now, now,
@@ -1158,6 +1246,8 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       const pickupAddr = rawPickup
         ? (() => { try { return JSON.parse(rawPickup); } catch { return rawPickup; } })()
         : null;
+      // T-COM-04: Per-vendor delivery event — one event per sub-order so the
+      // logistics service can dispatch a separate pickup per vendor location.
       await publishEvent(c.env.COMMERCE_EVENTS, {
         id: `evt_dlv_${now}_${Math.random().toString(36).slice(2, 9)}`,
         tenantId: tenantId!,
@@ -1166,12 +1256,18 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         timestamp: now,
         payload: {
           orderId: childId,
+          marketplaceOrderId: mkpOrderId,
           tenantId,
           sourceModule: 'multi-vendor',
           vendorId,
           pickupAddress: pickupAddr,
           deliveryAddress: body.shipping_address ?? null,
           itemsSummary: `${group.items.length} item(s) from ${vendorName}`,
+          // T-COM-04: shipping cost for this specific vendor sub-order (kobo)
+          shippingKobo: breakdownMap[vendorId]?.shippingKobo ?? 0,
+          // Logistics can use subtotal + shipping to confirm correct amount
+          subOrderSubtotalKobo: group.subtotal,
+          subOrderTotalKobo: childTotal,
         },
       }).catch(() => { /* non-fatal */ });
     }
@@ -1215,7 +1311,13 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         marketplace_order_id: mkpOrderId,
         subtotal,
         vat_kobo: mvVatKobo,
-        total_amount: subtotal,
+        // T-COM-04: total_amount = subtotal + consolidated shipping across all vendor sub-orders
+        total_amount: grandTotal,
+        total_shipping_kobo: totalShippingKobo,
+        // Per-vendor shipping fee for customer receipt / UI split shipment display
+        shipping_breakdown: shippingBreakdown,
+        // Indicates whether shipping fees were sourced from Logistics API or fell back to 0
+        shipping_source: logisticsWorker ? 'logistics' : 'fallback',
         payment_reference: paymentRef,
         payment_verified: body.payment_method === 'paystack' && !!c.env.PAYSTACK_SECRET,
         vendor_count: vendorCount,

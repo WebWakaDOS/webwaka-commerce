@@ -398,21 +398,73 @@ export const MarketplaceInterface: React.FC<{
         {cart.length > 0 && (
           <div style={{ marginTop: '2rem', backgroundColor: '#fff', padding: '1rem', borderRadius: '8px', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
             <h2 style={{ fontSize: '1.2rem', margin: '0 0 1rem 0' }}>Marketplace Cart</h2>
-            {cart.map(item => (
-              <div key={item.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.5rem 0', borderBottom: '1px solid #eee' }}>
-                <span style={{ flex: 1 }}>{item.name} (x{item.cartQuantity})</span>
-                <span style={{ marginRight: '1rem' }}>₦{((item.price * item.cartQuantity) / 100).toFixed(2)}</span>
-                <button
-                  onClick={() => removeFromCart(item.id)}
-                  style={{ padding: '0.25rem 0.5rem', backgroundColor: '#dc3545', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem' }}
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
+
+            {/* T-COM-04: Split Shipment Breakdown — one shipment per vendor */}
+            {(() => {
+              const vendorGroups = cart.reduce((acc, item) => {
+                const vid = item.vendorId ?? 'unknown';
+                if (!acc[vid]) acc[vid] = { vendorId: vid, vendorName: item.vendorName ?? vid, items: [] };
+                acc[vid]!.items.push(item);
+                return acc;
+              }, {} as Record<string, { vendorId: string; vendorName: string; items: MvCartItem[] }>);
+              const hasMultipleVendors = Object.keys(vendorGroups).length > 1;
+              return (
+                <>
+                  {hasMultipleVendors && (
+                    <div style={{
+                      backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: '6px',
+                      padding: '0.6rem 0.9rem', marginBottom: '1rem', fontSize: '0.9rem', color: '#1e40af',
+                    }}>
+                      📦 Your order will be shipped in <strong>{Object.keys(vendorGroups).length} separate packages</strong> from different sellers. Each package ships independently.
+                    </div>
+                  )}
+                  {Object.values(vendorGroups).map((group, idx) => {
+                    const groupSubtotal = group.items.reduce((s, i) => s + i.price * i.cartQuantity, 0);
+                    return (
+                      <div key={group.vendorId} style={{
+                        border: '1px solid #e5e7eb', borderRadius: '6px', marginBottom: '0.75rem', overflow: 'hidden',
+                      }}>
+                        <div style={{
+                          backgroundColor: '#f9fafb', padding: '0.4rem 0.75rem',
+                          fontSize: '0.82rem', fontWeight: 600, color: '#374151',
+                          borderBottom: '1px solid #e5e7eb', display: 'flex', justifyContent: 'space-between',
+                        }}>
+                          <span>📦 Shipment {idx + 1} — {group.vendorName}</span>
+                          <span style={{ fontWeight: 400, color: '#6b7280' }}>Subtotal: ₦{(groupSubtotal / 100).toFixed(2)}</span>
+                        </div>
+                        {group.items.map(item => (
+                          <div key={item.id} style={{
+                            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                            padding: '0.5rem 0.75rem', borderBottom: '1px solid #f3f4f6',
+                          }}>
+                            <span style={{ flex: 1, fontSize: '0.9rem' }}>{item.name} ×{item.cartQuantity}</span>
+                            <span style={{ marginRight: '0.75rem', fontSize: '0.9rem' }}>
+                              ₦{((item.price * item.cartQuantity) / 100).toFixed(2)}
+                            </span>
+                            <button
+                              onClick={() => removeFromCart(item.id)}
+                              style={{ padding: '0.2rem 0.45rem', backgroundColor: '#dc3545', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '0.75rem' }}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                        <div style={{ padding: '0.35rem 0.75rem', fontSize: '0.78rem', color: '#6b7280', backgroundColor: '#f9fafb' }}>
+                          🚚 Shipping fee calculated at checkout
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
+              );
+            })()}
+
             <div style={{ display: 'flex', justifyContent: 'space-between', padding: '1rem 0', fontWeight: 'bold', fontSize: '1.1rem' }}>
-              <span>Total:</span>
+              <span>Items Total:</span>
               <span>₦{(totalAmount / 100).toFixed(2)}</span>
+            </div>
+            <div style={{ fontSize: '0.82rem', color: '#6b7280', marginBottom: '0.5rem' }}>
+              + Shipping fees will be added per seller at checkout
             </div>
 
             <form onSubmit={handleCheckout} style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '0.5rem' }}>

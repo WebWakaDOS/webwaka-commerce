@@ -4353,4 +4353,231 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// T-COM-04: Multi-Vendor Cart Splitting & Consolidated Shipping
+// ═══════════════════════════════════════════════════════════════════════════════
+describe('T-COM-04: Multi-Vendor Cart Splitting & Consolidated Shipping', () => {
+  const mockLogisticsWorker = { fetch: vi.fn() };
+
+  const mockEnvWithLogistics = {
+    DB: mockDb,
+    TENANT_CONFIG: {},
+    EVENTS: {},
+    SESSIONS_KV: {},
+    JWT_SECRET: 'test-secret-32-chars-minimum!!!',
+    CATALOG_CACHE: mockCatalogCache,
+    ADMIN_API_KEY: 'admin-secret-key',
+    LOGISTICS_WORKER: mockLogisticsWorker,
+  };
+
+  function makeLogisticsFetch(totalFee: number) {
+    return vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, data: { total_fee: totalFee } }),
+    });
+  }
+
+  const checkoutBodyWithShipping = {
+    items: [
+      { product_id: 'p1', vendor_id: 'vnd_1', quantity: 1, price: 1000000, name: 'Laptop' },
+      { product_id: 'p2', vendor_id: 'vnd_2', quantity: 2, price: 250000, name: 'Book' },
+    ],
+    customer_email: 'buyer@example.com',
+    payment_method: 'paystack',
+    ndpr_consent: true,
+    shipping_address: { state: 'Lagos', lga: 'Ikeja', street: '1 Airport Road' },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockDb.first.mockResolvedValue(null);
+    mockDb.run.mockResolvedValue({ success: true });
+    mockDb.batch.mockResolvedValue([{ meta: { changes: 1 } }]);
+    mockCatalogCache.get.mockResolvedValue(null);
+    mockCatalogCache.put.mockResolvedValue(undefined);
+    _resetCheckoutRateLimitStore();
+    _resetOtpRateLimitStore();
+    _resetSearchRateLimitStore();
+  });
+
+  it('total_amount = subtotal + consolidated shipping when LOGISTICS_WORKER returns fees', async () => {
+    let logisticsCalls = 0;
+    mockLogisticsWorker.fetch = vi.fn().mockImplementation(() => {
+      logisticsCalls++;
+      const fee = logisticsCalls === 1 ? 500000 : 300000;
+      return Promise.resolve({ ok: true, json: async () => ({ success: true, data: { total_fee: fee } }) });
+    });
+
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    expect(res.status).toBe(201);
+    const data = await res.json() as any;
+    const subtotal = 1000000 + 250000 * 2; // 1 500 000
+    expect(data.data.subtotal).toBe(subtotal);
+    expect(data.data.total_shipping_kobo).toBe(800000);
+    expect(data.data.total_amount).toBe(subtotal + 800000);
+  });
+
+  it('shipping_breakdown contains per-vendor fees keyed by vendor_id', async () => {
+    let calls = 0;
+    mockLogisticsWorker.fetch = vi.fn().mockImplementation(() => {
+      calls++;
+      const fee = calls === 1 ? 500000 : 300000;
+      return Promise.resolve({ ok: true, json: async () => ({ success: true, data: { total_fee: fee } }) });
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    const data = await res.json() as any;
+    expect(data.data.shipping_breakdown).toHaveProperty('vnd_1');
+    expect(data.data.shipping_breakdown).toHaveProperty('vnd_2');
+    const fees = Object.values(data.data.shipping_breakdown as Record<string, number>);
+    expect(fees.reduce((a: number, b: number) => a + b, 0)).toBe(800000);
+  });
+
+  it('queries LOGISTICS_WORKER exactly once per distinct vendor group', async () => {
+    mockLogisticsWorker.fetch = makeLogisticsFetch(200000);
+    await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    expect(mockLogisticsWorker.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('logistics URL includes vendor_id, state, lga, and order_value query params', async () => {
+    mockLogisticsWorker.fetch = makeLogisticsFetch(100000);
+    await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    const firstCall = (mockLogisticsWorker.fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, unknown];
+    const url = firstCall[0] as string;
+    expect(url).toContain('vendor_id=');
+    expect(url).toContain('state=Lagos');
+    expect(url).toContain('lga=Ikeja');
+    expect(url).toContain('order_value=');
+  });
+
+  it('shipping_source is "logistics" when LOGISTICS_WORKER is configured', async () => {
+    mockLogisticsWorker.fetch = makeLogisticsFetch(100000);
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    const data = await res.json() as any;
+    expect(data.data.shipping_source).toBe('logistics');
+  });
+
+  it('shipping_source is "fallback" when LOGISTICS_WORKER is absent from env', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnv as any,
+    );
+    const data = await res.json() as any;
+    expect(data.data.shipping_source).toBe('fallback');
+  });
+
+  it('total_amount = subtotal and shipping = 0 when LOGISTICS_WORKER is absent', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnv as any,
+    );
+    const data = await res.json() as any;
+    const subtotal = 1000000 + 250000 * 2;
+    expect(data.data.total_amount).toBe(subtotal);
+    expect(data.data.total_shipping_kobo).toBe(0);
+  });
+
+  it('total_amount = subtotal and logistics NOT queried when no shipping_address state', async () => {
+    mockLogisticsWorker.fetch = makeLogisticsFetch(999999);
+    const { shipping_address: _ignored, ...bodyNoAddr } = checkoutBodyWithShipping as any;
+    void _ignored;
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', bodyNoAddr),
+      mockEnvWithLogistics as any,
+    );
+    const data = await res.json() as any;
+    expect(data.data.total_shipping_kobo).toBe(0);
+    expect(mockLogisticsWorker.fetch).not.toHaveBeenCalled();
+  });
+
+  it('vendor_breakdown entries include shippingKobo field', async () => {
+    let calls = 0;
+    mockLogisticsWorker.fetch = vi.fn().mockImplementation(() => {
+      calls++;
+      const fee = calls === 1 ? 500000 : 300000;
+      return Promise.resolve({ ok: true, json: async () => ({ success: true, data: { total_fee: fee } }) });
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    const data = await res.json() as any;
+    const breakdown = data.data.vendor_breakdown as Record<string, { shippingKobo: number }>;
+    expect(typeof breakdown['vnd_1']?.shippingKobo).toBe('number');
+    expect(typeof breakdown['vnd_2']?.shippingKobo).toBe('number');
+    const totalShipping = Object.values(breakdown).reduce((s, v) => s + (v.shippingKobo ?? 0), 0);
+    expect(totalShipping).toBe(800000);
+  });
+
+  it('gracefully falls back to 0 when logistics worker throws a network error', async () => {
+    mockLogisticsWorker.fetch = vi.fn().mockRejectedValue(new Error('Connection refused'));
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    expect(res.status).toBe(201);
+    const data = await res.json() as any;
+    expect(data.data.total_shipping_kobo).toBe(0);
+  });
+
+  it('gracefully falls back to 0 when logistics worker returns success:false', async () => {
+    mockLogisticsWorker.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: false, data: null }),
+    });
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', checkoutBodyWithShipping),
+      mockEnvWithLogistics as any,
+    );
+    expect(res.status).toBe(201);
+    const data = await res.json() as any;
+    expect(data.data.total_shipping_kobo).toBe(0);
+  });
+
+  it('single-vendor checkout surfaces shipping cost and correct total', async () => {
+    mockLogisticsWorker.fetch = makeLogisticsFetch(250000);
+    const singleVendorBody = {
+      items: [{ product_id: 'px', vendor_id: 'vnd_solo', quantity: 1, price: 2000000, name: 'Chair' }],
+      customer_email: 'solo@example.com',
+      payment_method: 'paystack',
+      ndpr_consent: true,
+      shipping_address: { state: 'Abuja', lga: 'Wuse', street: '5 Aminu Crescent' },
+    };
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', singleVendorBody),
+      mockEnvWithLogistics as any,
+    );
+    expect(res.status).toBe(201);
+    const data = await res.json() as any;
+    expect(data.data.total_shipping_kobo).toBe(250000);
+    expect(data.data.total_amount).toBe(2000000 + 250000);
+    expect(data.data.vendor_breakdown['vnd_solo']?.shippingKobo).toBe(250000);
+  });
+
+  it('NDPR invariant is enforced even with LOGISTICS_WORKER configured', async () => {
+    const res = await multiVendorRouter.fetch(
+      makeRequest('POST', '/checkout', { ...checkoutBodyWithShipping, ndpr_consent: false }),
+      mockEnvWithLogistics as any,
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
 
