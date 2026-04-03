@@ -24,6 +24,7 @@ import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
 import type { RateLimitStore } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
 import { DEFAULT_LOYALTY_CONFIG, type LoyaltyConfig } from '../../core/tenant/index';
+import { getEffectiveBranding, syncBrandingToUIConfigKV } from '../../core/ui-config-branding'; // COM-5
 
 function evaluateLoyaltyTier(points: number, cfg: LoyaltyConfig): string {
   const sorted = [...cfg.tiers].sort((a, b) => b.minPoints - a.minPoints);
@@ -2000,18 +2001,36 @@ app.get('/config', async (c) => {
   const tenantId = getTenantId(c);
   try {
     const config = await c.env.TENANT_CONFIG.get(`tenant:${tenantId}`, 'json') as Record<string, unknown> | null;
-    const branding = (config?.branding as Record<string, unknown> | null) ?? {};
+    const localBranding = (config?.branding as Record<string, unknown> | null) ?? {};
+    // COM-5: read from canonical UI_CONFIG_KV first (set by webwaka-ui-builder), fall back to local D1 config
+    const effectiveBranding = c.env.UI_CONFIG_KV
+      ? await getEffectiveBranding(tenantId, c.env.UI_CONFIG_KV, {
+          primaryColor: (localBranding.primaryColor as string) ?? '#2563eb',
+          accentColor: (localBranding.accentColor as string) ?? '#16a34a',
+          fontFamily: (localBranding.fontFamily as string) ?? 'Inter, system-ui, sans-serif',
+          logoUrl: (localBranding.logoUrl as string) ?? undefined,
+          heroImageUrl: (localBranding.heroImageUrl as string) ?? undefined,
+          announcementBar: (localBranding.announcementBar as string) ?? undefined,
+        })
+      : {
+          primaryColor: (localBranding.primaryColor as string) ?? '#2563eb',
+          accentColor: (localBranding.accentColor as string) ?? '#16a34a',
+          fontFamily: (localBranding.fontFamily as string) ?? 'Inter, system-ui, sans-serif',
+          logoUrl: (localBranding.logoUrl as string) ?? null,
+          heroImageUrl: (localBranding.heroImageUrl as string) ?? null,
+          announcementBar: (localBranding.announcementBar as string) ?? null,
+        };
     return c.json({
       success: true,
       data: {
         tenantId,
         branding: {
-          primaryColor: branding.primaryColor ?? '#2563eb',
-          accentColor: branding.accentColor ?? '#16a34a',
-          fontFamily: branding.fontFamily ?? 'Inter, system-ui, sans-serif',
-          logoUrl: branding.logoUrl ?? null,
-          heroImageUrl: branding.heroImageUrl ?? null,
-          announcementBar: branding.announcementBar ?? null,
+          primaryColor: effectiveBranding.primaryColor ?? '#2563eb',
+          accentColor: effectiveBranding.accentColor ?? '#16a34a',
+          fontFamily: effectiveBranding.fontFamily ?? 'Inter, system-ui, sans-serif',
+          logoUrl: effectiveBranding.logoUrl ?? null,
+          heroImageUrl: effectiveBranding.heroImageUrl ?? null,
+          announcementBar: effectiveBranding.announcementBar ?? null,
         },
       },
     });
@@ -2171,6 +2190,16 @@ app.put('/admin/tenant/branding', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), 
 
     const updatedConfig = { ...existing, branding: updatedBranding };
     await c.env.TENANT_CONFIG.put(`tenant:${tenantId}`, JSON.stringify(updatedConfig));
+
+    // COM-5: sync branding update to canonical UI_CONFIG_KV for webwaka-ui-builder deployments
+    if (c.env.UI_CONFIG_KV) {
+      await syncBrandingToUIConfigKV(
+        tenantId,
+        c.env.UI_CONFIG_KV,
+        updatedBranding as import('../../core/ui-config-branding').StorefrontBranding,
+        (existing.domain as string) ?? undefined,
+      );
+    }
 
     return c.json({ success: true, data: { tenantId, branding: updatedBranding } });
   } catch (err) {

@@ -50,6 +50,7 @@ export interface Env {
   INTER_SERVICE_SECRET?: string;        // Shared secret for inter-service authentication (P10.1)
   LOGISTICS_WORKER?: Fetcher;           // Service Binding to webwaka-logistics (T-CVC-01, T-CVC-02)
   TRACKING_SECRET?: string;             // HMAC-SHA256 secret for signing tracking tokens (T-CVC-02)
+  UI_CONFIG_KV?: KVNamespace;           // Canonical branding config store (COM-5, shared with webwaka-ui-builder)
 }
 
 const app = new Hono<{ Bindings: Env }>();
