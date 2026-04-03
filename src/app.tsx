@@ -409,55 +409,41 @@ declare global {
   }
 }
 
-// ── Order Tracking Section (T005) ────────────────────────────────────────────
-function OrderTrackingSection({ tenantId, orderId }: { tenantId: string; orderId: string }) {
-  const [loading, setLoading] = React.useState(true);
+// ── Order Tracking Redirect (T-CVC-02) ───────────────────────────────────────
+// Commerce no longer hosts a local tracking UI.
+// This helper calls the Commerce API, which issues a 302 redirect to the
+// Logistics portal with a signed token. We follow the redirect by opening
+// the Logistics URL in a new tab.
+function useTrackingRedirect(tenantId: string) {
+  const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState('');
-  const [data, setData] = React.useState<{
-    order_id: string; order_status: string; payment_status: string;
-    timeline: Array<{ status: string; timestamp: number; note?: string }>;
-  } | null>(null);
 
-  React.useEffect(() => {
-    if (!orderId) return;
+  const openTracking = React.useCallback((orderId: string, path: string) => {
     setLoading(true); setError('');
-    fetch(`/api/single-vendor/orders/${encodeURIComponent(orderId)}/track`, { headers: { 'x-tenant-id': tenantId } })
-      .then(r => r.json() as Promise<{ success: boolean; data: typeof data; error?: string }>)
-      .then(d => { if (d.success) setData(d.data); else setError(d.error ?? 'Order not found'); })
-      .catch(() => setError('Could not load tracking. Try again.'))
+    fetch(`/api/${path}`, {
+      headers: { 'x-tenant-id': tenantId },
+      redirect: 'manual', // capture the 302 without following it
+    })
+      .then(r => {
+        if (r.type === 'opaqueredirect' || r.status === 302 || r.status === 301) {
+          // Follow the redirect to the Logistics portal in a new tab
+          // For manual redirects the Location header is available via r.url in some environments;
+          // fall back to a direct fetch that follows the redirect to extract the final URL.
+          return fetch(`/api/${path}`, { headers: { 'x-tenant-id': tenantId } })
+            .then(r2 => { window.open(r2.url, '_blank', 'noopener'); });
+        }
+        // Fallback: if Logistics is unavailable the API returns 200 JSON with note: logistics_unavailable
+        return r.json().then((d: { success: boolean; note?: string; data?: { id?: string; order_status?: string } }) => {
+          if (d.note === 'logistics_unavailable') {
+            setError('Live tracking is temporarily unavailable. Your order status: ' + (d.data?.order_status ?? 'confirmed'));
+          }
+        });
+      })
+      .catch(() => setError('Could not open tracking. Please try again.'))
       .finally(() => setLoading(false));
-  }, [orderId, tenantId]);
+  }, [tenantId]);
 
-  const STEPS = ['placed', 'confirmed', 'processing', 'shipped', 'delivered'];
-
-  if (loading) return <div style={{ textAlign: 'center', padding: '12px', fontSize: '13px', color: '#6b7280' }}>Loading tracking…</div>;
-  if (error) return <div style={{ padding: '10px 14px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginTop: '12px' }}>{error}</div>;
-  if (!data) return null;
-
-  const currentIdx = STEPS.indexOf(data.order_status.toLowerCase());
-  return (
-    <div style={{ marginTop: '16px', textAlign: 'left', background: '#f9fafb', borderRadius: '10px', padding: '14px' }}>
-      <div style={{ fontWeight: 700, fontSize: '14px', marginBottom: '12px', color: '#111827' }}>Order Tracking</div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        {STEPS.map((step, idx) => {
-          const done = idx <= currentIdx;
-          const isCurrent = idx === currentIdx;
-          const event = data.timeline.find(t => t.status.toLowerCase() === step);
-          return (
-            <div key={step} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-              <div style={{ width: '20px', height: '20px', borderRadius: '50%', border: `2px solid ${done ? '#16a34a' : '#d1d5db'}`, backgroundColor: done ? '#16a34a' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: '2px' }}>
-                {done && <span style={{ color: '#fff', fontSize: '10px', fontWeight: 700 }}>✓</span>}
-              </div>
-              <div>
-                <div style={{ fontSize: '13px', fontWeight: isCurrent ? 700 : 600, color: done ? '#111827' : '#9ca3af', textTransform: 'capitalize' }}>{step}</div>
-                {event && <div style={{ fontSize: '11px', color: '#6b7280' }}>{new Date(event.timestamp).toLocaleString('en-NG')}{event.note ? ` · ${event.note}` : ''}</div>}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
+  return { loading, error, openTracking };
 }
 
 // Single-Vendor Storefront Module (COM-2) — SV Phase 2: Paystack, VAT, promo, address
@@ -659,8 +645,9 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [reviewSubmitting, setReviewSubmitting] = useState(false);
   const [reviewError, setReviewError] = useState('');
 
-  // ── Order tracking (T005) ─────────────────────────────────────────────────
-  const [trackingOrderId, setTrackingOrderId] = useState('');
+  // ── Order tracking (T-CVC-02) ───────────────────────────────────────────
+  // Commerce no longer renders a local tracking UI; redirect to Logistics portal.
+  const { loading: svTrackingLoading, error: svTrackingError, openTracking: svOpenTracking } = useTrackingRedirect(tenantId);
 
   // ── Computed totals (client preview — server re-verifies) ─────────────────
   const subtotal = total; // from cart hook (kobo)
@@ -979,22 +966,22 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
         <p style={{ color: '#6b7280' }}>Ref: {orderRef}</p>
         <p style={{ color: '#6b7280', fontSize: '13px' }}>A confirmation will be sent to {email || phone}</p>
 
-        {/* Order Tracking Link (T005) */}
+        {/* Order Tracking Link (T-CVC-02) — redirects to Logistics portal */}
         {orderRef && (
           <button
-            onClick={() => setTrackingOrderId(orderRef)}
-            style={{ display: 'block', margin: '12px auto 0', padding: '8px 16px', backgroundColor: '#f0fdf4', color: '#16a34a', border: '1px solid #bbf7d0', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}
+            onClick={() => svOpenTracking(orderRef, `single-vendor/orders/${encodeURIComponent(orderRef)}/track`)}
+            disabled={svTrackingLoading}
+            style={{ display: 'block', margin: '12px auto 0', padding: '8px 16px', backgroundColor: '#f0fdf4', color: '#16a34a', border: '1px solid #bbf7d0', borderRadius: '8px', cursor: svTrackingLoading ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 600 }}
           >
-            Track Your Order →
+            {svTrackingLoading ? 'Opening tracker…' : 'Track Your Order →'}
           </button>
         )}
-
-        {trackingOrderId === orderRef && orderRef && (
-          <OrderTrackingSection tenantId={tenantId} orderId={orderRef} />
+        {svTrackingError && (
+          <div style={{ marginTop: '8px', padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '12px' }}>{svTrackingError}</div>
         )}
 
         <button
-          onClick={() => { setStep('catalog'); setOrderRef(''); setPromoDiscount(0); setPromoCode(''); setDeliveryFeeKobo(0); setTrackingOrderId(''); }}
+          onClick={() => { setStep('catalog'); setOrderRef(''); setPromoDiscount(0); setPromoCode(''); setDeliveryFeeKobo(0); }}
           style={{ marginTop: '16px', padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
         >
           Continue Shopping
@@ -1770,11 +1757,8 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
   const [showCart, setShowCart] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
   const [orderSuccess, setOrderSuccess] = useState<{ marketplace_order_id: string } | null>(null);
-  const [trackingData, setTrackingData] = useState<{
-    payment_status: string; order_status: string; vendor_count: number;
-    vendor_orders: Array<{ id: string; vendor_id: string; order_status: string; payment_status: string; total_amount: number }>;
-  } | null>(null);
-  const [trackingLoading, setTrackingLoading] = useState(false);
+  // T-CVC-02: Commerce no longer renders a local tracking UI; redirect to Logistics portal.
+  const { loading: mvTrackingLoading, error: mvTrackingError, openTracking: mvOpenTracking } = useTrackingRedirect(tenantId);
 
   // Rehydrate cart from server on mount if we have a token
   useEffect(() => {
@@ -2166,45 +2150,24 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
               </button>
             </div>
 
-            {/* Track order button + live status */}
+            {/* Track order button (T-CVC-02) — opens Logistics portal in new tab */}
             <button
-              onClick={() => {
-                if (trackingData) { setTrackingData(null); return; }
-                setTrackingLoading(true);
-                fetch(`/api/multi-vendor/orders/track?marketplace_order_id=${encodeURIComponent(orderSuccess.marketplace_order_id)}`, {
-                  headers: { 'x-tenant-id': tenantId },
-                })
-                  .then(r => r.json() as Promise<{ success: boolean; data?: typeof trackingData }>)
-                  .then(d => { if (d.success && d.data) setTrackingData(d.data); })
-                  .catch(() => {})
-                  .finally(() => setTrackingLoading(false));
-              }}
-              style={{ width: '100%', padding: '10px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '8px', fontWeight: 600, cursor: 'pointer', fontSize: '13px', marginBottom: '10px' }}
+              onClick={() => mvOpenTracking(
+                orderSuccess.marketplace_order_id,
+                `multi-vendor/orders/track?marketplace_order_id=${encodeURIComponent(orderSuccess.marketplace_order_id)}`,
+              )}
+              disabled={mvTrackingLoading}
+              style={{ width: '100%', padding: '10px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '8px', fontWeight: 600, cursor: mvTrackingLoading ? 'wait' : 'pointer', fontSize: '13px', marginBottom: '10px' }}
             >
-              {trackingLoading ? 'Fetching status…' : trackingData ? 'Hide Status' : '📦 Track This Order'}
+              {mvTrackingLoading ? 'Opening tracker…' : '📦 Track This Order'}
             </button>
-
-            {trackingData && (
-              <div style={{ backgroundColor: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
-                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
-                  <span style={{ padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600, backgroundColor: trackingData.payment_status === 'paid' ? '#dcfce7' : '#fef9c3', color: trackingData.payment_status === 'paid' ? '#15803d' : '#ca8a04' }}>
-                    {trackingData.payment_status}
-                  </span>
-                  <span style={{ padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600, backgroundColor: '#e0f2fe', color: '#0369a1' }}>
-                    {trackingData.order_status}
-                  </span>
-                </div>
-                {trackingData.vendor_orders.map((vo, i) => (
-                  <div key={vo.id} style={{ fontSize: '12px', color: '#374151', borderTop: i > 0 ? '1px solid #e5e7eb' : 'none', paddingTop: i > 0 ? '6px' : 0, marginTop: i > 0 ? '6px' : 0 }}>
-                    <span style={{ fontWeight: 600 }}>Vendor order {i + 1}:</span> {vo.order_status} · {vo.payment_status} · {formatKoboToNaira(vo.total_amount)}
-                  </div>
-                ))}
-              </div>
+            {mvTrackingError && (
+              <div style={{ marginBottom: '10px', padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '12px' }}>{mvTrackingError}</div>
             )}
 
             <div style={{ display: 'flex', gap: '8px' }}>
               <button
-                onClick={() => { setOrderSuccess(null); setTrackingData(null); setActiveTab('browse'); }}
+                onClick={() => { setOrderSuccess(null); setActiveTab('browse'); }}
                 style={{ flex: 1, padding: '11px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '13px' }}
               >
                 Shop More
