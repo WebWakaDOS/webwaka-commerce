@@ -2545,4 +2545,666 @@ describe('T-COM-01: Micro-Hub Routing — SV checkout integration', () => {
   it('ORDER_PACKED event constant is order.packed', () => {
     expect('order.packed').toBe('order.packed');
   });
-});
+
+}); // end describe('T-COM-01: Micro-Hub Routing — SV checkout integration')
+
+// ── T-COM-03: Dynamic Promo Engine ──────────────────────────────────────────
+describe('T-COM-03: Dynamic Promo Engine', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDb.prepare.mockReturnThis();
+    mockDb.bind.mockReturnThis();
+    mockDb.all.mockResolvedValue({ results: [] });
+    mockFirstImpl = () => Promise.resolve(null);
+    mockDb.first.mockImplementation(() => mockFirstImpl());
+    mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
+    mockDb.batch.mockResolvedValue([
+      { meta: { changes: 1 } },
+      { meta: { changes: 1 } },
+      { meta: { changes: 1 } },
+    ]);
+    _resetOtpRateLimitStore();
+    _resetCheckoutRateLimitStore();
+    _resetSearchRateLimitStore();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+    // ── computeDiscount — discountCap enforcement ───────────────────────────
+    describe('computeDiscount() — discountCap enforcement', () => {
+      it('caps PERCENTAGE discount at discountCap', () => {
+        // 50% of 200000 = 100000, but cap = 50000
+        expect(computeDiscount('pct', 50, 200000, 50000)).toBe(50000);
+      });
+
+      it('caps FIXED discount at discountCap', () => {
+        // flat 80000, cap 30000 → returns 30000
+        expect(computeDiscount('flat', 80000, 100000, 30000)).toBe(30000);
+      });
+
+      it('allows full discount when below discountCap', () => {
+        // 10% of 100000 = 10000, cap 50000 → 10000 (uncapped)
+        expect(computeDiscount('pct', 10, 100000, 50000)).toBe(10000);
+      });
+
+      it('handles null discountCap (uncapped)', () => {
+        expect(computeDiscount('pct', 30, 100000, null)).toBe(30000);
+      });
+
+      it('never exceeds subtotal even without cap', () => {
+        // flat 200000 on 100000 order → capped at 100000
+        expect(computeDiscount('flat', 200000, 100000)).toBe(100000);
+      });
+
+      it('PERCENTAGE type alias works', () => {
+        expect(computeDiscount('PERCENTAGE', 20, 100000)).toBe(20000);
+      });
+
+      it('FIXED type alias works', () => {
+        expect(computeDiscount('FIXED', 5000, 100000)).toBe(5000);
+      });
+    });
+
+    // ── POST /promo/validate — enhanced validation ──────────────────────────
+    describe('POST /promo/validate — discountCap + date ranges', () => {
+      it('applies discountCap to PERCENTAGE discount on validate', async () => {
+        mockFirstImpl = () => Promise.resolve({
+          id: 'promo_cap', code: 'CAPCAP', discount_type: 'pct', discount_value: 50,
+          discountCap: 30000,
+          min_order_kobo: 0, max_uses: 0, current_uses: 0,
+          expires_at: null, is_active: 1, description: null,
+        });
+        const req = makeRequest('POST', '/promo/validate', { code: 'CAPCAP', subtotal_kobo: 200000 });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { discount_kobo: number } };
+        expect(body.data.discount_kobo).toBe(30000); // 50% = 100000, capped at 30000
+      });
+
+      it('returns 422 for future validFrom (promo not yet active)', async () => {
+        // validFrom/validUntil are only checked at checkout; /promo/validate uses expires_at
+        // Validate endpoint still respects expires_at
+        mockFirstImpl = () => Promise.resolve({
+          id: 'promo_future', code: 'FUTURE', discount_type: 'pct', discount_value: 10,
+          discountCap: null,
+          min_order_kobo: 0, max_uses: 0, current_uses: 0,
+          expires_at: Date.now() - 1000, is_active: 1, description: null,
+        });
+        const req = makeRequest('POST', '/promo/validate', { code: 'FUTURE', subtotal_kobo: 100000 });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(422);
+        const body = await res.json() as { error: string };
+        expect(body.error).toMatch(/expired/i);
+      });
+    });
+
+    // ── POST /checkout — BOGO discount ──────────────────────────────────────
+    describe('POST /checkout — BOGO promo type', () => {
+      function bogoPromo(overrides: Record<string, unknown> = {}) {
+        return {
+          id: 'promo_bogo', code: 'BOGO2', discount_type: 'BOGO', discount_value: 0,
+          discountCap: null,
+          min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+          expires_at: null, is_active: 1,
+          promoType: 'BOGO', minOrderValueKobo: null,
+          maxUsesTotal: null, maxUsesPerCustomer: null,
+          validFrom: null, validUntil: null,
+          productScope: null,
+          ...overrides,
+        };
+      }
+
+      it('gives one free unit for every two purchased (BOGO, qty=2)', async () => {
+        // Product price 100000 × 2 units; BOGO = 1 free = 100000 off
+        // Subtotal = 200000; after BOGO = 100000; VAT = 7500; total = 107500
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Cap', price: 100000, quantity: 10, version: 1 });
+          return Promise.resolve(bogoPromo());
+        };
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 107500 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          items: [{ product_id: 'prod_1', quantity: 2, price: 100000, name: 'Cap' }],
+          promo_code: 'BOGO2',
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(100000);
+      });
+
+      it('gives zero BOGO discount for qty=1 (no complete pair)', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Cap', price: 100000, quantity: 10, version: 1 });
+          return Promise.resolve(bogoPromo());
+        };
+        // subtotal = 100000; no BOGO pair; VAT = 7500; total = 107500
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 107500 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          items: [{ product_id: 'prod_1', quantity: 1, price: 100000, name: 'Cap' }],
+          promo_code: 'BOGO2',
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(0);
+      });
+
+      it('BOGO respects productScope — only scoped products are discounted', async () => {
+        // Scope: only prod_scoped is eligible; prod_other is not
+        // 2× prod_scoped at 50000 → BOGO = 50000 off; 1× prod_other at 30000 → full price
+        // Subtotal = 130000; discount = 50000; after = 80000; VAT = 6000; total = 86000
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_scoped', name: 'Scope', price: 50000, quantity: 10, version: 1 });
+          if (call === 2) return Promise.resolve({ id: 'prod_other', name: 'Other', price: 30000, quantity: 10, version: 1 });
+          return Promise.resolve(bogoPromo({ productScope: JSON.stringify(['prod_scoped']) }));
+        };
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 86000 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          items: [
+            { product_id: 'prod_scoped', quantity: 2, price: 50000, name: 'Scope' },
+            { product_id: 'prod_other', quantity: 1, price: 30000, name: 'Other' },
+          ],
+          promo_code: 'BOGO2',
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(50000);
+      });
+    });
+
+    // ── POST /checkout — FREE_SHIPPING promo type ───────────────────────────
+    describe('POST /checkout — FREE_SHIPPING promo type', () => {
+      function freeShipPromo(overrides: Record<string, unknown> = {}) {
+        return {
+          id: 'promo_fs', code: 'FREESHIP', discount_type: 'FREE_SHIPPING', discount_value: 0,
+          discountCap: null,
+          min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+          expires_at: null, is_active: 1,
+          promoType: 'FREE_SHIPPING', minOrderValueKobo: null,
+          maxUsesTotal: null, maxUsesPerCustomer: null,
+          validFrom: null, validUntil: null, productScope: null,
+          ...overrides,
+        };
+      }
+
+      it('returns 201 and discount_kobo=0 for FREE_SHIPPING promo (subtotal unchanged)', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Book', price: 100000, quantity: 10, version: 1 });
+          return Promise.resolve(freeShipPromo());
+        };
+        // subtotal = 100000; no product discount; VAT = 7500; total = 107500
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 107500 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          items: [{ product_id: 'prod_1', quantity: 1, price: 100000, name: 'Book' }],
+          promo_code: 'FREESHIP',
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(0);
+        expect(data.data.free_shipping).toBe(true);
+      });
+
+      it('FREE_SHIPPING with min_order_kobo blocks under-threshold orders', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Book', price: 5000, quantity: 10, version: 1 });
+          return Promise.resolve(freeShipPromo({ min_order_kobo: 50000, minOrderValueKobo: 50000 }));
+        };
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          items: [{ product_id: 'prod_1', quantity: 1, price: 5000, name: 'Book' }],
+          promo_code: 'FREESHIP',
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(422);
+        const body = await res.json() as { error: string };
+        expect(body.error).toMatch(/minimum order/i);
+      });
+    });
+
+    // ── POST /checkout — maxUsesPerCustomer per-customer limit ───────────────
+    describe('POST /checkout — per-customer usage limit', () => {
+      it('returns 422 when customer has already used the promo (promo_already_used)', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Shoe', price: 50000, quantity: 10, version: 1 });
+          if (call === 2) {
+            return Promise.resolve({
+              id: 'promo_1', code: 'ONCE', discount_type: 'pct', discount_value: 10,
+              discountCap: null,
+              min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+              expires_at: null, is_active: 1,
+              promoType: 'PERCENTAGE', minOrderValueKobo: null,
+              maxUsesTotal: null, maxUsesPerCustomer: 1,
+              validFrom: null, validUntil: null, productScope: null,
+            });
+          }
+          // call === 3: promo_usage COUNT query → customer has used it once
+          return Promise.resolve({ cnt: 1 });
+        };
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          promo_code: 'ONCE',
+          customer_phone: '08012345678',
+          items: [{ product_id: 'prod_1', quantity: 1, price: 50000, name: 'Shoe' }],
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(422);
+        const body = await res.json() as { error: string };
+        expect(body.error).toMatch(/already_used|already used/i);
+      });
+
+      it('allows checkout when customer usage count is zero (first use)', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'Shoe', price: 50000, quantity: 10, version: 1 });
+          if (call === 2) {
+            return Promise.resolve({
+              id: 'promo_1', code: 'ONCE', discount_type: 'pct', discount_value: 10,
+              discountCap: null,
+              min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+              expires_at: null, is_active: 1,
+              promoType: 'PERCENTAGE', minOrderValueKobo: null,
+              maxUsesTotal: null, maxUsesPerCustomer: 1,
+              validFrom: null, validUntil: null, productScope: null,
+            });
+          }
+          // call === 3: promo_usage COUNT query → zero uses
+          return Promise.resolve({ cnt: 0 });
+        };
+        // subtotal = 50000; 10% off = 5000; after = 45000; VAT = 3375; total = 48375
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 48375 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          promo_code: 'ONCE',
+          customer_phone: '08012345678',
+          items: [{ product_id: 'prod_1', quantity: 1, price: 50000, name: 'Shoe' }],
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(5000);
+      });
+    });
+
+    // ── POST /checkout — validFrom / validUntil date window ─────────────────
+    describe('POST /checkout — validFrom / validUntil date window', () => {
+      function promoWithWindow(validFrom: string | null, validUntil: string | null) {
+        return {
+          id: 'promo_win', code: 'WIN', discount_type: 'pct', discount_value: 15,
+          discountCap: null,
+          min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+          expires_at: null, is_active: 1,
+          promoType: 'PERCENTAGE', minOrderValueKobo: null,
+          maxUsesTotal: null, maxUsesPerCustomer: null,
+          validFrom, validUntil, productScope: null,
+        };
+      }
+
+      it('returns 422 when current date is before validFrom', async () => {
+        const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'X', price: 10000, quantity: 5, version: 1 });
+          return Promise.resolve(promoWithWindow(futureDate, null));
+        };
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          promo_code: 'WIN',
+          items: [{ product_id: 'prod_1', quantity: 1, price: 10000, name: 'X' }],
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(422);
+        const body = await res.json() as { error: string };
+        expect(body.error).toMatch(/not_yet_active|promo_not_yet_active/i);
+      });
+
+      it('returns 422 when current date is after validUntil', async () => {
+        const pastDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'X', price: 10000, quantity: 5, version: 1 });
+          return Promise.resolve(promoWithWindow(null, pastDate));
+        };
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          promo_code: 'WIN',
+          items: [{ product_id: 'prod_1', quantity: 1, price: 10000, name: 'X' }],
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(422);
+        const body = await res.json() as { error: string };
+        expect(body.error).toMatch(/expired|promo_expired/i);
+      });
+
+      it('applies discount when within validFrom and validUntil window', async () => {
+        const past = new Date(Date.now() - 3600000).toISOString();
+        const future = new Date(Date.now() + 3600000).toISOString();
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'X', price: 20000, quantity: 10, version: 1 });
+          return Promise.resolve(promoWithWindow(past, future));
+        };
+        // 15% of 20000 = 3000; after = 17000; VAT = 1275; total = 18275
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 18275 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({ promo_code: 'WIN' }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(3000);
+      });
+    });
+
+    // ── POST /checkout — discountCap at checkout level ─────────────────────
+    describe('POST /checkout — discountCap enforcement at checkout', () => {
+      it('caps PERCENTAGE discount at discountCap during checkout', async () => {
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_1', name: 'BigItem', price: 1000000, quantity: 5, version: 1 });
+          return Promise.resolve({
+            id: 'promo_cap', code: 'CAP30', discount_type: 'pct', discount_value: 30,
+            discountCap: 50000,
+            min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+            expires_at: null, is_active: 1,
+            promoType: 'PERCENTAGE', minOrderValueKobo: null,
+            maxUsesTotal: null, maxUsesPerCustomer: null,
+            validFrom: null, validUntil: null, productScope: null,
+          });
+        };
+        // 30% of 1000000 = 300000, but cap = 50000
+        // after = 950000; VAT = 71250; total = 1021250
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 1021250 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          items: [{ product_id: 'prod_1', quantity: 1, price: 1000000, name: 'BigItem' }],
+          promo_code: 'CAP30',
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(50000);
+      });
+    });
+
+    // ── Product scope filtering for PERCENTAGE/FIXED ─────────────────────────
+    describe('POST /checkout — product scope filtering (PERCENTAGE)', () => {
+      it('applies discount only to scoped products, full price for others', async () => {
+        // Scope: only prod_a; prod_b at full price
+        // prod_a: 60000; prod_b: 40000; subtotal = 100000
+        // Applicable = 60000; 25% off = 15000; total discount = 15000
+        // after = 85000; VAT = 6375; total = 91375
+        let call = 0;
+        mockFirstImpl = () => {
+          call++;
+          if (call === 1) return Promise.resolve({ id: 'prod_a', name: 'A', price: 60000, quantity: 10, version: 1 });
+          if (call === 2) return Promise.resolve({ id: 'prod_b', name: 'B', price: 40000, quantity: 10, version: 1 });
+          return Promise.resolve({
+            id: 'promo_scope', code: 'SCOPE25', discount_type: 'pct', discount_value: 25,
+            discountCap: null,
+            min_order_kobo: 0, max_uses: 0, current_uses: 0, usedCount: 0,
+            expires_at: null, is_active: 1,
+            promoType: 'PERCENTAGE', minOrderValueKobo: null,
+            maxUsesTotal: null, maxUsesPerCustomer: null,
+            validFrom: null, validUntil: null,
+            productScope: JSON.stringify(['prod_a']),
+          });
+        };
+        vi.stubGlobal('fetch', makePaystackFetch({ status: 'success', amount: 91375 }));
+        const req = makeRequest('POST', '/checkout', checkoutBody({
+          items: [
+            { product_id: 'prod_a', quantity: 1, price: 60000, name: 'A' },
+            { product_id: 'prod_b', quantity: 1, price: 40000, name: 'B' },
+          ],
+          promo_code: 'SCOPE25',
+        }));
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const data = await res.json() as any;
+        expect(data.data.discount_kobo).toBe(15000);
+      });
+    });
+
+    // ── Admin CRUD: GET /admin/promos ──────────────────────────────────────
+    describe('GET /admin/promos', () => {
+      it('returns a list of promo codes for the tenant', async () => {
+        mockDb.all.mockResolvedValueOnce({
+          results: [
+            { id: 'promo_1', code: 'SAVE20', promoType: 'PERCENTAGE', discount_value: 20, is_active: 1 },
+            { id: 'promo_2', code: 'FREESHIP', promoType: 'FREE_SHIPPING', discount_value: 0, is_active: 1 },
+          ],
+        });
+        const req = makeRequest('GET', '/admin/promos');
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: unknown[]; meta: { count: number } };
+        expect(body.success).toBe(true);
+        expect(body.data).toHaveLength(2);
+        expect(body.meta.count).toBe(2);
+      });
+
+      it('returns empty list when no promos exist', async () => {
+        mockDb.all.mockResolvedValueOnce({ results: [] });
+        const req = makeRequest('GET', '/admin/promos');
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: unknown[] };
+        expect(body.data).toHaveLength(0);
+      });
+
+      it('filters by type=BOGO', async () => {
+        mockDb.all.mockResolvedValueOnce({ results: [{ id: 'promo_b', code: 'BOGO1', promoType: 'BOGO' }] });
+        const req = makeRequest('GET', '/admin/promos?type=BOGO');
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+        const bindCalls = (mockDb.bind.mock.calls as Array<unknown[]>);
+        const typeBindCall = bindCalls.find(args => args.includes('BOGO'));
+        expect(typeBindCall).toBeDefined();
+      });
+
+      it('filters by status=active', async () => {
+        mockDb.all.mockResolvedValueOnce({ results: [] });
+        const req = makeRequest('GET', '/admin/promos?status=active');
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+      });
+
+      it('enforces tenant isolation — binds tenant_id', async () => {
+        mockDb.all.mockResolvedValueOnce({ results: [] });
+        const req = makeRequest('GET', '/admin/promos', undefined, 'tnt_isolated');
+        await singleVendorRouter.fetch(req, mockEnv as any);
+        const bindCalls = (mockDb.bind.mock.calls as Array<unknown[]>);
+        const tenantBindCall = bindCalls.find(args => args.includes('tnt_isolated'));
+        expect(tenantBindCall).toBeDefined();
+      });
+    });
+
+    // ── Admin CRUD: POST /admin/promos ─────────────────────────────────────
+    describe('POST /admin/promos', () => {
+      it('creates a PERCENTAGE promo and returns 201', async () => {
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('POST', '/admin/promos', {
+          code: 'NEWCODE',
+          promoType: 'PERCENTAGE',
+          discountValue: 20,
+          minOrderValueKobo: 10000,
+          maxUsesTotal: 100,
+          maxUsesPerCustomer: 1,
+          validFrom: '2025-01-01T00:00:00.000Z',
+          validUntil: '2026-01-01T00:00:00.000Z',
+        });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const body = await res.json() as { success: boolean; data: { code: string; promoType: string } };
+        expect(body.success).toBe(true);
+        expect(body.data.code).toBe('NEWCODE');
+        expect(body.data.promoType).toBe('PERCENTAGE');
+      });
+
+      it('creates a FIXED promo with discountCap and returns 201', async () => {
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('POST', '/admin/promos', {
+          code: 'FLAT500',
+          promoType: 'FIXED',
+          discountValue: 50000,
+          discountCap: 30000,
+        });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const body = await res.json() as { success: boolean; data: { code: string; promoType: string } };
+        expect(body.success).toBe(true);
+        expect(body.data.code).toBe('FLAT500');
+        expect(body.data.promoType).toBe('FIXED');
+      });
+
+      it('creates a FREE_SHIPPING promo (no discountValue required)', async () => {
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('POST', '/admin/promos', {
+          code: 'SHIPFREE',
+          promoType: 'FREE_SHIPPING',
+        });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(201);
+        const body = await res.json() as { success: boolean; data: { promoType: string } };
+        expect(body.data.promoType).toBe('FREE_SHIPPING');
+      });
+
+      it('returns 400 when code is missing', async () => {
+        const req = makeRequest('POST', '/admin/promos', { promoType: 'PERCENTAGE', discountValue: 10 });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.success).toBe(false);
+        expect(body.error).toMatch(/code/i);
+      });
+
+      it('returns 400 when promoType is invalid', async () => {
+        const req = makeRequest('POST', '/admin/promos', { code: 'BADTYPE', promoType: 'UNKNOWN' });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.error).toMatch(/promoType/i);
+      });
+
+      it('returns 400 when PERCENTAGE discountValue exceeds 100', async () => {
+        const req = makeRequest('POST', '/admin/promos', { code: 'OVER100', promoType: 'PERCENTAGE', discountValue: 101 });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.error).toMatch(/100/);
+      });
+
+      it('returns 400 when FIXED promo has no discountValue', async () => {
+        const req = makeRequest('POST', '/admin/promos', { code: 'NODV', promoType: 'FIXED' });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.error).toMatch(/discountValue/i);
+      });
+
+      it('returns 409 when promo code already exists (UNIQUE constraint)', async () => {
+        mockDb.run.mockRejectedValueOnce(new Error('UNIQUE constraint failed: promo_codes.code'));
+        const req = makeRequest('POST', '/admin/promos', { code: 'DUP', promoType: 'PERCENTAGE', discountValue: 10 });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(409);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.error).toMatch(/already exists/i);
+      });
+    });
+
+    // ── Admin CRUD: PATCH /admin/promos/:id ───────────────────────────────
+    describe('PATCH /admin/promos/:id', () => {
+      it('updates discountValue and returns 200 with the promo id', async () => {
+        mockDb.first.mockResolvedValueOnce({ id: 'promo_x' });
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('PATCH', '/admin/promos/promo_x', { discountValue: 25 });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { id: string } };
+        expect(body.success).toBe(true);
+        expect(body.data.id).toBe('promo_x');
+      });
+
+      it('updates is_active to false (deactivate)', async () => {
+        mockDb.first.mockResolvedValueOnce({ id: 'promo_y' });
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('PATCH', '/admin/promos/promo_y', { is_active: false });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean };
+        expect(body.success).toBe(true);
+      });
+
+      it('returns 404 when promo id does not exist for tenant', async () => {
+        mockDb.first.mockResolvedValueOnce(null);
+        const req = makeRequest('PATCH', '/admin/promos/ghost_id', { discountValue: 10 });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(404);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.error).toMatch(/not found/i);
+      });
+
+      it('returns 400 when no fields are provided', async () => {
+        mockDb.first.mockResolvedValueOnce({ id: 'promo_z' });
+        const req = makeRequest('PATCH', '/admin/promos/promo_z', {});
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.error).toMatch(/no fields/i);
+      });
+
+      it('clears discountCap by setting it to null', async () => {
+        mockDb.first.mockResolvedValueOnce({ id: 'promo_cap' });
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('PATCH', '/admin/promos/promo_cap', { discountCap: null });
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+      });
+    });
+
+    // ── Admin CRUD: DELETE /admin/promos/:id ──────────────────────────────
+    describe('DELETE /admin/promos/:id', () => {
+      it('soft-deletes a promo and returns deleted:true', async () => {
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 1 } });
+        const req = makeRequest('DELETE', '/admin/promos/promo_del');
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { success: boolean; data: { id: string; deleted: boolean } };
+        expect(body.success).toBe(true);
+        expect(body.data.deleted).toBe(true);
+        expect(body.data.id).toBe('promo_del');
+      });
+
+      it('returns 404 when promo does not exist or already deleted', async () => {
+        mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
+        const req = makeRequest('DELETE', '/admin/promos/no_such_promo');
+        const res = await singleVendorRouter.fetch(req, mockEnv as any);
+        expect(res.status).toBe(404);
+        const body = await res.json() as { success: boolean; error: string };
+        expect(body.error).toMatch(/not found|already deleted/i);
+      });
+
+      it('is idempotent — second delete returns 404', async () => {
+        mockDb.run
+          .mockResolvedValueOnce({ success: true, meta: { changes: 1 } })
+          .mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
+        const first = makeRequest('DELETE', '/admin/promos/promo_idem');
+        await singleVendorRouter.fetch(first, mockEnv as any);
+        const second = makeRequest('DELETE', '/admin/promos/promo_idem');
+        const res = await singleVendorRouter.fetch(second, mockEnv as any);
+        expect(res.status).toBe(404);
+      });
+    });
+}); // end describe('T-COM-03: Dynamic Promo Engine')

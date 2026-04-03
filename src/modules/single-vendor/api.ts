@@ -299,11 +299,12 @@ app.post('/promo/validate', async (c) => {
   try {
     interface PromoRow {
       id: string; code: string; discount_type: string; discount_value: number;
+      discountCap: number | null;
       min_order_kobo: number; max_uses: number; current_uses: number;
       expires_at: number | null; is_active: number; description: string | null;
     }
     const promo = await c.env.DB.prepare(
-      `SELECT id, code, discount_type, discount_value, min_order_kobo, max_uses, current_uses,
+      `SELECT id, code, discount_type, discount_value, discountCap, min_order_kobo, max_uses, current_uses,
               expires_at, is_active, description
        FROM promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
     ).bind(tenantId, body.code.toUpperCase().trim()).first<PromoRow>();
@@ -314,7 +315,7 @@ app.post('/promo/validate', async (c) => {
     if (promo.max_uses > 0 && promo.current_uses >= promo.max_uses) return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
     if (body.subtotal_kobo < promo.min_order_kobo) return c.json({ success: false, error: `Minimum order of ₦${(promo.min_order_kobo / 100).toFixed(2)} required for this code` }, 422);
 
-    const discountKobo = computeDiscount(promo.discount_type, promo.discount_value, body.subtotal_kobo);
+    const discountKobo = computeDiscount(promo.discount_type, promo.discount_value, body.subtotal_kobo, promo.discountCap);
     return c.json({ success: true, data: { code: promo.code, discount_type: promo.discount_type, discount_value: promo.discount_value, discount_kobo: discountKobo, description: promo.description } });
   } catch (err) {
     console.error('[SV] route error:', err);
@@ -378,6 +379,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     if (body.promo_code && body.promo_code.trim() !== '') {
       interface EnhancedPromoRow {
         id: string; code: string; discount_type: string; discount_value: number;
+        discountCap: number | null;
         min_order_kobo: number; max_uses: number; current_uses: number;
         expires_at: number | null; is_active: number;
         promoType: string | null; minOrderValueKobo: number | null;
@@ -386,7 +388,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         productScope: string | null; usedCount: number;
       }
       const promo = await c.env.DB.prepare(
-        `SELECT id, code, discount_type, discount_value, min_order_kobo, max_uses, current_uses, expires_at, is_active,
+        `SELECT id, code, discount_type, discount_value, discountCap, min_order_kobo, max_uses, current_uses, expires_at, is_active,
                 promoType, minOrderValueKobo, maxUsesTotal, maxUsesPerCustomer, validFrom, validUntil, productScope, usedCount
          FROM promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
       ).bind(tenantId, body.promo_code.toUpperCase().trim()).first<EnhancedPromoRow>();
@@ -449,7 +451,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
           applicableAmount = body.items.reduce((s, item, idx) =>
             scopeIds.includes(item.product_id) ? s + (dbProducts[idx]?.price ?? item.price) * item.quantity : s, 0);
         }
-        discountKobo = computeDiscount(effectiveType, promo.discount_value, applicableAmount);
+        discountKobo = computeDiscount(effectiveType, promo.discount_value, applicableAmount, promo.discountCap);
       }
 
       promoRow = { id: promo.id, discount_type: promo.discount_type, discount_value: promo.discount_value, promoType: effectiveType };
@@ -1604,11 +1606,220 @@ app.patch('/admin/reviews/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), as
   }
 });
 
-export function computeDiscount(discountType: string, discountValue: number, subtotalKobo: number): number {
-  if (discountType === 'flat' || discountType === 'FIXED') return Math.min(discountValue, subtotalKobo);
-  if (discountType === 'pct' || discountType === 'PERCENTAGE') return Math.round((subtotalKobo * discountValue) / 100);
+// ── T-COM-03: Admin Promo CRUD ────────────────────────────────────────────────
+// Invariants: [MTT] tenant_id on every read/write; [TXN] atomic updates.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /admin/promos — list promo codes for tenant with optional type/status filter
+app.get('/admin/promos', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const promoType = c.req.query('type');
+  const status = c.req.query('status'); // 'active' | 'inactive' | 'all'
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10), 200);
+  const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10), 0);
+
+  let where = 'tenant_id = ? AND deleted_at IS NULL';
+  const bindings: unknown[] = [tenantId];
+
+  if (promoType) { where += ' AND promoType = ?'; bindings.push(promoType.toUpperCase()); }
+  if (status === 'active') { where += ' AND is_active = 1'; }
+  else if (status === 'inactive') { where += ' AND is_active = 0'; }
+
+  bindings.push(limit, offset);
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, code, description, promoType, discount_type, discount_value, discountCap,
+              min_order_kobo, minOrderValueKobo, max_uses, current_uses, usedCount,
+              maxUsesTotal, maxUsesPerCustomer, expires_at, validFrom, validUntil,
+              productScope, stackable, is_active, created_at, updated_at
+       FROM promo_codes
+       WHERE ${where}
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`,
+    ).bind(...bindings).all<Record<string, unknown>>();
+
+    return c.json({ success: true, data: results, meta: { limit, offset, count: results.length } });
+  } catch (err) {
+    console.error('[SV][admin/promos] GET error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// POST /admin/promos — create a new promo code
+app.post('/admin/promos', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+
+  interface CreatePromoBody {
+    code: string;
+    description?: string;
+    promoType: 'PERCENTAGE' | 'FIXED' | 'FREE_SHIPPING' | 'BOGO';
+    discountValue?: number;
+    discountCap?: number;
+    minOrderValueKobo?: number;
+    maxUsesTotal?: number;
+    maxUsesPerCustomer?: number;
+    validFrom?: string;
+    validUntil?: string;
+    productScope?: string[];
+    stackable?: boolean;
+  }
+
+  let body: CreatePromoBody;
+  try { body = await c.req.json(); }
+  catch { return c.json({ success: false, error: 'Invalid JSON body' }, 400); }
+
+  if (!body.code?.trim()) return c.json({ success: false, error: 'code is required' }, 400);
+
+  const validTypes = ['PERCENTAGE', 'FIXED', 'FREE_SHIPPING', 'BOGO'];
+  if (!body.promoType || !validTypes.includes(body.promoType)) {
+    return c.json({ success: false, error: `promoType must be one of: ${validTypes.join(', ')}` }, 400);
+  }
+
+  if ((body.promoType === 'PERCENTAGE' || body.promoType === 'FIXED') && (!body.discountValue || body.discountValue <= 0)) {
+    return c.json({ success: false, error: 'discountValue must be a positive number for PERCENTAGE/FIXED promos' }, 400);
+  }
+
+  if (body.promoType === 'PERCENTAGE' && body.discountValue! > 100) {
+    return c.json({ success: false, error: 'PERCENTAGE discountValue cannot exceed 100' }, 400);
+  }
+
+  const code = body.code.toUpperCase().trim();
+  const now = Date.now();
+  const id = `promo_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+  const discountType = body.promoType === 'PERCENTAGE' ? 'pct'
+    : body.promoType === 'FIXED' ? 'flat'
+    : body.promoType; // FREE_SHIPPING / BOGO kept as-is
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO promo_codes
+         (id, tenant_id, code, description, promoType, discount_type, discount_value,
+          discountCap, min_order_kobo, minOrderValueKobo, max_uses, current_uses, usedCount,
+          maxUsesTotal, maxUsesPerCustomer, validFrom, validUntil, productScope,
+          stackable, is_active, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?,?,1,?,?)`,
+    ).bind(
+      id, tenantId, code,
+      body.description ?? null,
+      body.promoType,
+      discountType,
+      body.discountValue ?? 0,
+      body.discountCap ?? null,
+      body.minOrderValueKobo ?? 0,
+      body.minOrderValueKobo ?? null,
+      body.maxUsesTotal ?? null,
+      body.maxUsesPerCustomer ?? null,
+      body.validFrom ?? null,
+      body.validUntil ?? null,
+      body.productScope ? JSON.stringify(body.productScope) : null,
+      body.stackable ? 1 : 0,
+      now, now,
+    ).run();
+
+    return c.json({ success: true, data: { id, code, promoType: body.promoType } }, 201);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('UNIQUE') || msg.includes('unique')) {
+      return c.json({ success: false, error: `Promo code '${code}' already exists for this tenant` }, 409);
+    }
+    console.error('[SV][admin/promos] POST error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// PATCH /admin/promos/:id — update an existing promo code
+app.patch('/admin/promos/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const promoId = c.req.param('id');
+
+  interface UpdatePromoBody {
+    description?: string;
+    discountValue?: number;
+    discountCap?: number | null;
+    minOrderValueKobo?: number;
+    maxUsesTotal?: number | null;
+    maxUsesPerCustomer?: number | null;
+    validFrom?: string | null;
+    validUntil?: string | null;
+    productScope?: string[] | null;
+    stackable?: boolean;
+    is_active?: boolean;
+  }
+
+  let body: UpdatePromoBody;
+  try { body = await c.req.json(); }
+  catch { return c.json({ success: false, error: 'Invalid JSON body' }, 400); }
+
+  const existing = await c.env.DB.prepare(
+    'SELECT id FROM promo_codes WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+  ).bind(promoId, tenantId).first<{ id: string }>();
+
+  if (!existing) return c.json({ success: false, error: 'Promo code not found' }, 404);
+
+  const updates: string[] = [];
+  const values: unknown[] = [];
+
+  if (body.description !== undefined) { updates.push('description = ?'); values.push(body.description); }
+  if (body.discountValue !== undefined) { updates.push('discount_value = ?'); values.push(body.discountValue); }
+  if ('discountCap' in body) { updates.push('discountCap = ?'); values.push(body.discountCap ?? null); }
+  if (body.minOrderValueKobo !== undefined) {
+    updates.push('min_order_kobo = ?', 'minOrderValueKobo = ?');
+    values.push(body.minOrderValueKobo, body.minOrderValueKobo);
+  }
+  if ('maxUsesTotal' in body) { updates.push('max_uses = ?', 'maxUsesTotal = ?'); values.push(body.maxUsesTotal ?? 0, body.maxUsesTotal ?? null); }
+  if ('maxUsesPerCustomer' in body) { updates.push('maxUsesPerCustomer = ?'); values.push(body.maxUsesPerCustomer ?? null); }
+  if ('validFrom' in body) { updates.push('validFrom = ?'); values.push(body.validFrom ?? null); }
+  if ('validUntil' in body) { updates.push('validUntil = ?'); values.push(body.validUntil ?? null); }
+  if ('productScope' in body) { updates.push('productScope = ?'); values.push(body.productScope ? JSON.stringify(body.productScope) : null); }
+  if (body.stackable !== undefined) { updates.push('stackable = ?'); values.push(body.stackable ? 1 : 0); }
+  if (body.is_active !== undefined) { updates.push('is_active = ?'); values.push(body.is_active ? 1 : 0); }
+
+  if (updates.length === 0) return c.json({ success: false, error: 'No fields to update' }, 400);
+
+  updates.push('updated_at = ?');
+  values.push(Date.now(), promoId, tenantId);
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE promo_codes SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?`,
+    ).bind(...values).run();
+
+    return c.json({ success: true, data: { id: promoId } });
+  } catch (err) {
+    console.error('[SV][admin/promos] PATCH error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// DELETE /admin/promos/:id — soft-delete a promo code (idempotent)
+app.delete('/admin/promos/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const promoId = c.req.param('id');
+  const now = Date.now();
+
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE promo_codes SET deleted_at = ?, is_active = 0, updated_at = ?
+       WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+    ).bind(now, now, promoId, tenantId).run();
+
+    if (result.meta.changes === 0) return c.json({ success: false, error: 'Promo code not found or already deleted' }, 404);
+    return c.json({ success: true, data: { id: promoId, deleted: true } });
+  } catch (err) {
+    console.error('[SV][admin/promos] DELETE error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+export function computeDiscount(discountType: string, discountValue: number, subtotalKobo: number, discountCap?: number | null): number {
+  let raw = 0;
+  if (discountType === 'flat' || discountType === 'FIXED') raw = Math.min(discountValue, subtotalKobo);
+  else if (discountType === 'pct' || discountType === 'PERCENTAGE') raw = Math.round((subtotalKobo * discountValue) / 100);
   // FREE_SHIPPING and BOGO are handled at checkout level with full item context
-  return 0;
+  if (discountCap != null && discountCap > 0) raw = Math.min(raw, discountCap);
+  return Math.min(raw, subtotalKobo);
 }
 
 /** Sanitise FTS5 query — escape special chars, trim */

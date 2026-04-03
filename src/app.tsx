@@ -433,9 +433,10 @@ function useTrackingRedirect(tenantId: string) {
             .then(r2 => { window.open(r2.url, '_blank', 'noopener'); });
         }
         // Fallback: if Logistics is unavailable the API returns 200 JSON with note: logistics_unavailable
-        return r.json().then((d: { success: boolean; note?: string; data?: { id?: string; order_status?: string } }) => {
-          if (d.note === 'logistics_unavailable') {
-            setError('Live tracking is temporarily unavailable. Your order status: ' + (d.data?.order_status ?? 'confirmed'));
+        return r.json().then((d: unknown) => {
+          const resp = d as { success: boolean; note?: string; data?: { id?: string; order_status?: string } };
+          if (resp.note === 'logistics_unavailable') {
+            setError('Live tracking is temporarily unavailable. Your order status: ' + (resp.data?.order_status ?? 'confirmed'));
           }
         });
       })
