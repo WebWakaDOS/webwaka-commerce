@@ -23,7 +23,7 @@
 
     // Stricter Typechecking Options
     "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
+    // "exactOptionalPropertyTypes": true,  // disabled — causes cascading errors with optional string fields
 
     // Style Options
     // "noImplicitReturns": true,

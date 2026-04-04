@@ -18,6 +18,10 @@ import { cors } from 'hono/cors';
 import { posRouter } from './modules/pos/api';
 import { singleVendorRouter } from './modules/single-vendor/api';
 import { multiVendorRouter } from './modules/multi-vendor/api';
+import { b2bRouter } from './modules/b2b/api';
+import { recommendationsRouter } from './modules/ai/recommendations';
+import { forecastingRouter } from './modules/ai/forecasting';
+import { commerceRouter } from './modules/commerce/api';
 import { jwtAuthMiddleware } from './middleware/auth';
 import { createTenantResolverMiddleware } from './core/tenant/index';
 import { syncRouter } from './core/sync/server';
@@ -83,7 +87,7 @@ app.get('/health', (c) => {
       status: 'healthy',
       environment: c.env?.DB ? 'production' : 'development',
       version: '4.2.0',
-      modules: ['pos', 'single-vendor', 'multi-vendor'],
+      modules: ['pos', 'single-vendor', 'multi-vendor', 'b2b', 'ai', 'commerce'],
       security: 'JWT-auth-enabled',
       event_bus: 'cloudflare-queues',
       timestamp: new Date().toISOString(),
@@ -101,6 +105,10 @@ app.use('/api/*', (c, next) => createTenantResolverMiddleware(c.env.TENANT_CONFI
 app.route('/api/pos', posRouter);
 app.route('/api/single-vendor', singleVendorRouter);
 app.route('/api/multi-vendor', multiVendorRouter);
+app.route('/api/b2b', b2bRouter);
+app.route('/api/ai/recommendations', recommendationsRouter);
+app.route('/api/ai/forecasting', forecastingRouter);
+app.route('/api/commerce', commerceRouter);
 app.route('/api/sync', syncRouter);
 
 // ── GET /sitemap.xml — Product sitemap for SEO (P2-T08) ──────────────────────
@@ -383,7 +391,10 @@ app.notFound((c) => {
     {
       success: false,
       error: 'Route not found',
-      availableRoutes: ['/health', '/api/pos', '/api/single-vendor', '/api/multi-vendor'],
+      availableRoutes: [
+        '/health', '/api/pos', '/api/single-vendor', '/api/multi-vendor',
+        '/api/b2b', '/api/ai/recommendations', '/api/ai/forecasting', '/api/commerce',
+      ],
     },
     404,
   );

@@ -2003,7 +2003,7 @@ app.get('/config', async (c) => {
     const config = await c.env.TENANT_CONFIG.get(`tenant:${tenantId}`, 'json') as Record<string, unknown> | null;
     const localBranding = (config?.branding as Record<string, unknown> | null) ?? {};
     // COM-5: read from canonical UI_CONFIG_KV first (set by webwaka-ui-builder), fall back to local D1 config
-    const effectiveBranding = c.env.UI_CONFIG_KV
+    const effectiveBranding = c.env.UI_CONFIG_KV && tenantId
       ? await getEffectiveBranding(tenantId, c.env.UI_CONFIG_KV, {
           primaryColor: (localBranding.primaryColor as string) ?? '#2563eb',
           accentColor: (localBranding.accentColor as string) ?? '#16a34a',
@@ -2192,7 +2192,7 @@ app.put('/admin/tenant/branding', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), 
     await c.env.TENANT_CONFIG.put(`tenant:${tenantId}`, JSON.stringify(updatedConfig));
 
     // COM-5: sync branding update to canonical UI_CONFIG_KV for webwaka-ui-builder deployments
-    if (c.env.UI_CONFIG_KV) {
+    if (c.env.UI_CONFIG_KV && tenantId) {
       await syncBrandingToUIConfigKV(
         tenantId,
         c.env.UI_CONFIG_KV,

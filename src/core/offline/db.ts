@@ -190,6 +190,54 @@ export interface StorefrontCartSession {
   updatedAt: number;
 }
 
+// ─── v9 commerce cache types ─────────────────────────────────────────────────
+
+export interface CachedFlashSale {
+  id: string;
+  tenantId: string;
+  name: string;
+  startsAt: number;
+  endsAt: number;
+  status: string;
+  itemsJson: string;
+}
+
+export interface CachedProductBundle {
+  id: string;
+  tenantId: string;
+  sku: string;
+  name: string;
+  bundlePriceKobo: number;
+  savingsKobo: number;
+  isActive: boolean;
+}
+
+export interface CachedSubscriptionPlan {
+  id: string;
+  tenantId: string;
+  name: string;
+  priceKobo: number;
+  interval: string;
+  isActive: boolean;
+}
+
+export interface CachedGiftCard {
+  id: string;
+  tenantId: string;
+  code: string;
+  balanceKobo: number;
+  status: string;
+}
+
+export interface PendingPosTransaction {
+  id?: number;
+  tenantId: string;
+  localId: string;
+  payload: unknown;
+  status: 'PENDING' | 'SYNCED' | 'FAILED';
+  createdAt: number;
+}
+
 // ─── Database class ───────────────────────────────────────────────────────────
 export class CommerceOfflineDB extends Dexie {
   mutations!: Table<CommerceMutation, number>;
@@ -205,6 +253,12 @@ export class CommerceOfflineDB extends Dexie {
   syncConflicts!: Table<SyncConflict, string>; // P0-T02
   customers!: Table<OfflineCustomer, string>;  // P03
   onboardingState!: Table<OnboardingState, number>; // P03
+  // v9 — COM module caches
+  flashSales!: Table<CachedFlashSale, string>;
+  productBundles!: Table<CachedProductBundle, string>;
+  subscriptionPlans!: Table<CachedSubscriptionPlan, string>;
+  giftCards!: Table<CachedGiftCard, string>;
+  pendingPos!: Table<PendingPosTransaction, number>;
 
   constructor(tenantId: string) {
     super(`WebWakaCommerce_${tenantId}`);
@@ -307,6 +361,30 @@ export class CommerceOfflineDB extends Dexie {
       syncConflicts: 'id, tenantId, entityType, resolvedAt',
       customers: 'id, tenantId, phone, updatedAt',
       onboardingState: '++id, tenantId, vendorId, step, updatedAt',
+    });
+
+    // v9 — COM: adds offline caches for new commerce modules:
+    //           flashSales, productBundles, subscriptionPlans, giftCards, pendingPos
+    this.version(9).stores({
+      mutations: '++id, tenantId, entityType, entityId, status, timestamp',
+      cartItems: '++id, tenantId, sessionToken, productId',
+      offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
+      products: 'id, tenantId, sku, category, updatedAt',
+      posReceipts: 'id, orderId, tenantId, createdAt',
+      posSessions: 'id, tenantId, status, openedAt',
+      heldCarts: 'id, tenantId, heldAt',
+      storefrontCarts: 'id, tenantId, updatedAt',
+      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      mvProducts: 'id, tenantId, vendorId, cachedAt',
+      syncConflicts: 'id, tenantId, entityType, resolvedAt',
+      customers: 'id, tenantId, phone, updatedAt',
+      onboardingState: '++id, tenantId, vendorId, step, updatedAt',
+      // New in v9
+      flashSales: 'id, tenantId, status, endsAt',
+      productBundles: 'id, tenantId, sku, isActive',
+      subscriptionPlans: 'id, tenantId, interval, isActive',
+      giftCards: 'id, tenantId, code, status',
+      pendingPos: '++id, tenantId, status, createdAt',
     });
   }
 }

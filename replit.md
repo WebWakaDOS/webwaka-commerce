@@ -1,7 +1,7 @@
-# WebWaka Commerce Suite — T-COM-03 Complete (914 tests)
+# WebWaka Commerce Platform v4 — Full Implementation Complete
 
 ## Project Overview
-AI-native, mobile-first, offline-first SaaS operating system and commerce platform for emerging markets (Nigeria/Africa). Includes POS, Single-Vendor Storefront, and Multi-Vendor Marketplace modules.
+AI-native, mobile-first, offline-first SaaS Digital Operating System for Nigerian/emerging markets. Three commerce modules: POS, Single-Vendor Storefront, Multi-Vendor Marketplace. Full implementation of all 20 backlog items across 3 phases.
 
 ## Tech Stack
 - **Frontend:** React 19 + TypeScript, Vite 6
@@ -24,9 +24,23 @@ src/
     tenant/       # Multi-tenancy resolution
   middleware/     # Hono middlewares (auth)
   modules/        # Business SaaS modules
-    pos/          # Point of Sale
-    single-vendor/# B2C Storefront
-    multi-vendor/ # Marketplace
+    pos/          # Point of Sale (offline-queue, receipt, sessions)
+    single-vendor/# B2C Storefront (tiered pricing, cart, wishlists)
+    multi-vendor/ # Marketplace (KYC, orders, payouts, reviews)
+    b2b/          # B2B Wholesale Portal (MOQ, credit terms, bulk pricing)
+    ai/           # AI engine (recommendations FBT + forecasting SMA/WMA)
+    commerce/     # Shared commerce modules:
+      # abandoned-cart   — 3-step SMS recovery
+      # subscriptions    — Paystack recurring billing
+      # gift-cards       — 16-char codes, partial redemption
+      # flash-sales      — Time-bound discounts, countdown timers
+      # bundles          — Component-based bundled products
+      # purchase-orders  — Auto-PO generation from low stock
+      # commissions      — Staff commission tracking
+      # segmentation     — RFM customer segmentation
+      # dynamic-pricing  — Inventory/demand-based price rules
+      # whatsapp-bot     — WhatsApp commerce bot (Termii)
+      # multi-warehouse  — Haversine routing + stock reservation
     admin/        # Platform administration
   i18n/           # Language files
 public/           # Static assets, SW, PWA manifest
