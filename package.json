@@ -43,14 +43,9 @@
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.23",
-    "@webwaka/core": "github:WebWakaDOS/webwaka-core#main",
+    "@webwaka/core": "file:./packages/webwaka-core",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "wrangler": "^4.79.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@webwaka/core"
-    ]
   }
 }
