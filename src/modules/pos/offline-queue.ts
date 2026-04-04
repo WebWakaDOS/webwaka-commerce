@@ -58,7 +58,7 @@ export interface PendingTransaction {
 // ─── Dexie database ───────────────────────────────────────────────────────────
 
 class PosOfflineQueueDB extends Dexie {
-  pendingTransactions!: Table<PendingTransaction, number>;
+  declare pendingTransactions: Table<PendingTransaction, number>;
 
   constructor(tenantId: string) {
     super(`WebWakaPOSQueue_${tenantId}`);
