@@ -1,11 +1,9 @@
 {
   "name": "webwaka-commerce",
   "version": "4.0.0",
-  "description": "**Project:** WebWaka Digital Operating System v4   **Status:** Active   **Description:** AI-Native SaaS Operating System and SaaS Generation Platform for Emerging Markets",
+  "description": "WebWaka Commerce Platform (POS, Storefront, Marketplace). Part of WebWaka OS v4.",
   "main": "index.js",
-  "directories": {
-    "doc": "docs"
-  },
+  "directories": { "doc": "docs" },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
@@ -43,7 +41,7 @@
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.23",
-    "@webwaka/core": "file:./packages/webwaka-core",
+    "@webwaka/core": "^1.6.1",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "wrangler": "^4.79.0"
