@@ -16,7 +16,7 @@ kv_namespaces = [
   { binding = "TENANT_CONFIG",  id = "e9a8b3178cf245a7815f4e5bf7e67299" },
   { binding = "EVENTS",         id = "4e0bd5d5233f47dbaff75f8b10b89a8d" },
   { binding = "SESSIONS_KV",    id = "f176cebbdf8445838c72d9fde0173628" },
-  { binding = "CATALOG_CACHE",  id = "dd4a0e2f5b8c52f19a2031e4f7a8b9c0" }
+  { binding = "CATALOG_CACHE",  id = "1c68508a4bdd4ce794b2de6de61d99ec" }
 ]
 
 [[env.production.d1_databases]]
@@ -44,7 +44,6 @@ dead_letter_queue   = "webwaka-commerce-events-dlq-prod"
 [[env.production.services]]
 binding = "LOGISTICS_WORKER"
 service = "webwaka-logistics-api-prod"
-environment = "production"
 
 # Production secrets (set via: wrangler secret put <NAME> --env production)
 # PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET,
