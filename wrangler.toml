@@ -1,6 +1,7 @@
 name = "webwaka-commerce-api"
 main = "src/worker.ts"
-compatibility_date = "2024-03-14"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
 
 # ─── Cron Triggers ────────────────────────────────────────────────────────────
 # Abandoned cart nudge (hourly) + daily payout settlement cycle (8am WAT = 7am UTC)
@@ -25,13 +26,10 @@ database_name = "webwaka-commerce-db-prod"
 database_id   = "1cc45df9-36e5-44d4-8a3b-e8377881c00b"
 
 # CF Queues — event bus (P0-T01)
-# Create before deploy: wrangler queues create webwaka-commerce-events-prod
-# Production queue producer
 [[env.production.queues.producers]]
 binding = "COMMERCE_EVENTS"
 queue   = "webwaka-commerce-events-prod"
 
-# Production queue consumer
 [[env.production.queues.consumers]]
 queue               = "webwaka-commerce-events-prod"
 max_batch_size      = 25
@@ -40,25 +38,10 @@ max_retries         = 5
 dead_letter_queue   = "webwaka-commerce-events-dlq-prod"
 
 # T-CVC-01: Service Binding to webwaka-logistics for centralised delivery zone queries.
-# Commerce checkout delegates GET /shipping/estimate to the Logistics worker.
 [[env.production.services]]
 binding = "LOGISTICS_WORKER"
 service = "webwaka-logistics-api-prod"
 
 # Production secrets (set via: wrangler secret put <NAME> --env production)
 # PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET,
-# ALLOWED_ORIGINS (e.g. "https://app.webwaka.com,https://pos.webwaka.com"),
-# OPENROUTER_API_KEY, KYCSALT,
-# INTER_SERVICE_SECRET (T-FND-03): Shared secret for Service Binding auth with SA v2.
-#   Must match the INTER_SERVICE_SECRET set in webwaka-super-admin-v2.
-#   Set with: wrangler secret put INTER_SERVICE_SECRET --env production
-#   Generate a strong secret: openssl rand -hex 32
-
-# ─── Local Dev KV Seed (P0-T07) ───────────────────────────────────────────────
-# After `wrangler dev`, seed the demo tenant into TENANT_CONFIG KV:
-#
-#   wrangler kv:key put --binding=TENANT_CONFIG "tenant:tnt_demo" \
-#     '{"tenantId":"tnt_demo","domain":"localhost","enabledModules":["retail_pos","single_vendor_storefront","multi_vendor_marketplace"],"branding":{"primaryColor":"#1A56DB","logoUrl":"/logo.png"},"permissions":{"admin":["*"],"cashier":["pos.*"]},"featureFlags":{"ai_recommendations":false}}'
-#
-# The real worker resolves tenants via: kv.get(`tenant:${tenantId}`, 'json')
-# (see src/core/tenant/index.ts → createTenantResolverMiddleware)
+# ALLOWED_ORIGINS, OPENROUTER_API_KEY, KYCSALT, INTER_SERVICE_SECRET
