@@ -1,3 +1,4 @@
+import { generateForecastNarrativeViaAIPlatform } from './ai-platform-narrative';
 /**
  * WebWaka — Inventory Forecasting
  * Implementation Plan §3 Item 14 — Inventory Forecasting
@@ -125,7 +126,8 @@ export interface ForecastOptions {
   lookbackDays?: number;
   leadTimeDays?: number;    // Days from order → delivery for reorder calculation
   safetyStockDays?: number; // Buffer stock (days of inventory kept as safety margin)
-  openRouterApiKey?: string;
+  aiPlatformUrl?: string;
+  aiPlatformToken?: string;
   withNarrative?: boolean;
 }
 
@@ -142,7 +144,8 @@ export async function forecastProduct(
     lookbackDays = 30,
     leadTimeDays = 7,
     safetyStockDays = 3,
-    openRouterApiKey,
+    aiPlatformUrl,
+    aiPlatformToken,
     withNarrative = false,
   } = options;
 
@@ -187,7 +190,8 @@ export async function forecastProduct(
   // Optional AI narrative
   if (withNarrative && openRouterApiKey && urgency !== 'OK') {
     try {
-      forecast.narrative = await generateForecastNarrative(openRouterApiKey, forecast);
+      forecast.narrative = await generateForecastNarrative(aiPlatformUrl,
+    aiPlatformToken, forecast);
     } catch { /* AI enrichment is non-fatal */ }
   }
 
@@ -227,41 +231,6 @@ export async function forecastLowStockProducts(
   return forecasts
     .filter((f) => f.urgency !== 'OK')
     .sort((a, b) => a.estimatedRunoutDays - b.estimatedRunoutDays);
-}
-
-// ─── OpenRouter narrative generation ──────────────────────────────────────────
-
-async function generateForecastNarrative(
-  apiKey: string,
-  forecast: InventoryForecast,
-): Promise<string> {
-  const prompt = `You are a Nigerian inventory analyst writing a concise alert (max 2 sentences).
-Product: "${forecast.productName}" (SKU: ${forecast.sku})
-Current stock: ${forecast.currentStock} units
-Avg daily sales: ${forecast.avgDailySales.toFixed(1)} units/day
-Estimated runout: ${forecast.estimatedRunoutDays} days (${forecast.estimatedRunoutDate})
-Urgency: ${forecast.urgency}
-Recommend ordering: ${forecast.recommendedOrderQty} units
-Write a concise plain-English alert for the store owner.`;
-
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://webwaka.com',
-    },
-    body: JSON.stringify({
-      model: 'openai/gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 128,
-    }),
-    signal: AbortSignal.timeout(8_000),
-  });
-
-  if (!res.ok) throw new Error(`OpenRouter ${res.status}`);
-  const json = await res.json() as { choices: Array<{ message: { content: string } }> };
-  return json.choices[0]?.message?.content?.trim() ?? '';
 }
 
 // ─── Hono router ──────────────────────────────────────────────────────────────
