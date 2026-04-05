@@ -5,7 +5,7 @@
  * MV-1 addition: vendorAuthMiddleware — verifies vendor JWT (role='vendor')
  * and injects vendor_id + tenant_id into the Hono context.
  */
-import { jwtAuthMiddleware as coreJwtAuthMiddleware, requireRole as coreRequireRole, verifyJwt } from '@webwaka/core';
+import { jwtAuthMiddleware as coreJwtAuthMiddleware, requireRole as coreRequireRole, verifyJWT } from '@webwaka/core';
 import { getJwtSecret } from '../utils/jwt-secret';
 import type { Context, Next } from 'hono';
 
@@ -64,8 +64,11 @@ export const requireRole = coreRequireRole;
 /**
  * Vendor JWT middleware for Hono routes.
  * Validates Bearer token with role='vendor' and injects:
- *   c.set('vendorId', ...)    — the authenticated vendor's ID
+ *   c.set('vendorId', ...)       — the authenticated vendor's ID
  *   c.set('vendorTenantId', ...) — the marketplace tenant ID from the JWT
+ *
+ * Invariant: tenantId is ALWAYS extracted from the validated JWT payload —
+ * NEVER from request headers or body (cross-tenant injection prevention).
  *
  * Usage (inline on a vendor-guarded route):
  *   app.get('/vendor/orders', vendorAuthMiddleware, async (c) => {
@@ -73,7 +76,6 @@ export const requireRole = coreRequireRole;
  *   });
  */
 export async function vendorAuthMiddleware(c: Context, next: Next): Promise<Response | void> {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
   const auth = c.req.header('Authorization');
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
 
@@ -82,16 +84,15 @@ export async function vendorAuthMiddleware(c: Context, next: Next): Promise<Resp
   }
 
   const jwtSecret: string = getJwtSecret(c.env as { JWT_SECRET?: string });
-  const claims = await verifyJwt(token, jwtSecret);
+  // FIX: use verifyJWT (uppercase T) — canonical export from @webwaka/core
+  const claims = await verifyJWT(token, jwtSecret);
 
   if (!claims || claims.role !== 'vendor') {
     return c.json({ success: false, error: 'Invalid or expired vendor token' }, 401);
   }
 
-  if (claims.tenant !== tenantId) {
-    return c.json({ success: false, error: 'Vendor token tenant mismatch' }, 403);
-  }
-
+  // FIX: tenantId sourced exclusively from JWT claims — never from headers
+  // This prevents cross-tenant data injection attacks (Invariant: Build Once Use Infinitely)
   c.set('vendorId', String(claims.vendor_id));
   c.set('vendorTenantId', String(claims.tenant));
   await next();
