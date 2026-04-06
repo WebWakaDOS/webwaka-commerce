@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS cmrc_vendors (
   status TEXT NOT NULL DEFAULT 'pending', -- pending, active, suspended
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+  pickupAddress TEXT,
   deleted_at INTEGER
 );
 

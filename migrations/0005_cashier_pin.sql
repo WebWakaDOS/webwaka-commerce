@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS cmrc_staff (
 CREATE INDEX IF NOT EXISTS idx_staff_tenant ON cmrc_staff(tenant_id, id);
 
 -- For existing deployments: add PIN columns if the table already exists without them
-ALTER TABLE cmrc_staff ADD COLUMN IF NOT EXISTS manager_phone TEXT;
-ALTER TABLE cmrc_staff ADD COLUMN IF NOT EXISTS cashierPinHash TEXT;
-ALTER TABLE cmrc_staff ADD COLUMN IF NOT EXISTS cashierPinSalt TEXT;
-ALTER TABLE cmrc_staff ADD COLUMN IF NOT EXISTS pinLockedUntil TEXT;
-ALTER TABLE cmrc_staff ADD COLUMN IF NOT EXISTS pinFailedAttempts INTEGER NOT NULL DEFAULT 0;
+-- (column defined in base migration, no-op)
+-- (column defined in base migration, no-op)
+-- (column defined in base migration, no-op)
+-- (column defined in base migration, no-op)
+-- (column defined in base migration, no-op)

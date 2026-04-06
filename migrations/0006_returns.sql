@@ -31,13 +31,13 @@ CREATE TABLE IF NOT EXISTS cmrc_stock_adjustment_log (
 CREATE INDEX IF NOT EXISTS idx_stock_adj_tenant ON cmrc_stock_adjustment_log (tenantId, productId);
 
 -- 3. Cashier ID column on cmrc_orders table (Task 5)
-ALTER TABLE cmrc_orders ADD COLUMN IF NOT EXISTS cashier_id TEXT;
+-- (column defined in base migration, no-op)
 
 -- 4. Ensure cmrc_customers.creditBalanceKobo exists (defensive; already in 0003)
-ALTER TABLE cmrc_customers ADD COLUMN IF NOT EXISTS creditBalanceKobo INTEGER NOT NULL DEFAULT 0;
+-- (column defined in base migration, no-op)
 
 -- 5. Ensure cmrc_customers.lastPurchaseAt exists (defensive; already in 0003)
-ALTER TABLE cmrc_customers ADD COLUMN IF NOT EXISTS lastPurchaseAt TEXT;
+-- (column defined in base migration, no-op)
 
 -- 6. Ensure cmrc_vendor_ledger_entries.orderId column exists (for SALE/COMMISSION writes)
-ALTER TABLE cmrc_vendor_ledger_entries ADD COLUMN IF NOT EXISTS orderId TEXT;
+-- (column defined in base migration, no-op)

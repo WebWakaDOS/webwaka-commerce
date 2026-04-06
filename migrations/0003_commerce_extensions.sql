@@ -216,5 +216,5 @@ CREATE TABLE IF NOT EXISTS cmrc_purchase_order_items (
 CREATE INDEX IF NOT EXISTS idx_purchase_order_items_po ON cmrc_purchase_order_items (poId);
 
 -- Extend cmrc_customers table
-ALTER TABLE cmrc_customers ADD COLUMN IF NOT EXISTS creditBalanceKobo INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE cmrc_customers ADD COLUMN IF NOT EXISTS lastPurchaseAt TEXT;
+-- (column defined in base migration, no-op)
+-- (column defined in base migration, no-op)

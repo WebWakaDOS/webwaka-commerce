@@ -13,4 +13,4 @@ CREATE TABLE IF NOT EXISTS cmrc_product_attributes (
 CREATE INDEX IF NOT EXISTS idx_product_attributes_product ON cmrc_product_attributes(tenantId, productId);
 
 -- Vendor branding column (JSON: { logoUrl, bannerUrl, primaryColor, tagline })
-ALTER TABLE cmrc_vendors ADD COLUMN IF NOT EXISTS branding TEXT;
+-- (column defined in base migration, no-op)
