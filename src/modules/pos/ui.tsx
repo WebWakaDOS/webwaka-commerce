@@ -616,7 +616,7 @@ export const POSInterface: React.FC<{ tenantId: string }> = ({ tenantId }) => {
     try {
       // 1. Check Dexie cache first (works fully offline)
       const db = getCommerceDB(tenantId);
-      const offlineMatch: OfflineCustomer | undefined = await db.customers
+      const offlineMatch: OfflineCustomer | undefined = await db.cmrc_customers
         .where('phone').equals(phone)
         .and((c: OfflineCustomer) => c.tenantId === tenantId)
         .first();

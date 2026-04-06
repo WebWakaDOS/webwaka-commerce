@@ -21,11 +21,11 @@ import { Hono } from 'hono';
 import type { Env } from '../../worker';
 
 import { abandonedCartRouter } from './abandoned-cart';
-import { subscriptionsRouter } from './cmrc_subscriptions';
+import { subscriptionsRouter } from './subscriptions';
 import { giftCardsRouter } from './gift-cards';
 import { flashSalesRouter } from './flash-sales';
 import { bundlesRouter } from './bundles';
-import { purchaseOrdersRouter } from './purchase-cmrc_orders';
+import { purchaseOrdersRouter } from './purchase-orders';
 import { commissionsRouter } from './commissions';
 import { segmentationRouter } from './segmentation';
 import { dynamicPricingRouter } from './dynamic-pricing';

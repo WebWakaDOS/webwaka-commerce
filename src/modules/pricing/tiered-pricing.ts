@@ -192,6 +192,6 @@ export function segmentFromJwtPayload(
   if (role === 'VIP' || role === 'VIP_CUSTOMER') return 'VIP';
   if (role === 'WHOLESALE' || role === 'WHOLESALER') return 'WHOLESALE';
   if (role === 'B2B' || role === 'B2B_BUYER') return 'B2B';
-  if (role === 'STAFF' || role === 'EMPLOYEE') return 'STAFF';
+  if (role === 'STAFF' || role === 'EMPLOYEE' || role === 'CMRC_STAFF') return 'STAFF';
   return 'RETAIL';
 }
