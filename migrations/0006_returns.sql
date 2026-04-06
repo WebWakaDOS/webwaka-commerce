@@ -1,9 +1,9 @@
 -- P07: Returns, Stock Take, Cashier Reporting
--- Task 1: order_returns and stock_adjustment_log tables
--- Task 5: cashier_id column on orders
+-- Task 1: cmrc_order_returns and cmrc_stock_adjustment_log tables
+-- Task 5: cashier_id column on cmrc_orders
 
 -- 1. Order returns table
-CREATE TABLE IF NOT EXISTS order_returns (
+CREATE TABLE IF NOT EXISTS cmrc_order_returns (
   id TEXT PRIMARY KEY,
   tenantId TEXT NOT NULL,
   originalOrderId TEXT NOT NULL,
@@ -14,10 +14,10 @@ CREATE TABLE IF NOT EXISTS order_returns (
   status TEXT NOT NULL DEFAULT 'PENDING',
   createdAt TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_order_returns_tenant ON order_returns (tenantId, originalOrderId);
+CREATE INDEX IF NOT EXISTS idx_order_returns_tenant ON cmrc_order_returns (tenantId, originalOrderId);
 
 -- 2. Stock adjustment log
-CREATE TABLE IF NOT EXISTS stock_adjustment_log (
+CREATE TABLE IF NOT EXISTS cmrc_stock_adjustment_log (
   id TEXT PRIMARY KEY,
   tenantId TEXT NOT NULL,
   productId TEXT NOT NULL,
@@ -28,16 +28,16 @@ CREATE TABLE IF NOT EXISTS stock_adjustment_log (
   sessionId TEXT,
   createdAt TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_stock_adj_tenant ON stock_adjustment_log (tenantId, productId);
+CREATE INDEX IF NOT EXISTS idx_stock_adj_tenant ON cmrc_stock_adjustment_log (tenantId, productId);
 
--- 3. Cashier ID column on orders table (Task 5)
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS cashier_id TEXT;
+-- 3. Cashier ID column on cmrc_orders table (Task 5)
+ALTER TABLE cmrc_orders ADD COLUMN IF NOT EXISTS cashier_id TEXT;
 
--- 4. Ensure customers.creditBalanceKobo exists (defensive; already in 0003)
-ALTER TABLE customers ADD COLUMN IF NOT EXISTS creditBalanceKobo INTEGER NOT NULL DEFAULT 0;
+-- 4. Ensure cmrc_customers.creditBalanceKobo exists (defensive; already in 0003)
+ALTER TABLE cmrc_customers ADD COLUMN IF NOT EXISTS creditBalanceKobo INTEGER NOT NULL DEFAULT 0;
 
--- 5. Ensure customers.lastPurchaseAt exists (defensive; already in 0003)
-ALTER TABLE customers ADD COLUMN IF NOT EXISTS lastPurchaseAt TEXT;
+-- 5. Ensure cmrc_customers.lastPurchaseAt exists (defensive; already in 0003)
+ALTER TABLE cmrc_customers ADD COLUMN IF NOT EXISTS lastPurchaseAt TEXT;
 
--- 6. Ensure vendor_ledger_entries.orderId column exists (for SALE/COMMISSION writes)
-ALTER TABLE vendor_ledger_entries ADD COLUMN IF NOT EXISTS orderId TEXT;
+-- 6. Ensure cmrc_vendor_ledger_entries.orderId column exists (for SALE/COMMISSION writes)
+ALTER TABLE cmrc_vendor_ledger_entries ADD COLUMN IF NOT EXISTS orderId TEXT;

@@ -105,25 +105,25 @@ export async function handleInventoryUpdated(
     }
   }
 
-  // 2. Back-in-stock WhatsApp notifications for wishlist customers
+  // 2. Back-in-stock WhatsApp notifications for wishlist cmrc_customers
   if (productId && typeof newQuantity === 'number' && newQuantity > 0 && env.DB) {
     try {
-      // Fetch wishlist customers for this product
+      // Fetch wishlist cmrc_customers for this product
       const wishlistRows = await env.DB.prepare(
-        'SELECT customer_id FROM wishlists WHERE tenant_id = ? AND product_id = ? LIMIT 100'
+        'SELECT customer_id FROM cmrc_wishlists WHERE tenant_id = ? AND product_id = ? LIMIT 100'
       ).bind(tenantId, productId).all<{ customer_id: string }>();
 
       if ((wishlistRows.results?.length ?? 0) === 0) {
         // No wishlist entries; log and return
         await env.DB.prepare(
-          'INSERT OR IGNORE INTO inventory_sync_log (id, tenantId, productId, newQuantity, wishlistNotified, createdAt) VALUES (?, ?, ?, ?, 0, ?)'
+          'INSERT OR IGNORE INTO cmrc_inventory_sync_log (id, tenantId, productId, newQuantity, wishlistNotified, createdAt) VALUES (?, ?, ?, ?, 0, ?)'
         ).bind(`isl_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`, tenantId, productId, newQuantity, new Date().toISOString()).run().catch(() => {});
         return;
       }
 
       // Fetch product name
       const productRow = await env.DB.prepare(
-        'SELECT name FROM products WHERE id = ? AND tenant_id = ?'
+        'SELECT name FROM cmrc_products WHERE id = ? AND tenant_id = ?'
       ).bind(productId, tenantId).first<{ name: string }>();
       const productName = productRow?.name ?? 'A product';
       const storeUrl = `https://${tenantId}.webwaka.ng/`;
@@ -132,7 +132,7 @@ export async function handleInventoryUpdated(
       for (const row of wishlistRows.results ?? []) {
         try {
           const custRow = await env.DB.prepare(
-            'SELECT phone FROM customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
+            'SELECT phone FROM cmrc_customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
           ).bind(row.customer_id, tenantId).first<{ phone: string }>();
           if (!custRow?.phone) continue;
 
@@ -150,7 +150,7 @@ export async function handleInventoryUpdated(
 
       // 3. Audit log
       await env.DB.prepare(
-        'INSERT OR IGNORE INTO inventory_sync_log (id, tenantId, productId, newQuantity, wishlistNotified, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
+        'INSERT OR IGNORE INTO cmrc_inventory_sync_log (id, tenantId, productId, newQuantity, wishlistNotified, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
       ).bind(
         `isl_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
         tenantId, productId, newQuantity, notifiedCount, new Date().toISOString()
@@ -161,7 +161,7 @@ export async function handleInventoryUpdated(
   }
 }
 
-// ─── Handler: order.created → log to platform_order_log ──────────────────────
+// ─── Handler: order.created → log to cmrc_platform_order_log ──────────────────────
 
 export async function handleOrderCreated(
   event: WebWakaEvent<{ order?: { id?: string } }>,
@@ -176,7 +176,7 @@ export async function handleOrderCreated(
 
   try {
     await env.DB.prepare(
-      `INSERT OR IGNORE INTO platform_order_log
+      `INSERT OR IGNORE INTO cmrc_platform_order_log
          (id, tenant_id, order_id, source_module, created_at)
        VALUES (?, ?, ?, ?, ?)`,
     )
@@ -188,7 +188,7 @@ export async function handleOrderCreated(
   }
 }
 
-// ─── Handler: shift.closed → compute Z-report and insert shift_analytics ─────
+// ─── Handler: shift.closed → compute Z-report and insert cmrc_shift_analytics ─────
 
 export async function handleShiftClosed(
   event: WebWakaEvent<{ sessionId?: string }>,
@@ -203,7 +203,7 @@ export async function handleShiftClosed(
       `SELECT COUNT(*) AS total_orders,
               COALESCE(SUM(total_amount), 0) AS revenue_kobo,
               COALESCE(AVG(total_amount), 0) AS avg_order_kobo
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND session_id = ? AND deleted_at IS NULL`,
     )
       .bind(tenantId, sessionId)
@@ -215,7 +215,7 @@ export async function handleShiftClosed(
     const recordedAt = new Date(event.timestamp).toISOString();
 
     await env.DB.prepare(
-      `INSERT OR IGNORE INTO shift_analytics
+      `INSERT OR IGNORE INTO cmrc_shift_analytics
          (id, tenant_id, session_id, total_orders, revenue_kobo, avg_order_kobo, recorded_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
@@ -237,14 +237,14 @@ export async function handleShiftClosed(
 // ─── Handler: vendor.kyc.submitted → automated KYC pipeline ──────────────────
 //
 // Pipeline:
-//   1. INSERT OR IGNORE kyc_review_queue (idempotent)
+//   1. INSERT OR IGNORE cmrc_kyc_review_queue (idempotent)
 //   2. Fetch vendor: bvn_hash, rc_number, name, phone, onboarding_data_json
 //   3. If KYC credentials not configured → MANUAL_REVIEW
 //   4. createKycProvider + Promise.allSettled([verifyBvn, verifyCac])
 //   5. AUTO_APPROVED  — both pass
 //      AUTO_REJECTED  — BVN fails
 //      MANUAL_REVIEW  — BVN passes, CAC fails/missing
-//   6. UPDATE kyc_review_queue + vendors
+//   6. UPDATE cmrc_kyc_review_queue + cmrc_vendors
 //   7. Publish VENDOR_KYC_APPROVED | VENDOR_KYC_REJECTED event
 //   8. WhatsApp notification via Termii
 
@@ -260,7 +260,7 @@ async function _updateKycQueueStatus(
   const reviewedAt = new Date().toISOString();
   try {
     await db.prepare(
-      `UPDATE kyc_review_queue
+      `UPDATE cmrc_kyc_review_queue
        SET status = ?, reviewed_at = ?
        WHERE id = ? AND tenant_id = ? AND vendor_id = ?`,
     ).bind(status, reviewedAt, queueId, tenantId, vendorId).run();
@@ -294,7 +294,7 @@ export async function handleVendorKycSubmitted(
   // ── 1. Insert into review queue (idempotent) ─────────────────────────────
   try {
     await env.DB.prepare(
-      `INSERT OR IGNORE INTO kyc_review_queue
+      `INSERT OR IGNORE INTO cmrc_kyc_review_queue
          (id, tenant_id, vendor_id, submitted_at, status)
        VALUES (?, ?, ?, ?, 'PENDING')`,
     ).bind(queueId, tenantId, vendorId, submittedAt).run();
@@ -312,7 +312,7 @@ export async function handleVendorKycSubmitted(
   try {
     vendor = await env.DB.prepare(
       `SELECT bvn_hash, rc_number, name, phone, onboarding_data_json
-       FROM vendors
+       FROM cmrc_vendors
        WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL`,
     ).bind(vendorId, tenantId).first<{
       bvn_hash: string | null;
@@ -411,7 +411,7 @@ export async function handleVendorKycSubmitted(
     // Update vendor: approved + activate
     try {
       await env.DB.prepare(
-        `UPDATE vendors
+        `UPDATE cmrc_vendors
          SET kyc_status = 'approved', kyc_approved_at = ?, active = 1, updated_at = ?
          WHERE id = ? AND marketplace_tenant_id = ?`,
       ).bind(now, now, vendorId, tenantId).run();
@@ -431,14 +431,14 @@ export async function handleVendorKycSubmitted(
     await _sendKycWhatsApp(
       env,
       vendor.phone,
-      `Congratulations! Your WebWaka seller account for ${vendor.name} is now LIVE. You can start listing products and receiving orders immediately.`,
+      `Congratulations! Your WebWaka seller account for ${vendor.name} is now LIVE. You can start listing cmrc_products and receiving cmrc_orders immediately.`,
     );
 
   } else if (newStatus === 'AUTO_REJECTED') {
     // Update vendor: rejected
     try {
       await env.DB.prepare(
-        `UPDATE vendors
+        `UPDATE cmrc_vendors
          SET kyc_status = 'rejected',
              kyc_rejection_reason = ?,
              updated_at = ?
@@ -490,7 +490,7 @@ export async function handleVendorKycSubmitted(
   }
 }
 
-// ─── Handler: delivery.booking.confirmed → update vendor_orders tracking ──────
+// ─── Handler: delivery.booking.confirmed → update cmrc_vendor_orders tracking ──────
 
 export async function handleDeliveryBookingConfirmed(
   event: WebWakaEvent<{
@@ -509,7 +509,7 @@ export async function handleDeliveryBookingConfirmed(
 
   const now = Date.now();
   await env.DB.prepare(
-    `UPDATE vendor_orders
+    `UPDATE cmrc_vendor_orders
      SET fulfilment_status = 'shipped',
          tracking_number    = ?,
          tracking_url       = ?,
@@ -590,16 +590,16 @@ export async function handleCartAbandoned(
   try {
     if (isSecondNudge) {
       await env.DB.prepare(
-        `UPDATE abandoned_carts SET second_nudge_sent_at = ? WHERE cart_token = (
-           SELECT session_token FROM cart_sessions WHERE id = ? LIMIT 1
+        `UPDATE cmrc_abandoned_carts SET second_nudge_sent_at = ? WHERE cart_token = (
+           SELECT session_token FROM cmrc_cart_sessions WHERE id = ? LIMIT 1
          )`,
       ).bind(now, cartId).run();
     } else {
       await env.DB.prepare(
-        `INSERT OR IGNORE INTO abandoned_carts
+        `INSERT OR IGNORE INTO cmrc_abandoned_carts
            (id, tenant_id, customer_phone, cart_json, total_kobo, nudge_sent_at, cart_token, created_at, updated_at)
          SELECT ?, ?, ?, items_json, 0, ?, session_token, ?, ?
-         FROM cart_sessions WHERE id = ?`,
+         FROM cmrc_cart_sessions WHERE id = ?`,
       ).bind(acId, event.tenantId, customerPhone, now, now, now, cartId).run();
     }
   } catch { /* Non-fatal */ }
@@ -639,7 +639,7 @@ export async function handleDeliveryStatusUpdated(
   // 1. Update order status in D1
   try {
     await env.DB.prepare(
-      `UPDATE orders
+      `UPDATE cmrc_orders
        SET order_status = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ?`,
     ).bind(mappedStatus, now, orderId, tenantId).run();
@@ -651,7 +651,7 @@ export async function handleDeliveryStatusUpdated(
   let customerPhone: string | null = null;
   try {
     const row = await env.DB.prepare(
-      `SELECT customer_phone FROM orders WHERE id = ? AND tenant_id = ?`,
+      `SELECT customer_phone FROM cmrc_orders WHERE id = ? AND tenant_id = ?`,
     ).bind(orderId, tenantId).first<{ customer_phone: string | null }>();
     customerPhone = row?.customer_phone ?? null;
   } catch { /* non-fatal */ }
@@ -680,14 +680,14 @@ export async function handleDeliveryStatusUpdated(
   if (mappedStatus === 'DELIVERED') {
     try {
       const existing = await env.DB.prepare(
-        `SELECT id FROM review_invites WHERE order_id = ? AND customer_phone = ?`,
+        `SELECT id FROM cmrc_review_invites WHERE order_id = ? AND customer_phone = ?`,
       ).bind(orderId, customerPhone ?? '').first();
 
       if (!existing && customerPhone) {
         const inviteId = `ri_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const sendAt = Date.now() + 3 * 24 * 60 * 60 * 1000; // 3 days later
         await env.DB.prepare(
-          `INSERT OR IGNORE INTO review_invites
+          `INSERT OR IGNORE INTO cmrc_review_invites
              (id, tenant_id, order_id, customer_phone, send_at, sent, created_at)
            VALUES (?, ?, ?, ?, ?, 0, ?)`,
         ).bind(inviteId, tenantId, orderId, customerPhone, sendAt, Date.now()).run();

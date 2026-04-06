@@ -99,12 +99,12 @@ export async function fetchDailySales(
   const since = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
 
   try {
-    // Try order_items table first (pos + storefront orders)
+    // Try order_items table first (pos + storefront cmrc_orders)
     const { results } = await db.prepare(
       `SELECT DATE(o.created_at / 1000, 'unixepoch') AS sale_date,
               SUM(oi.quantity) AS units_sold
        FROM order_items oi
-       JOIN orders o ON o.id = oi.order_id
+       JOIN cmrc_orders o ON o.id = oi.order_id
        WHERE o.tenant_id = ?
          AND oi.product_id = ?
          AND o.created_at >= ?
@@ -201,8 +201,8 @@ export async function forecastProduct(
 }
 
 /**
- * Batch forecast for all products approaching reorder point.
- * Returns only products with urgency LOW, CRITICAL, or OUT_OF_STOCK.
+ * Batch forecast for all cmrc_products approaching reorder point.
+ * Returns only cmrc_products with urgency LOW, CRITICAL, or OUT_OF_STOCK.
  */
 export async function forecastLowStockProducts(
   db: D1Database,
@@ -213,21 +213,21 @@ export async function forecastLowStockProducts(
     id: string; name: string; sku: string; quantity: number; low_stock_threshold: number | null;
   }
 
-  let products: ProductRow[] = [];
+  let cmrc_products: ProductRow[] = [];
   try {
     const { results } = await db.prepare(
       `SELECT id, name, sku, quantity, low_stock_threshold
-       FROM products
+       FROM cmrc_products
        WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL AND quantity < 100
        ORDER BY quantity ASC LIMIT 50`
     ).bind(tenantId).all<ProductRow>();
-    products = results;
+    cmrc_products = results;
   } catch {
     return [];
   }
 
   const forecasts = await Promise.all(
-    products.map((p) => forecastProduct(db, tenantId, p, options))
+    cmrc_products.map((p) => forecastProduct(db, tenantId, p, options))
   );
 
   return forecasts
@@ -246,7 +246,7 @@ forecastingRouter.use('*', async (c, next) => {
 
 /**
  * GET /api/forecasting/low-stock
- * Returns products approaching their reorder point with runout estimates.
+ * Returns cmrc_products approaching their reorder point with runout estimates.
  * Requires TENANT_ADMIN or SUPER_ADMIN.
  */
 forecastingRouter.get(
@@ -284,7 +284,7 @@ forecastingRouter.get(
     }
 
     const product = await c.env.DB.prepare(
-      'SELECT id, name, sku, quantity, low_stock_threshold FROM products WHERE id = ? AND tenant_id = ?'
+      'SELECT id, name, sku, quantity, low_stock_threshold FROM cmrc_products WHERE id = ? AND tenant_id = ?'
     ).bind(productId, tenantId).first<ProductRow>();
 
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);

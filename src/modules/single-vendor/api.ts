@@ -8,8 +8,8 @@
  * SV-3 additions:
  *   SEARCH-1: GET /catalog/search?q= via FTS5 MATCH
  *   PAGE-1:   GET /catalog → cursor pagination (?after=<id>&per_page=24)
- *   ORDER-1:  GET /orders/:id → full order with parsed items
- *   VAR-1:    GET /products/:id/variants → variant list
+ *   ORDER-1:  GET /cmrc_orders/:id → full order with parsed items
+ *   VAR-1:    GET /cmrc_products/:id/variants → variant list
  */
 import { Hono } from 'hono';
 import {
@@ -89,7 +89,7 @@ app.get('/', async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
+      'SELECT * FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
   } catch (err) {
@@ -118,7 +118,7 @@ app.get('/catalog/search', async (c) => {
       `SELECT p.id, p.name, p.description, p.price, p.quantity, p.category,
               p.image_url, p.sku, p.has_variants
        FROM products_fts fts
-       JOIN products p ON p.id = fts.product_id
+       JOIN cmrc_products p ON p.id = fts.product_id
        WHERE fts MATCH ?
          AND fts.tenant_id = ?
          AND p.is_active = 1
@@ -127,22 +127,22 @@ app.get('/catalog/search', async (c) => {
        LIMIT ?`
     ).bind(sanitizeFts(q), tenantId, perPage).all();
 
-    return c.json({ success: true, data: { products: results, query: q, count: results.length } });
+    return c.json({ success: true, data: { cmrc_products: results, query: q, count: results.length } });
   } catch (ftsErr) {
     // FTS table may not exist in early envs — graceful fallback with LIKE
     console.warn('[SV][catalog/search] FTS5 query failed, falling back to LIKE:', ftsErr);
     try {
       const { results } = await c.env.DB.prepare(
         `SELECT id, name, description, price, quantity, category, image_url, sku, has_variants
-         FROM products
+         FROM cmrc_products
          WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
            AND (name LIKE ? OR description LIKE ? OR category LIKE ? OR sku LIKE ?)
          ORDER BY name ASC LIMIT ?`
       ).bind(tenantId, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, perPage).all();
-      return c.json({ success: true, data: { products: results, query: q, count: results.length } });
+      return c.json({ success: true, data: { cmrc_products: results, query: q, count: results.length } });
     } catch (err) {
       console.error('[SV] route error:', err);
-      return c.json({ success: true, data: { products: [], query: q, count: 0 } });
+      return c.json({ success: true, data: { cmrc_products: [], query: q, count: 0 } });
     }
   }
 });
@@ -159,7 +159,7 @@ app.get('/catalog', async (c) => {
   if (c.env.CATALOG_CACHE) {
     const cached = await c.env.CATALOG_CACHE.get(cacheKey);
     if (cached) {
-      const parsed = JSON.parse(cached) as { products: unknown[]; next_cursor: string | null; has_more: boolean };
+      const parsed = JSON.parse(cached) as { cmrc_products: unknown[]; next_cursor: string | null; has_more: boolean };
       return c.json({ success: true, data: parsed, cached: true });
     }
   }
@@ -168,7 +168,7 @@ app.get('/catalog', async (c) => {
     const params: (string | number)[] = [tenantId!];
     let query =
       `SELECT id, name, description, price, quantity, category, image_url, sku, has_variants
-       FROM products
+       FROM cmrc_products
        WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL`;
 
     if (after) { query += ' AND id > ?'; params.push(after); }
@@ -188,7 +188,7 @@ app.get('/catalog', async (c) => {
 
     // ── Cloudflare Images URL transform (optional — CF_IMAGES_ACCOUNT_HASH) ──
     const cfHash = c.env.CF_IMAGES_ACCOUNT_HASH;
-    const products = cfHash
+    const cmrc_products = cfHash
       ? rawProducts.map(p => ({
           ...p,
           image_url: p.image_url
@@ -197,7 +197,7 @@ app.get('/catalog', async (c) => {
         }))
       : rawProducts;
 
-    const payload = { products, next_cursor: nextCursor, has_more: hasMore };
+    const payload = { cmrc_products, next_cursor: nextCursor, has_more: hasMore };
 
     // Write to KV cache (non-blocking, 60s TTL)
     if (c.env.CATALOG_CACHE) {
@@ -209,20 +209,20 @@ app.get('/catalog', async (c) => {
     return c.json({ success: true, data: payload });
   } catch (err) {
     console.error('[SV] route error:', err);
-    return c.json({ success: true, data: { products: [], next_cursor: null, has_more: false } });
+    return c.json({ success: true, data: { cmrc_products: [], next_cursor: null, has_more: false } });
   }
 });
 
-// ── GET /products/by-slug/:slug — Product detail by URL slug ─────────────────
-// Must be BEFORE /products/:id/variants to avoid :id capturing "by-slug"
-app.get('/products/by-slug/:slug', async (c) => {
+// ── GET /cmrc_products/by-slug/:slug — Product detail by URL slug ─────────────────
+// Must be BEFORE /cmrc_products/:id/variants to avoid :id capturing "by-slug"
+app.get('/cmrc_products/by-slug/:slug', async (c) => {
   const tenantId = getTenantId(c);
   const slug = c.req.param('slug');
   try {
     const product = await c.env.DB.prepare(
       `SELECT id, name, description, price, quantity, category, image_url, sku,
               has_variants, slug
-       FROM products
+       FROM cmrc_products
        WHERE tenant_id = ? AND slug = ? AND is_active = 1 AND deleted_at IS NULL`,
     ).bind(tenantId, slug).first();
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
@@ -233,14 +233,14 @@ app.get('/products/by-slug/:slug', async (c) => {
   }
 });
 
-// ── GET /products/:id/variants — Product variants (VAR-1) ────────────────────
-app.get('/products/:id/variants', async (c) => {
+// ── GET /cmrc_products/:id/variants — Product variants (VAR-1) ────────────────────
+app.get('/cmrc_products/:id/variants', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, product_id, option_name, option_value, sku, price_delta, quantity
-       FROM product_variants
+       FROM cmrc_product_variants
        WHERE product_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
        ORDER BY option_name ASC, option_value ASC`
     ).bind(productId, tenantId).all();
@@ -264,7 +264,7 @@ app.post('/cart', async (c) => {
   const expiresAt = now + 3600000;
   try {
     await c.env.DB.prepare(
-      `INSERT INTO cart_sessions (id, tenant_id, session_token, items_json, expires_at, created_at, updated_at)
+      `INSERT INTO cmrc_cart_sessions (id, tenant_id, session_token, items_json, expires_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET items_json = excluded.items_json, updated_at = excluded.updated_at`
     ).bind(id, tenantId, token, JSON.stringify(body.items), expiresAt, now, now).run();
@@ -281,7 +281,7 @@ app.get('/cart/:token', async (c) => {
   const token = c.req.param('token');
   try {
     const cart = await c.env.DB.prepare(
-      'SELECT * FROM cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?'
+      'SELECT * FROM cmrc_cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?'
     ).bind(token, tenantId, Date.now()).first();
     if (!cart) return c.json({ success: false, error: 'Cart not found or expired' }, 404);
     return c.json({ success: true, data: cart });
@@ -307,7 +307,7 @@ app.post('/promo/validate', async (c) => {
     const promo = await c.env.DB.prepare(
       `SELECT id, code, discount_type, discount_value, discountCap, min_order_kobo, max_uses, current_uses,
               expires_at, is_active, description
-       FROM promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
+       FROM cmrc_promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
     ).bind(tenantId, body.code.toUpperCase().trim()).first<PromoRow>();
 
     if (!promo) return c.json({ success: false, error: 'Promo code not found' }, 404);
@@ -357,7 +357,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     const dbProducts: Array<DbProduct | null> = await Promise.all(
       body.items.map(item =>
         c.env.DB.prepare(
-          'SELECT id, name, price, quantity, version FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL'
+          'SELECT id, name, price, quantity, version FROM cmrc_products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL'
         ).bind(item.product_id, tenantId).first<DbProduct>()
       )
     );
@@ -394,7 +394,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       const promo = await c.env.DB.prepare(
         `SELECT id, code, discount_type, discount_value, discountCap, min_order_kobo, max_uses, current_uses, expires_at, is_active,
                 promoType, minOrderValueKobo, maxUsesTotal, maxUsesPerCustomer, validFrom, validUntil, productScope, usedCount
-         FROM promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
+         FROM cmrc_promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
       ).bind(tenantId, body.promo_code.toUpperCase().trim()).first<EnhancedPromoRow>();
 
       if (!promo) return c.json({ success: false, error: 'Promo code not found' }, 422);
@@ -421,7 +421,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         const promoCustomerKey = body.customer_phone ?? body.customer_email ?? '';
         if (promoCustomerKey) {
           const usageRow = await c.env.DB.prepare(
-            'SELECT COUNT(*) as cnt FROM promo_usage WHERE promoId = ? AND customerId = ? AND tenantId = ?'
+            'SELECT COUNT(*) as cnt FROM cmrc_promo_usage WHERE promoId = ? AND customerId = ? AND tenantId = ?'
           ).bind(promo.id, promoCustomerKey, tenantId).first<{ cnt: number }>();
           if ((usageRow?.cnt ?? 0) >= promo.maxUsesPerCustomer) {
             return c.json({ success: false, error: 'promo_already_used' }, 422);
@@ -510,7 +510,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
 
       const lockResult = await updateWithVersionLock(
         c.env.DB,
-        'products',
+        'cmrc_products',
         { quantity: newQty },
         { id: item.product_id, tenantId: tenantId!, expectedVersion: dbProd.version },
       );
@@ -566,7 +566,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     let promoPreClaimed = false;
     if (promoRow && promoCapForClaim !== null) {
       const claimResult = await c.env.DB.prepare(
-        `UPDATE promo_codes
+        `UPDATE cmrc_promo_codes
            SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ?
          WHERE id = ? AND tenant_id = ?
            AND (
@@ -585,7 +585,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     // ── Insert order + customer + promo atomically ────────────────────────────
     const stmts = [
       c.env.DB.prepare(
-        `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal,
+        `INSERT INTO cmrc_orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal,
                              discount, discount_kobo, vat_kobo, total_amount, payment_method,
                              payment_status, order_status, channel, payment_reference,
                              paystack_reference, delivery_address_json, promo_code,
@@ -601,7 +601,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         now, now,
       ),
       c.env.DB.prepare(
-        `INSERT OR IGNORE INTO customers (id, tenant_id, name, email, phone, ndpr_consent, ndpr_consent_at, created_at, updated_at)
+        `INSERT OR IGNORE INTO cmrc_customers (id, tenant_id, name, email, phone, ndpr_consent, ndpr_consent_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`
       ).bind(custId, tenantId, contactName, body.customer_email ?? null, body.customer_phone ?? null, now, now, now),
     ];
@@ -610,7 +610,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       // Uncapped promos are incremented here (inside the atomic batch)
       stmts.push(
         c.env.DB.prepare(
-          'UPDATE promo_codes SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ? WHERE id = ? AND tenant_id = ?'
+          'UPDATE cmrc_promo_codes SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ? WHERE id = ? AND tenant_id = ?'
         ).bind(now, promoRow.id, tenantId)
       );
     }
@@ -622,7 +622,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         const puId = `pu_${now}_${Math.random().toString(36).slice(2, 9)}`;
         stmts.push(
           c.env.DB.prepare(
-            `INSERT INTO promo_usage (id, promoId, customerId, tenantId, usedAt, freeProductId)
+            `INSERT INTO cmrc_promo_usage (id, promoId, customerId, tenantId, usedAt, freeProductId)
              VALUES (?, ?, ?, ?, ?, ?)`
           ).bind(puId, promoRow.id, promoCustomerKey, tenantId, new Date(now).toISOString(), bogoFreeProductId)
         );
@@ -637,7 +637,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       // back the usage counter so the promo can be legitimately used in a retry.
       if (promoPreClaimed && promoRow) {
         await c.env.DB.prepare(
-          'UPDATE promo_codes SET current_uses = current_uses - 1, usedCount = usedCount - 1, updated_at = ? WHERE id = ? AND tenant_id = ?',
+          'UPDATE cmrc_promo_codes SET current_uses = current_uses - 1, usedCount = usedCount - 1, updated_at = ? WHERE id = ? AND tenant_id = ?',
         ).bind(now, promoRow.id, tenantId).run().catch(() => {
           // Compensation failure is non-fatal from the user's perspective —
           // operations can reconcile the counter via the admin dashboard.
@@ -660,7 +660,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         try {
           interface OutletRow { id: string; name: string; address: string | null; lat: number | null; lng: number | null }
           const { results: outlets } = await c.env.DB.prepare(
-            `SELECT id, name, address, lat, lng FROM pos_outlets WHERE tenant_id = ? AND active = 1`
+            `SELECT id, name, address, lat, lng FROM cmrc_pos_outlets WHERE tenant_id = ? AND active = 1`
           ).bind(tenantId).all<OutletRow>();
           if (!outlets || outlets.length === 0) return;
 
@@ -689,7 +689,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
           if (!nearestId) return;
           const assignedAt = new Date().toISOString();
           await c.env.DB.prepare(
-            `UPDATE orders SET fulfillment_outlet_id = ?, fulfillment_status = 'assigned',
+            `UPDATE cmrc_orders SET fulfillment_outlet_id = ?, fulfillment_status = 'assigned',
              fulfillment_assigned_at = ?, updated_at = ?
              WHERE id = ? AND tenant_id = ?`
           ).bind(nearestId, assignedAt, assignedAt, orderId, tenantId).run();
@@ -714,7 +714,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       })();
     })();
 
-    // ── Award loyalty points in customer_loyalty table (POS-E10, non-blocking) ─
+    // ── Award loyalty points in cmrc_customer_loyalty table (POS-E10, non-blocking) ─
     void (async () => {
       try {
         const svLoyaltyCfg = (c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty ?? DEFAULT_LOYALTY_CONFIG;
@@ -723,23 +723,23 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         const phone = body.customer_phone ?? '';
         if (!phone) return;
         const custRow = await c.env.DB.prepare(
-          'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+          'SELECT id FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
         ).bind(tenantId, phone).first<{ id: string }>();
         if (!custRow) return;
         const existing = await c.env.DB.prepare(
-          'SELECT id, points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?'
+          'SELECT id, points FROM cmrc_customer_loyalty WHERE tenantId = ? AND customerId = ?'
         ).bind(tenantId, custRow.id).first<{ id: string; points: number }>();
         const prevPts = existing?.points ?? 0;
         const newPts = prevPts + svLoyaltyEarned;
         const newTier = evaluateLoyaltyTier(newPts, svLoyaltyCfg);
         if (existing) {
           await c.env.DB.prepare(
-            'UPDATE customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
+            'UPDATE cmrc_customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
           ).bind(newPts, newTier, new Date(now).toISOString(), tenantId, custRow.id).run();
         } else {
           const lid = `loy_sv_${now}_${Math.random().toString(36).slice(2, 9)}`;
           await c.env.DB.prepare(
-            'INSERT OR IGNORE INTO customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
+            'INSERT OR IGNORE INTO cmrc_customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
           ).bind(lid, tenantId, custRow.id, svLoyaltyEarned, evaluateLoyaltyTier(svLoyaltyEarned, svLoyaltyCfg), new Date(now).toISOString()).run();
         }
       } catch { /* non-fatal */ }
@@ -781,9 +781,9 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   }
 });
 
-// ── GET /orders/:id/delivery-options — Return logistics quotes from KV (P05-T2) ─
-// Must be BEFORE /orders/:id to prevent ":id" from matching sub-paths
-app.get('/orders/:id/delivery-options', async (c) => {
+// ── GET /cmrc_orders/:id/delivery-options — Return logistics quotes from KV (P05-T2) ─
+// Must be BEFORE /cmrc_orders/:id to prevent ":id" from matching sub-paths
+app.get('/cmrc_orders/:id/delivery-options', async (c) => {
   const orderId = c.req.param('id');
   try {
     const raw = c.env.CATALOG_CACHE
@@ -799,18 +799,18 @@ app.get('/orders/:id/delivery-options', async (c) => {
   }
 });
 
-// ── GET /orders/:id/track — T-CVC-02: Redirect to Logistics tracking portal ───
-// Must be BEFORE /orders/:id to prevent ":id" from matching the track path.
+// ── GET /cmrc_orders/:id/track — T-CVC-02: Redirect to Logistics tracking portal ───
+// Must be BEFORE /cmrc_orders/:id to prevent ":id" from matching the track path.
 // Obtains a signed tracking token from Logistics via Service Binding, then
 // redirects the customer to the Logistics tracking portal URL.
-app.get('/orders/:id/track', async (c) => {
+app.get('/cmrc_orders/:id/track', async (c) => {
   const tenantId = getTenantId(c);
   const orderId = c.req.param('id');
 
   // Verify order exists and belongs to this tenant before issuing a token
   try {
     const order = await c.env.DB.prepare(
-      `SELECT id FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
+      `SELECT id FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
     ).bind(orderId, tenantId).first<{ id: string }>();
     if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
   } catch (err) {
@@ -847,7 +847,7 @@ app.get('/orders/:id/track', async (c) => {
   try {
     const order = await c.env.DB.prepare(
       `SELECT id, order_status, payment_status, created_at, updated_at
-       FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
     ).bind(orderId, tenantId).first<{
       id: string; order_status: string; payment_status: string;
       created_at: number; updated_at: number;
@@ -872,8 +872,8 @@ app.get('/orders/:id/track', async (c) => {
   }
 });
 
-// ── GET /orders/:id — Full order detail (ORDER-1) ─────────────────────────────
-app.get('/orders/:id', async (c) => {
+// ── GET /cmrc_orders/:id — Full order detail (ORDER-1) ─────────────────────────────
+app.get('/cmrc_orders/:id', async (c) => {
   const tenantId = getTenantId(c);
   const orderId = c.req.param('id');
   try {
@@ -886,7 +886,7 @@ app.get('/orders/:id', async (c) => {
       created_at: number; updated_at: number;
     }
     const order = await c.env.DB.prepare(
-      `SELECT * FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`
+      `SELECT * FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`
     ).bind(orderId, tenantId).first<OrderRow>();
 
     if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
@@ -913,12 +913,12 @@ app.get('/orders/:id', async (c) => {
   }
 });
 
-// ── GET /orders — List storefront orders ──────────────────────────────────────
-app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// ── GET /cmrc_orders — List storefront cmrc_orders ──────────────────────────────────────
+app.get('/cmrc_orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
+      "SELECT * FROM cmrc_orders WHERE tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
   } catch (err) {
@@ -927,12 +927,12 @@ app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   }
 });
 
-// ── GET /customers ────────────────────────────────────────────────────────────
-app.get('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// ── GET /cmrc_customers ────────────────────────────────────────────────────────────
+app.get('/cmrc_customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT id, name, email, phone, loyalty_points, total_spend, ndpr_consent, created_at FROM customers WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
+      'SELECT id, name, email, phone, loyalty_points, total_spend, ndpr_consent, created_at FROM cmrc_customers WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
   } catch (err) {
@@ -967,13 +967,13 @@ app.post('/auth/login', async (c) => {
         const now = Date.now();
         interface CustomerRow { id: string; loyalty_points: number }
         let customer = await c.env.DB.prepare(
-          'SELECT id, loyalty_points FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+          'SELECT id, loyalty_points FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
         ).bind(tenantId, e164).first<CustomerRow>();
 
         if (!customer) {
           const cid = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
           await c.env.DB.prepare(
-            `INSERT INTO customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+            `INSERT INTO cmrc_customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
              VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
           ).bind(cid, tenantId, e164, e164, now, now, now).run();
           customer = { id: cid, loyalty_points: 0 };
@@ -1051,7 +1051,7 @@ app.post('/auth/request-otp', async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+      `INSERT INTO cmrc_customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
@@ -1108,13 +1108,13 @@ app.post('/auth/verify-otp', async (c) => {
         const now = Date.now();
         interface CustomerRow { id: string; loyalty_points: number }
         let customer = await c.env.DB.prepare(
-          'SELECT id, loyalty_points FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+          'SELECT id, loyalty_points FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
         ).bind(tenantId, e164).first<CustomerRow>();
 
         if (!customer) {
           const cid = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
           await c.env.DB.prepare(
-            `INSERT INTO customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+            `INSERT INTO cmrc_customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
              VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
           ).bind(cid, tenantId, e164, e164, now, now, now).run();
           customer = { id: cid, loyalty_points: 0 };
@@ -1148,7 +1148,7 @@ app.post('/auth/verify-otp', async (c) => {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
     const otpRow = await c.env.DB.prepare(
       `SELECT id, otp_hash, is_used, attempts, expires_at
-       FROM customer_otps
+       FROM cmrc_customer_otps
        WHERE tenant_id = ? AND phone = ? AND is_used = 0
        ORDER BY created_at DESC LIMIT 1`
     ).bind(tenantId, e164).first<OtpRow>();
@@ -1159,23 +1159,23 @@ app.post('/auth/verify-otp', async (c) => {
 
     const inputHash = await hashOtp(otp);
     if (inputHash !== otpRow.otp_hash) {
-      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      await c.env.DB.prepare('UPDATE cmrc_customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
       return c.json({ success: false, error: 'Incorrect OTP' }, 401);
     }
 
-    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+    await c.env.DB.prepare('UPDATE cmrc_customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
 
     const now = Date.now();
     const customerId = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
 
     interface CustomerRow { id: string; loyalty_points: number }
     let customer = await c.env.DB.prepare(
-      'SELECT id, loyalty_points FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+      'SELECT id, loyalty_points FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
     ).bind(tenantId, e164).first<CustomerRow>();
 
     if (!customer) {
       await c.env.DB.prepare(
-        `INSERT INTO customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+        `INSERT INTO cmrc_customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
          VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`
       ).bind(customerId, tenantId, e164, e164, now, now, now).run();
       customer = { id: customerId, loyalty_points: 0 };
@@ -1209,8 +1209,8 @@ app.get('/wishlist', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT w.id, w.product_id, w.added_at,
               p.name, p.price, p.image_url, p.category, p.quantity, p.is_active
-       FROM wishlists w
-       LEFT JOIN products p ON p.id = w.product_id AND p.tenant_id = w.tenant_id
+       FROM cmrc_wishlists w
+       LEFT JOIN cmrc_products p ON p.id = w.product_id AND p.tenant_id = w.tenant_id
        WHERE w.tenant_id = ? AND w.customer_id = ?
        ORDER BY w.added_at DESC`
     ).bind(tenantId, customer.customerId).all();
@@ -1234,7 +1234,7 @@ app.post('/wishlist', async (c) => {
     const now = Date.now();
     const wlId = `wl_${now}_${Math.random().toString(36).slice(2, 8)}`;
     await c.env.DB.prepare(
-      'INSERT OR IGNORE INTO wishlists (id, tenant_id, customer_id, product_id, added_at) VALUES (?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO cmrc_wishlists (id, tenant_id, customer_id, product_id, added_at) VALUES (?, ?, ?, ?, ?)'
     ).bind(wlId, tenantId, customer.customerId, body.product_id, now).run();
     return c.json({ success: true, data: { action: 'added', product_id: body.product_id } }, 201);
   } catch (err) {
@@ -1252,7 +1252,7 @@ app.delete('/wishlist/:productId', async (c) => {
   const productId = c.req.param('productId');
   try {
     await c.env.DB.prepare(
-      'DELETE FROM wishlists WHERE tenant_id = ? AND customer_id = ? AND product_id = ?'
+      'DELETE FROM cmrc_wishlists WHERE tenant_id = ? AND customer_id = ? AND product_id = ?'
     ).bind(tenantId, customer.customerId, productId).run();
     return c.json({ success: true, data: { action: 'removed', product_id: productId } });
   } catch (err) {
@@ -1261,8 +1261,8 @@ app.delete('/wishlist/:productId', async (c) => {
   }
 });
 
-// ── GET /account/orders — Customer's own orders, paginated ───────────────────
-app.get('/account/orders', async (c) => {
+// ── GET /account/cmrc_orders — Customer's own cmrc_orders, paginated ───────────────────
+app.get('/account/cmrc_orders', async (c) => {
   const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing tenant ID' }, 400);
   const customer = await authenticateCustomer(c);
@@ -1277,7 +1277,7 @@ app.get('/account/orders', async (c) => {
       `SELECT id, subtotal, discount_kobo, vat_kobo, total_amount, payment_status,
               order_status, payment_method, items_json, delivery_address_json,
               promo_code, created_at
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND customer_phone = ?
          AND channel = 'storefront' AND deleted_at IS NULL`;
 
@@ -1293,7 +1293,7 @@ app.get('/account/orders', async (c) => {
     }>();
 
     const hasMore = results.length > perPage;
-    const orders = (hasMore ? results.slice(0, perPage) : results).map(o => ({
+    const cmrc_orders = (hasMore ? results.slice(0, perPage) : results).map(o => ({
       ...o,
       items: (() => { try { return JSON.parse(o.items_json ?? '[]'); } catch { return []; } })(),
       delivery_address: (() => { try { return o.delivery_address_json ? JSON.parse(o.delivery_address_json) : null; } catch { return null; } })(),
@@ -1301,12 +1301,12 @@ app.get('/account/orders', async (c) => {
       delivery_address_json: undefined,
     }));
 
-    const nextCursor = hasMore ? orders[orders.length - 1]?.id ?? null : null;
+    const nextCursor = hasMore ? cmrc_orders[cmrc_orders.length - 1]?.id ?? null : null;
 
-    return c.json({ success: true, data: { orders, next_cursor: nextCursor, has_more: hasMore } });
+    return c.json({ success: true, data: { cmrc_orders, next_cursor: nextCursor, has_more: hasMore } });
   } catch (err) {
     console.error('[SV] route error:', err);
-    return c.json({ success: true, data: { orders: [], next_cursor: null, has_more: false } });
+    return c.json({ success: true, data: { cmrc_orders: [], next_cursor: null, has_more: false } });
   }
 });
 
@@ -1319,7 +1319,7 @@ app.get('/account/profile', async (c) => {
   try {
     interface CustomerRow { id: string; name: string | null; phone: string; loyalty_points: number; total_spend: number; created_at: number }
     const profile = await c.env.DB.prepare(
-      'SELECT id, name, phone, loyalty_points, total_spend, created_at FROM customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
+      'SELECT id, name, phone, loyalty_points, total_spend, created_at FROM cmrc_customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
     ).bind(customer.customerId, tenantId).first<CustomerRow>();
 
     if (!profile) return c.json({ success: false, error: 'Customer not found' }, 404);
@@ -1330,7 +1330,7 @@ app.get('/account/profile', async (c) => {
   }
 });
 
-// ── GET /analytics — Today/week revenue, conversion %, top products (ANLT-1) ─
+// ── GET /analytics — Today/week revenue, conversion %, top cmrc_products (ANLT-1) ─
 app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
   const expectedKey = c.env.ADMIN_API_KEY;
@@ -1345,14 +1345,14 @@ app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
   const weekMs = now - 7 * 24 * 60 * 60 * 1000;
 
   try {
-    // Today and week revenue from paid orders (storefront channel)
+    // Today and week revenue from paid cmrc_orders (storefront channel)
     const revenueRow = await c.env.DB.prepare(
       `SELECT
          SUM(CASE WHEN created_at >= ? THEN total_amount ELSE 0 END) AS today_revenue_kobo,
          SUM(CASE WHEN created_at >= ? THEN total_amount ELSE 0 END) AS week_revenue_kobo,
          COUNT(CASE WHEN created_at >= ? THEN 1 END)                  AS today_orders,
          COUNT(CASE WHEN created_at >= ? THEN 1 END)                  AS week_orders
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND payment_status = 'paid' AND channel = 'storefront'`
     ).bind(todayMs, weekMs, todayMs, weekMs, tenantId).first<{
       today_revenue_kobo: number; week_revenue_kobo: number;
@@ -1361,16 +1361,16 @@ app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
 
     // Cart sessions created this week (for conversion denominator)
     const cartRow = await c.env.DB.prepare(
-      `SELECT COUNT(*) AS cart_count FROM cart_sessions WHERE tenant_id = ? AND created_at >= ?`
+      `SELECT COUNT(*) AS cart_count FROM cmrc_cart_sessions WHERE tenant_id = ? AND created_at >= ?`
     ).bind(tenantId, weekMs).first<{ cart_count: number }>();
 
-    // Top 5 products by revenue this week
+    // Top 5 cmrc_products by revenue this week
     const { results: topProducts } = await c.env.DB.prepare(
       `SELECT oi.product_id, oi.product_name AS name,
               SUM(oi.quantity)               AS units_sold,
               SUM(oi.total_price)            AS revenue_kobo
        FROM order_items oi
-       JOIN orders o ON o.id = oi.order_id
+       JOIN cmrc_orders o ON o.id = oi.order_id
        WHERE o.tenant_id = ? AND o.payment_status = 'paid'
          AND o.channel = 'storefront' AND o.created_at >= ?
        GROUP BY oi.product_id, oi.product_name
@@ -1389,12 +1389,12 @@ app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
       data: {
         today: {
           revenue_kobo: revenueRow?.today_revenue_kobo ?? 0,
-          orders: revenueRow?.today_orders ?? 0,
+          cmrc_orders: revenueRow?.today_orders ?? 0,
         },
         week: {
           revenue_kobo: revenueRow?.week_revenue_kobo ?? 0,
-          orders: weekOrders,
-          cart_sessions: cartCount,
+          cmrc_orders: weekOrders,
+          cmrc_cart_sessions: cartCount,
           conversion_pct: conversionPct,
         },
         top_products: topProducts,
@@ -1475,8 +1475,8 @@ app.get('/shipping/estimate', async (c) => {
   });
 });
 
-// ── GET /products/:id/reviews — Public product reviews (APPROVED only, paginated) ─
-app.get('/products/:id/reviews', async (c) => {
+// ── GET /cmrc_products/:id/reviews — Public product reviews (APPROVED only, paginated) ─
+app.get('/cmrc_products/:id/reviews', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   const page = Math.max(1, Number(c.req.query('page') ?? 1));
@@ -1485,13 +1485,13 @@ app.get('/products/:id/reviews', async (c) => {
   try {
     const statsRow = await c.env.DB.prepare(
       `SELECT AVG(rating) AS avgRating, COUNT(*) AS totalReviews
-       FROM product_reviews
+       FROM cmrc_product_reviews
        WHERE product_id = ? AND tenant_id = ? AND status = 'APPROVED' AND deleted_at IS NULL`,
     ).bind(productId, tenantId).first<{ avgRating: number | null; totalReviews: number }>();
 
     const { results } = await c.env.DB.prepare(
       `SELECT id, rating, body, review_text, verified_purchase, customer_phone, created_at
-       FROM product_reviews
+       FROM cmrc_product_reviews
        WHERE product_id = ? AND tenant_id = ? AND status = 'APPROVED' AND deleted_at IS NULL
        ORDER BY created_at DESC
        LIMIT ? OFFSET ?`,
@@ -1539,24 +1539,24 @@ app.post('/reviews', async (c) => {
 
   try {
     const order = await c.env.DB.prepare(
-      `SELECT id, order_status FROM orders
+      `SELECT id, order_status FROM cmrc_orders
        WHERE id = ? AND tenant_id = ? AND customer_phone = ?`,
     ).bind(body.orderId, tenantId, customer.phone).first<{ id: string; order_status: string }>();
 
     if (!order) return c.json({ success: false, error: 'Order not found or does not belong to you' }, 404);
     if (order.order_status !== 'DELIVERED') {
-      return c.json({ success: false, error: 'Reviews can only be submitted for delivered orders' }, 422);
+      return c.json({ success: false, error: 'Reviews can only be submitted for delivered cmrc_orders' }, 422);
     }
 
     const existingReview = await c.env.DB.prepare(
-      `SELECT id FROM product_reviews WHERE order_id = ? AND product_id = ? AND tenant_id = ?`,
+      `SELECT id FROM cmrc_product_reviews WHERE order_id = ? AND product_id = ? AND tenant_id = ?`,
     ).bind(body.orderId, body.productId, tenantId).first();
     if (existingReview) {
       return c.json({ success: false, error: 'You have already reviewed this product for this order' }, 409);
     }
 
     await c.env.DB.prepare(
-      `INSERT INTO product_reviews
+      `INSERT INTO cmrc_product_reviews
          (id, tenant_id, product_id, customer_id, customer_phone, order_id, rating, body, review_text, verified_purchase, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING', ?, ?)`,
     ).bind(
@@ -1572,8 +1572,8 @@ app.post('/reviews', async (c) => {
   }
 });
 
-// ── POST /products/:id/reviews — Legacy per-product review (existing customers) ─
-app.post('/products/:id/reviews', async (c) => {
+// ── POST /cmrc_products/:id/reviews — Legacy per-product review (existing cmrc_customers) ─
+app.post('/cmrc_products/:id/reviews', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   const customer = await authenticateCustomer(c as Parameters<typeof authenticateCustomer>[0]);
@@ -1588,13 +1588,13 @@ app.post('/products/:id/reviews', async (c) => {
   const id = `rev_${now}_${Math.random().toString(36).slice(2, 8)}`;
   try {
     const purchaseCheck = await c.env.DB.prepare(
-      `SELECT id FROM orders
+      `SELECT id FROM cmrc_orders
        WHERE tenant_id = ? AND customer_phone = ? AND channel = 'storefront'
          AND payment_status = 'paid' AND items_json LIKE ? LIMIT 1`,
     ).bind(tenantId, customer.phone, `%"${productId}"%`).first();
 
     await c.env.DB.prepare(
-      `INSERT INTO product_reviews
+      `INSERT INTO cmrc_product_reviews
          (id, tenant_id, product_id, customer_id, customer_phone, rating, review_text, body, verified_purchase, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`,
     ).bind(
@@ -1625,7 +1625,7 @@ app.get('/admin/reviews', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, product_id, order_id, customer_phone, rating, body, review_text, status, created_at
-       FROM product_reviews
+       FROM cmrc_product_reviews
        WHERE tenant_id = ? AND status = ? AND deleted_at IS NULL
        ORDER BY created_at DESC LIMIT 100`,
     ).bind(tenantId, status).all();
@@ -1651,7 +1651,7 @@ app.patch('/admin/reviews/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), as
   }
   try {
     const result = await c.env.DB.prepare(
-      `UPDATE product_reviews SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+      `UPDATE cmrc_product_reviews SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
     ).bind(body.status, Date.now(), reviewId, tenantId).run();
     if (result.meta.changes === 0) return c.json({ success: false, error: 'Review not found' }, 404);
     return c.json({ success: true, data: { id: reviewId, status: body.status } });
@@ -1688,7 +1688,7 @@ app.get('/admin/promos', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c)
               min_order_kobo, minOrderValueKobo, max_uses, current_uses, usedCount,
               maxUsesTotal, maxUsesPerCustomer, expires_at, validFrom, validUntil,
               productScope, stackable, is_active, created_at, updated_at
-       FROM promo_codes
+       FROM cmrc_promo_codes
        WHERE ${where}
        ORDER BY created_at DESC
        LIMIT ? OFFSET ?`,
@@ -1749,7 +1749,7 @@ app.post('/admin/promos', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO promo_codes
+      `INSERT INTO cmrc_promo_codes
          (id, tenant_id, code, description, promoType, discount_type, discount_value,
           discountCap, min_order_kobo, minOrderValueKobo, max_uses, current_uses, usedCount,
           maxUsesTotal, maxUsesPerCustomer, validFrom, validUntil, productScope,
@@ -1808,7 +1808,7 @@ app.patch('/admin/promos/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), asy
   catch { return c.json({ success: false, error: 'Invalid JSON body' }, 400); }
 
   const existing = await c.env.DB.prepare(
-    'SELECT id FROM promo_codes WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+    'SELECT id FROM cmrc_promo_codes WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
   ).bind(promoId, tenantId).first<{ id: string }>();
 
   if (!existing) return c.json({ success: false, error: 'Promo code not found' }, 404);
@@ -1838,7 +1838,7 @@ app.patch('/admin/promos/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), asy
 
   try {
     await c.env.DB.prepare(
-      `UPDATE promo_codes SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?`,
+      `UPDATE cmrc_promo_codes SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?`,
     ).bind(...values).run();
 
     return c.json({ success: true, data: { id: promoId } });
@@ -1856,7 +1856,7 @@ app.delete('/admin/promos/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), as
 
   try {
     const result = await c.env.DB.prepare(
-      `UPDATE promo_codes SET deleted_at = ?, is_active = 0, updated_at = ?
+      `UPDATE cmrc_promo_codes SET deleted_at = ?, is_active = 0, updated_at = ?
        WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
     ).bind(now, now, promoId, tenantId).run();
 
@@ -1954,7 +1954,7 @@ app.post('/paystack/webhook', async (c) => {
   const logId = `pwl_${event.replace('.', '_')}_${reference}`;
 
   const existing = await c.env.DB.prepare(
-    `SELECT id, processed FROM paystack_webhook_log WHERE id = ?`
+    `SELECT id, processed FROM cmrc_paystack_webhook_log WHERE id = ?`
   ).bind(logId).first<{ id: string; processed: number }>();
 
   if (existing?.processed) {
@@ -1962,7 +1962,7 @@ app.post('/paystack/webhook', async (c) => {
   }
 
   await c.env.DB.prepare(
-    `INSERT OR IGNORE INTO paystack_webhook_log
+    `INSERT OR IGNORE INTO cmrc_paystack_webhook_log
        (id, event, reference, tenant_id, raw_json, processed, received_at)
      VALUES (?, ?, ?, ?, ?, 0, ?)`
   ).bind(logId, event, reference, tenantId ?? null, rawBody, now).run();
@@ -1970,24 +1970,24 @@ app.post('/paystack/webhook', async (c) => {
   try {
     if (event === 'charge.success' && tenantId && reference) {
       await c.env.DB.prepare(
-        `UPDATE orders SET payment_status = 'paid', updated_at = ?
+        `UPDATE cmrc_orders SET payment_status = 'paid', updated_at = ?
          WHERE payment_reference = ? AND tenant_id = ?`
       ).bind(now, reference, tenantId).run();
 
       await c.env.DB.prepare(
-        `UPDATE settlements SET status = 'eligible', updated_at = ?
+        `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
          WHERE tenant_id = ? AND payment_reference = ? AND status = 'held' AND hold_until <= ?`
       ).bind(now, tenantId, reference, now).run();
     }
 
     await c.env.DB.prepare(
-      `UPDATE paystack_webhook_log SET processed = 1 WHERE id = ?`
+      `UPDATE cmrc_paystack_webhook_log SET processed = 1 WHERE id = ?`
     ).bind(logId).run();
 
     return c.json({ success: true });
   } catch (e) {
     await c.env.DB.prepare(
-      `UPDATE paystack_webhook_log SET error = ? WHERE id = ?`
+      `UPDATE cmrc_paystack_webhook_log SET error = ? WHERE id = ?`
     ).bind(String(e), logId).run();
     console.error('[SV][paystack/webhook] handler error:', e);
     return c.json({ success: false, error: 'Internal server error' }, 500);
@@ -2042,15 +2042,15 @@ app.get('/config', async (c) => {
   }
 });
 
-// ── GET /products/:id — Product detail with attributes (P12-T01) ──────────────
-app.get('/products/:id', async (c) => {
+// ── GET /cmrc_products/:id — Product detail with attributes (P12-T01) ──────────────
+app.get('/cmrc_products/:id', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   try {
     const product = await c.env.DB.prepare(
       `SELECT id, name, description, price, quantity, category, image_url, sku,
               has_variants, slug, is_active
-       FROM products
+       FROM cmrc_products
        WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL`
     ).bind(productId, tenantId).first<Record<string, unknown>>();
 
@@ -2058,12 +2058,12 @@ app.get('/products/:id', async (c) => {
 
     // Include attribute values
     const { results: attrs } = await c.env.DB.prepare(
-      'SELECT attributeName, attributeValue FROM product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+      'SELECT attributeName, attributeValue FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
     ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
 
     return c.json({ success: true, data: { ...product, attributes: attrs ?? [] } });
   } catch (err) {
-    console.error('[SV][products/:id] error:', err);
+    console.error('[SV][cmrc_products/:id] error:', err);
     return c.json({ success: false, error: 'Product not found' }, 404);
   }
 });
@@ -2077,7 +2077,7 @@ app.get('/search/suggest', async (c) => {
 
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT DISTINCT name FROM products
+      `SELECT DISTINCT name FROM cmrc_products
        WHERE tenant_id = ? AND name LIKE ? AND deleted_at IS NULL AND is_active = 1
        LIMIT 5`
     ).bind(tenantId, `${q}%`).all<{ name: string }>();
@@ -2088,8 +2088,8 @@ app.get('/search/suggest', async (c) => {
   }
 });
 
-// ── POST /products/:id/attributes — Add/update attribute (SV-E06) ─────────────
-app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// ── POST /cmrc_products/:id/attributes — Add/update attribute (SV-E06) ─────────────
+app.post('/cmrc_products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   const body = await c.req.json<{ attributeName: string; attributeValue: string }>();
@@ -2102,7 +2102,7 @@ app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
+      `INSERT INTO cmrc_product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
        VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(tenantId, productId, attributeName)
        DO UPDATE SET attributeValue = excluded.attributeValue`
@@ -2111,13 +2111,13 @@ app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']
     // Re-index FTS5: append attribute values to the product's description field
     try {
       const { results: attrs } = await c.env.DB.prepare(
-        'SELECT attributeName, attributeValue FROM product_attributes WHERE tenantId = ? AND productId = ?'
+        'SELECT attributeName, attributeValue FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ?'
       ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
 
       const attrText = attrs.map((a) => `${a.attributeName}: ${a.attributeValue}`).join(' ');
 
       const product = await c.env.DB.prepare(
-        'SELECT rowid, name, description, category, sku FROM products WHERE id = ? AND tenant_id = ?'
+        'SELECT rowid, name, description, category, sku FROM cmrc_products WHERE id = ? AND tenant_id = ?'
       ).bind(productId, tenantId).first<{ rowid: number; name: string; description: string | null; category: string | null; sku: string }>();
 
       if (product) {
@@ -2139,24 +2139,24 @@ app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']
 
     return c.json({ success: true, data: { id, productId, attributeName: body.attributeName.trim(), attributeValue: body.attributeValue.trim() } }, 201);
   } catch (err) {
-    console.error('[SV][products/attributes] POST error:', err);
+    console.error('[SV][cmrc_products/attributes] POST error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
-// ── GET /products/:id/attributes — List product attributes (SV-E06) ───────────
-app.get('/products/:id/attributes', async (c) => {
+// ── GET /cmrc_products/:id/attributes — List product attributes (SV-E06) ───────────
+app.get('/cmrc_products/:id/attributes', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
 
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT id, attributeName, attributeValue, createdAt FROM product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+      'SELECT id, attributeName, attributeValue, createdAt FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
     ).bind(tenantId, productId).all<{ id: string; attributeName: string; attributeValue: string; createdAt: string }>();
 
     return c.json({ success: true, data: { productId, attributes: results ?? [] } });
   } catch (err) {
-    console.error('[SV][products/attributes] GET error:', err);
+    console.error('[SV][cmrc_products/attributes] GET error:', err);
     return c.json({ success: true, data: { productId, attributes: [] } });
   }
 });
@@ -2212,8 +2212,8 @@ app.put('/admin/tenant/branding', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), 
 
 // ── SV-E14: Subscriptions CRUD ────────────────────────────────────────────────
 
-// POST /subscriptions — create a recurring order subscription
-app.post('/subscriptions', requireRole(['CUSTOMER']), async (c) => {
+// POST /cmrc_subscriptions — create a recurring order subscription
+app.post('/cmrc_subscriptions', requireRole(['CUSTOMER']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{ productId: string; frequencyDays: number; paystackToken: string }>();
   if (!body.productId || !body.frequencyDays || !body.paystackToken) {
@@ -2223,7 +2223,7 @@ app.post('/subscriptions', requireRole(['CUSTOMER']), async (c) => {
   if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
 
   const product = await c.env.DB.prepare(
-    'SELECT name, price FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+    'SELECT name, price FROM cmrc_products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
   ).bind(body.productId, tenantId).first<{ name: string; price: number }>();
   if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
 
@@ -2232,15 +2232,15 @@ app.post('/subscriptions', requireRole(['CUSTOMER']), async (c) => {
   const subId = `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
   await c.env.DB.prepare(
-    `INSERT INTO subscriptions (id, tenantId, customerId, productId, frequencyDays, nextChargeDate, paystackToken, status, productName)
+    `INSERT INTO cmrc_subscriptions (id, tenantId, customerId, productId, frequencyDays, nextChargeDate, paystackToken, status, productName)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
   ).bind(subId, tenantId, customerId, body.productId, body.frequencyDays, nextCharge.toISOString().slice(0, 10), body.paystackToken, product.name).run();
 
   return c.json({ success: true, data: { id: subId, status: 'ACTIVE', nextChargeDate: nextCharge.toISOString().slice(0, 10) } }, 201);
 });
 
-// PATCH /subscriptions/:id — pause, resume, or cancel a subscription
-app.patch('/subscriptions/:id', requireRole(['CUSTOMER']), async (c) => {
+// PATCH /cmrc_subscriptions/:id — pause, resume, or cancel a subscription
+app.patch('/cmrc_subscriptions/:id', requireRole(['CUSTOMER']), async (c) => {
   const tenantId = getTenantId(c);
   const id = c.req.param('id');
   const { status } = await c.req.json<{ status: 'PAUSED' | 'ACTIVE' | 'CANCELLED' }>();
@@ -2249,24 +2249,24 @@ app.patch('/subscriptions/:id', requireRole(['CUSTOMER']), async (c) => {
   const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
 
   const result = await c.env.DB.prepare(
-    `UPDATE subscriptions SET status = ? WHERE id = ? AND tenantId = ? AND customerId = ?`,
+    `UPDATE cmrc_subscriptions SET status = ? WHERE id = ? AND tenantId = ? AND customerId = ?`,
   ).bind(status, id, tenantId, customerId).run();
 
   if ((result.meta?.changes ?? 0) === 0) return c.json({ success: false, error: 'Subscription not found or not owned by you' }, 404);
   return c.json({ success: true, data: { id, status } });
 });
 
-// GET /subscriptions — list customer subscriptions
-app.get('/subscriptions', requireRole(['CUSTOMER']), async (c) => {
+// GET /cmrc_subscriptions — list customer cmrc_subscriptions
+app.get('/cmrc_subscriptions', requireRole(['CUSTOMER']), async (c) => {
   const tenantId = getTenantId(c);
   const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
   const { results } = await c.env.DB.prepare(
     `SELECT s.id, s.productId, s.productName, s.frequencyDays, s.nextChargeDate, s.status,
             s.retryCount, p.price_kobo AS priceKobo
-     FROM subscriptions s LEFT JOIN products p ON p.id = s.productId AND p.tenant_id = s.tenantId
+     FROM cmrc_subscriptions s LEFT JOIN cmrc_products p ON p.id = s.productId AND p.tenant_id = s.tenantId
      WHERE s.tenantId = ? AND s.customerId = ? ORDER BY s.createdAt DESC`,
   ).bind(tenantId, customerId).all<Record<string, unknown>>();
-  return c.json({ success: true, data: { subscriptions: results ?? [] } });
+  return c.json({ success: true, data: { cmrc_subscriptions: results ?? [] } });
 });
 
 // ── SV-E18: NDPR Data Export and Deletion ─────────────────────────────────────
@@ -2282,12 +2282,12 @@ app.post('/account/export', requireRole(['CUSTOMER']), async (c) => {
   const allowed = await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, rlKey, 1, 30 * 24 * 60 * 60 * 1000);
   if (!allowed) return c.json({ success: false, error: 'Data export is limited to once every 30 days' }, 429);
 
-  const [profile, orders, wishlist, loyalty, subscriptions] = await Promise.all([
-    c.env.DB.prepare(`SELECT id, name, phone, email, createdAt FROM customers WHERE id = ? AND tenant_id = ?`).bind(customerId, tenantId).first(),
-    c.env.DB.prepare(`SELECT id, total_amount, order_status, payment_status, created_at FROM orders WHERE customer_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT 100`).bind(customerId, tenantId).all(),
-    c.env.DB.prepare(`SELECT productId, createdAt FROM wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
-    c.env.DB.prepare(`SELECT points, tier, updatedAt FROM customer_loyalty WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).first(),
-    c.env.DB.prepare(`SELECT id, productName, frequencyDays, nextChargeDate, status FROM subscriptions WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
+  const [profile, cmrc_orders, wishlist, loyalty, cmrc_subscriptions] = await Promise.all([
+    c.env.DB.prepare(`SELECT id, name, phone, email, createdAt FROM cmrc_customers WHERE id = ? AND tenant_id = ?`).bind(customerId, tenantId).first(),
+    c.env.DB.prepare(`SELECT id, total_amount, order_status, payment_status, created_at FROM cmrc_orders WHERE customer_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT 100`).bind(customerId, tenantId).all(),
+    c.env.DB.prepare(`SELECT productId, createdAt FROM cmrc_wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
+    c.env.DB.prepare(`SELECT points, tier, updatedAt FROM cmrc_customer_loyalty WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).first(),
+    c.env.DB.prepare(`SELECT id, productName, frequencyDays, nextChargeDate, status FROM cmrc_subscriptions WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
   ]);
 
   return c.json({
@@ -2295,22 +2295,22 @@ app.post('/account/export', requireRole(['CUSTOMER']), async (c) => {
     data: {
       exportedAt: new Date().toISOString(),
       profile,
-      orders: orders.results ?? [],
+      cmrc_orders: cmrc_orders.results ?? [],
       wishlist: wishlist.results ?? [],
       loyalty,
-      subscriptions: subscriptions.results ?? [],
+      cmrc_subscriptions: cmrc_subscriptions.results ?? [],
     },
   });
 });
 
-// DELETE /account — NDPR soft-delete: anonymise PII, cancel active subscriptions
+// DELETE /account — NDPR soft-delete: anonymise PII, cancel active cmrc_subscriptions
 app.delete('/account', requireRole(['CUSTOMER']), async (c) => {
   const tenantId = getTenantId(c);
   const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
   if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
 
   const customer = await c.env.DB.prepare(
-    `SELECT phone FROM customers WHERE id = ? AND tenant_id = ? AND deletedAt IS NULL`,
+    `SELECT phone FROM cmrc_customers WHERE id = ? AND tenant_id = ? AND deletedAt IS NULL`,
   ).bind(customerId, tenantId).first<{ phone: string }>();
   if (!customer) return c.json({ success: false, error: 'Account not found' }, 404);
 
@@ -2322,10 +2322,10 @@ app.delete('/account', requireRole(['CUSTOMER']), async (c) => {
 
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `UPDATE customers SET name = 'Deleted User', phone = ?, email = NULL, deletedAt = ? WHERE id = ? AND tenant_id = ?`,
+      `UPDATE cmrc_customers SET name = 'Deleted User', phone = ?, email = NULL, deletedAt = ? WHERE id = ? AND tenant_id = ?`,
     ).bind(`deleted_${customerId}`, new Date().toISOString(), customerId, tenantId),
-    c.env.DB.prepare(`DELETE FROM wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId),
-    c.env.DB.prepare(`UPDATE subscriptions SET status = 'CANCELLED' WHERE customerId = ? AND tenantId = ? AND status = 'ACTIVE'`).bind(customerId, tenantId),
+    c.env.DB.prepare(`DELETE FROM cmrc_wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId),
+    c.env.DB.prepare(`UPDATE cmrc_subscriptions SET status = 'CANCELLED' WHERE customerId = ? AND tenantId = ? AND status = 'ACTIVE'`).bind(customerId, tenantId),
   ]);
 
   return c.json({ success: true, data: { message: 'Account deleted. Order history retained for merchant accounting.' } });
@@ -2339,7 +2339,7 @@ app.get('/payment-status', async (c) => {
   return c.json({ success: true, data: { confirmed: confirmed === '1', reference } });
 });
 
-// ── SV-E17: COD with Deposit — returns deposit amount for COD orders ──────────
+// ── SV-E17: COD with Deposit — returns deposit amount for COD cmrc_orders ──────────
 app.post('/checkout/cod-deposit', async (c) => {
   const tenantId = getTenantId(c);
   const { subtotalKobo } = await c.req.json<{ subtotalKobo: number }>();

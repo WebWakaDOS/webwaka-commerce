@@ -2,7 +2,7 @@
  * WebWaka — Staff Commission Tracking
  * Implementation Plan §3 Item 16 — Staff Commission Tracking
  *
- * Track sales commissions for POS cashiers and sales staff:
+ * Track sales commissions for POS cashiers and sales cmrc_staff:
  *   - Per-cashier commission rate (flat % or fixed amount per sale)
  *   - Commission accrual on every completed POS sale
  *   - Period-based payout (daily / weekly / monthly)
@@ -110,7 +110,7 @@ commissionsRouter.get(
     try {
       const { results } = await c.env.DB.prepare(
         `SELECT id, cashier_id, cashier_name, commission_type, rate, min_sale_kobo, is_active, created_at
-         FROM commission_rules WHERE tenant_id = ? ORDER BY created_at DESC`
+         FROM cmrc_commission_rules WHERE tenant_id = ? ORDER BY created_at DESC`
       ).bind(tenantId).all();
       return c.json({ success: true, data: results });
     } catch { return c.json({ success: true, data: [] }); }
@@ -140,7 +140,7 @@ commissionsRouter.post(
     const now = Date.now();
     try {
       await c.env.DB.prepare(
-        `INSERT INTO commission_rules
+        `INSERT INTO cmrc_commission_rules
            (id, tenant_id, cashier_id, cashier_name, commission_type, rate, min_sale_kobo, is_active, created_at)
          VALUES (?,?,?,?,?,?,?,1,?)`
       ).bind(
@@ -202,7 +202,7 @@ commissionsRouter.post('/record', async (c) => {
     // Fetch active commission rule for this cashier
     const rule = await c.env.DB.prepare(
       `SELECT id, commission_type, rate, min_sale_kobo
-       FROM commission_rules
+       FROM cmrc_commission_rules
        WHERE tenant_id = ? AND cashier_id = ? AND is_active = 1
        ORDER BY created_at DESC LIMIT 1`
     ).bind(tenantId, body.cashier_id).first<{

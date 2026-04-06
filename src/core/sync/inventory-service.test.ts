@@ -54,7 +54,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
 
   it('should sync POS inventory to Single Vendor Storefront based on preferences', async () => {
     // First prepare() → tenants query → return sync prefs for tnt_123
-    // Second prepare() → products INSERT
+    // Second prepare() → cmrc_products INSERT
     let callCount = 0;
     mockPrepare.mockImplementation(() => {
       callCount++;
@@ -66,7 +66,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
           run: mockRun,
         };
       }
-      // applySync: SELECT from products (no existing row)
+      // applySync: SELECT from cmrc_products (no existing row)
       if (callCount === 2) {
         return {
           bind: vi.fn().mockReturnThis(),
@@ -74,7 +74,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
           run: mockRun,
         };
       }
-      // applySync: INSERT OR IGNORE INTO products
+      // applySync: INSERT OR IGNORE INTO cmrc_products
       return {
         bind: vi.fn().mockReturnThis(),
         first: vi.fn().mockResolvedValue(null),
@@ -101,12 +101,12 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
 
     await service.handleInventoryUpdate(event);
 
-    // Verify D1 prepare was called (at least once for tenants query + once for products)
+    // Verify D1 prepare was called (at least once for tenants query + once for cmrc_products)
     expect(mockPrepare).toHaveBeenCalledTimes(3);
 
     // Verify the INSERT statement was built for the product
     const insertCall = mockPrepare.mock.calls[2]![0] as string;
-    expect(insertCall).toMatch(/INSERT INTO products/i);
+    expect(insertCall).toMatch(/INSERT INTO cmrc_products/i);
   });
 
   it('should apply last_write_wins conflict resolution', async () => {
@@ -159,7 +159,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
     // Verify UPDATE was issued (last_write_wins: overwrite regardless of version)
     expect(mockPrepare).toHaveBeenCalledTimes(3);
     const updateCall = mockPrepare.mock.calls[2]![0] as string;
-    expect(updateCall).toMatch(/UPDATE products/i);
+    expect(updateCall).toMatch(/UPDATE cmrc_products/i);
 
     // Verify quantity=20 was passed to bind
     const bindArgs = (mockPrepare.mock.results[2]!.value as { bind: ReturnType<typeof vi.fn> }).bind.mock.calls;
@@ -200,7 +200,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
 
     await service.handleInventoryUpdate(event);
 
-    // Only the tenants query should run — no products UPDATE/INSERT
+    // Only the tenants query should run — no cmrc_products UPDATE/INSERT
     expect(mockPrepare).toHaveBeenCalledTimes(1);
     const tenantsCall = mockPrepare.mock.calls[0]![0] as string;
     expect(tenantsCall).toMatch(/FROM tenants/i);
@@ -246,7 +246,7 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
     // Should not throw — graceful no-op
     await expect(service.handleInventoryUpdate(event)).resolves.toBeUndefined();
 
-    // Only the tenants lookup + (potentially) products SELECT — no UPDATE
+    // Only the tenants lookup + (potentially) cmrc_products SELECT — no UPDATE
     expect(mockPrepare.mock.calls.length).toBeLessThanOrEqual(2);
   });
 });

@@ -16,7 +16,7 @@ const mockDb = {
     bind: (..._args: unknown[]) => ({
       first: async <T>(): Promise<T | null> => {
         // Only return a version row for item_2 so conflict detection is testable
-        if (sql.includes('sync_versions') && sql.includes('SELECT version')) {
+        if (sql.includes('cmrc_sync_versions') && sql.includes('SELECT version')) {
           const entityId = _args[2] as string;
           if (entityId === 'item_2') return { version: 1 } as T;
         }

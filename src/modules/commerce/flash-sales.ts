@@ -130,7 +130,7 @@ flashSalesRouter.get('/', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT id, name, description, banner_image_url, starts_at, ends_at,
               status, items_json, total_units_cap, total_units_sold, created_at
-       FROM flash_sales
+       FROM cmrc_flash_sales
        WHERE tenant_id = ? AND status IN ('ACTIVE', 'SCHEDULED')
          AND ends_at > ?
        ORDER BY starts_at ASC LIMIT 20`
@@ -198,15 +198,15 @@ flashSalesRouter.post(
     const productIds = body.items.map((i) => i.product_id);
     const placeholders = productIds.map(() => '?').join(',');
     interface ProductRow { id: string; name: string; price: number }
-    let products: ProductRow[] = [];
+    let cmrc_products: ProductRow[] = [];
     try {
       const { results } = await c.env.DB.prepare(
-        `SELECT id, name, price FROM products WHERE id IN (${placeholders}) AND tenant_id = ?`
+        `SELECT id, name, price FROM cmrc_products WHERE id IN (${placeholders}) AND tenant_id = ?`
       ).bind(...productIds, tenantId).all<ProductRow>();
-      products = results;
+      cmrc_products = results;
     } catch { /* product table might not exist in test env */ }
 
-    const productMap = new Map(products.map((p) => [p.id, p]));
+    const productMap = new Map(cmrc_products.map((p) => [p.id, p]));
 
     const items: FlashSaleItem[] = body.items.map((i) => {
       const product = productMap.get(i.product_id);
@@ -227,7 +227,7 @@ flashSalesRouter.post(
 
     try {
       await c.env.DB.prepare(
-        `INSERT INTO flash_sales
+        `INSERT INTO cmrc_flash_sales
            (id, tenant_id, name, description, banner_image_url, starts_at, ends_at,
             status, items_json, total_units_cap, total_units_sold, created_at, updated_at)
          VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?)`
@@ -254,7 +254,7 @@ flashSalesRouter.patch(
     const id = c.req.param('id');
     try {
       await c.env.DB.prepare(
-        `UPDATE flash_sales SET status = 'CANCELLED', updated_at = ?
+        `UPDATE cmrc_flash_sales SET status = 'CANCELLED', updated_at = ?
          WHERE id = ? AND tenant_id = ? AND status IN ('ACTIVE', 'SCHEDULED')`
       ).bind(Date.now(), id, tenantId).run();
       return c.json({ success: true, data: { id, status: 'CANCELLED' } });
@@ -271,7 +271,7 @@ flashSalesRouter.get('/:id/timer', async (c) => {
   const id = c.req.param('id');
   try {
     const sale = await c.env.DB.prepare(
-      'SELECT id, name, starts_at, ends_at, status FROM flash_sales WHERE id = ? AND tenant_id = ?'
+      'SELECT id, name, starts_at, ends_at, status FROM cmrc_flash_sales WHERE id = ? AND tenant_id = ?'
     ).bind(id, tenantId).first<{ id: string; name: string; starts_at: number; ends_at: number; status: FlashSaleStatus }>();
 
     if (!sale) return c.json({ success: false, error: 'Flash sale not found' }, 404);

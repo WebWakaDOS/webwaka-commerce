@@ -71,7 +71,7 @@ app.get('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asyn
   const tenantId = getTenantId(c);
   try {
     const session = await c.env.DB.prepare(
-      "SELECT id, cashier_id, initial_float_kobo, status, opened_at FROM pos_sessions WHERE tenant_id = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1",
+      "SELECT id, cashier_id, initial_float_kobo, status, opened_at FROM cmrc_pos_sessions WHERE tenant_id = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1",
     )
       .bind(tenantId)
       .first();
@@ -91,7 +91,7 @@ app.get('/sessions/history', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async
     const { results } = await c.env.DB.prepare(
       `SELECT id, cashier_id, cashier_name, initial_float_kobo, status,
               opened_at, closed_at, total_sales_kobo, cash_sales_kobo, order_count
-       FROM pos_sessions
+       FROM cmrc_pos_sessions
        WHERE tenant_id = ? AND status = 'closed'
        ORDER BY closed_at DESC
        LIMIT ? OFFSET ?`,
@@ -129,7 +129,7 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       manager_phone: string | null;
     }
     const staffRow = await c.env.DB.prepare(
-      'SELECT cashierPinHash, cashierPinSalt, pinFailedAttempts, pinLockedUntil, manager_phone FROM staff WHERE id = ? AND tenant_id = ?',
+      'SELECT cashierPinHash, cashierPinSalt, pinFailedAttempts, pinLockedUntil, manager_phone FROM cmrc_staff WHERE id = ? AND tenant_id = ?',
     )
       .bind(body.cashier_id.trim(), tenantId)
       .first<StaffRow>();
@@ -161,7 +161,7 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
         const lockedUntil = locked ? String(now2 + 30 * 60 * 1000) : null;
 
         await c.env.DB.prepare(
-          'UPDATE staff SET pinFailedAttempts = ?, pinLockedUntil = ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
+          'UPDATE cmrc_staff SET pinFailedAttempts = ?, pinLockedUntil = ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
         )
           .bind(newAttempts, lockedUntil, now2, body.cashier_id.trim(), tenantId)
           .run();
@@ -191,16 +191,16 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 
       // PIN correct — reset attempt counter
       await c.env.DB.prepare(
-        'UPDATE staff SET pinFailedAttempts = 0, pinLockedUntil = NULL, updated_at = ? WHERE id = ? AND tenant_id = ?',
+        'UPDATE cmrc_staff SET pinFailedAttempts = 0, pinLockedUntil = NULL, updated_at = ? WHERE id = ? AND tenant_id = ?',
       )
         .bind(Date.now(), body.cashier_id.trim(), tenantId)
         .run();
     }
-    // If no staff record or no PIN configured: allow (PIN not yet set up)
+    // If no cmrc_staff record or no PIN configured: allow (PIN not yet set up)
 
     // 409 guard: refuse if an open session already exists for this tenant
     const existing = await c.env.DB.prepare(
-      "SELECT id FROM pos_sessions WHERE tenant_id = ? AND status = 'open' LIMIT 1",
+      "SELECT id FROM cmrc_pos_sessions WHERE tenant_id = ? AND status = 'open' LIMIT 1",
     )
       .bind(tenantId)
       .first<{ id: string }>();
@@ -218,7 +218,7 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     const cashierName = body.cashier_name?.trim() ?? null;
 
     await c.env.DB.prepare(
-      `INSERT INTO pos_sessions (id, tenant_id, cashier_id, cashier_name, initial_float_kobo, status, opened_at)
+      `INSERT INTO cmrc_pos_sessions (id, tenant_id, cashier_id, cashier_name, initial_float_kobo, status, opened_at)
        VALUES (?, ?, ?, ?, ?, 'open', ?)`,
     )
       .bind(id, tenantId, body.cashier_id.trim(), cashierName, floatKobo, now)
@@ -245,8 +245,8 @@ app.post('/sessions', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   }
 });
 
-// POST /api/pos/staff/:staffId/set-pin — Admin sets or resets a cashier's PIN
-app.post('/staff/:staffId/set-pin', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// POST /api/pos/cmrc_staff/:staffId/set-pin — Admin sets or resets a cashier's PIN
+app.post('/cmrc_staff/:staffId/set-pin', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const staffId = c.req.param('staffId');
   const body = await c.req.json<{ pin?: string; name?: string; manager_phone?: string }>();
@@ -260,13 +260,13 @@ app.post('/staff/:staffId/set-pin', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN'])
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO staff (id, tenant_id, name, manager_phone, cashierPinHash, cashierPinSalt, pinFailedAttempts, pinLockedUntil, created_at, updated_at)
+      `INSERT INTO cmrc_staff (id, tenant_id, name, manager_phone, cashierPinHash, cashierPinSalt, pinFailedAttempts, pinLockedUntil, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          cashierPinHash = excluded.cashierPinHash,
          cashierPinSalt = excluded.cashierPinSalt,
-         manager_phone = COALESCE(excluded.manager_phone, staff.manager_phone),
-         name = COALESCE(excluded.name, staff.name),
+         manager_phone = COALESCE(excluded.manager_phone, cmrc_staff.manager_phone),
+         name = COALESCE(excluded.name, cmrc_staff.name),
          pinFailedAttempts = 0,
          pinLockedUntil = NULL,
          updated_at = excluded.updated_at`,
@@ -301,7 +301,7 @@ app.patch(
 
     try {
       const session = await c.env.DB.prepare(
-        'SELECT id, cashier_id, initial_float_kobo, status, opened_at FROM pos_sessions WHERE id = ? AND tenant_id = ?',
+        'SELECT id, cashier_id, initial_float_kobo, status, opened_at FROM cmrc_pos_sessions WHERE id = ? AND tenant_id = ?',
       )
         .bind(id, tenantId)
         .first<{
@@ -317,7 +317,7 @@ app.patch(
       // Idempotent: already closed → return existing report
       if (session.status === 'closed') {
         const existing = await c.env.DB.prepare(
-          'SELECT z_report_json FROM pos_sessions WHERE id = ? AND tenant_id = ?',
+          'SELECT z_report_json FROM cmrc_pos_sessions WHERE id = ? AND tenant_id = ?',
         )
           .bind(id, tenantId)
           .first<{ z_report_json: string }>();
@@ -331,7 +331,7 @@ app.patch(
            COUNT(*) as order_count,
            COALESCE(SUM(total_amount), 0) as total_sales_kobo,
            COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN total_amount ELSE 0 END), 0) as cash_sales_kobo
-         FROM orders
+         FROM cmrc_orders
          WHERE session_id = ? AND tenant_id = ? AND order_status != 'voided'`,
       )
         .bind(id, tenantId)
@@ -345,7 +345,7 @@ app.patch(
       const expenseSummary = await c.env.DB.prepare(
         `SELECT COALESCE(SUM(amountKobo), 0) as totalExpensesKobo,
                 json_group_array(json_object('category',category,'amountKobo',amountKobo,'note',COALESCE(note,''))) as breakdown
-         FROM session_expenses WHERE sessionId = ? AND tenantId = ?`,
+         FROM cmrc_session_expenses WHERE sessionId = ? AND tenantId = ?`,
       ).bind(id, tenantId).first<{ totalExpensesKobo: number; breakdown: string }>();
       const totalExpensesKobo = expenseSummary?.totalExpensesKobo ?? 0;
       let expenseBreakdown: unknown[] = [];
@@ -361,7 +361,7 @@ app.patch(
                 COALESCE(SUM(total_amount), 0) as revenueKobo,
                 COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN total_amount ELSE 0 END), 0) as cashKobo,
                 COALESCE(SUM(CASE WHEN payment_method != 'cash' THEN total_amount ELSE 0 END), 0) as digitalKobo
-         FROM orders
+         FROM cmrc_orders
          WHERE session_id = ? AND tenant_id = ? AND order_status != 'voided'
          GROUP BY cashier_id`,
       ).bind(id, tenantId).all<{
@@ -387,7 +387,7 @@ app.patch(
       };
 
       await c.env.DB.prepare(
-        `UPDATE pos_sessions SET status = 'closed', closed_at = ?, total_sales_kobo = ?, order_count = ?, z_report_json = ? WHERE id = ? AND tenant_id = ?`,
+        `UPDATE cmrc_pos_sessions SET status = 'closed', closed_at = ?, total_sales_kobo = ?, order_count = ?, z_report_json = ? WHERE id = ? AND tenant_id = ?`,
       )
         .bind(now, totalSales, orderCount, JSON.stringify(zReport), id, tenantId)
         .run();
@@ -404,12 +404,12 @@ app.patch(
 // PRODUCT MANAGEMENT
 // ──────────────────────────────────────────────────────────────────────────────
 
-// GET /api/pos/ — List products for POS
+// GET /api/pos/ — List cmrc_products for POS
 app.get('/', async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, is_active FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC',
+      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, is_active FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC',
     )
       .bind(tenantId)
       .all();
@@ -420,8 +420,8 @@ app.get('/', async (c) => {
   }
 });
 
-// GET /api/pos/products — List products with filters and pagination
-app.get('/products', async (c) => {
+// GET /api/pos/cmrc_products — List cmrc_products with filters and pagination
+app.get('/cmrc_products', async (c) => {
   const tenantId = getTenantId(c);
   const category = c.req.query('category');
   const search = c.req.query('search');
@@ -429,7 +429,7 @@ app.get('/products', async (c) => {
   const offset = parseInt(c.req.query('offset') ?? '0', 10);
   try {
     let query =
-      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL';
+      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL';
     const params: (string | number)[] = [tenantId!];
     if (category) {
       query += ' AND category = ?';
@@ -449,15 +449,15 @@ app.get('/products', async (c) => {
   }
 });
 
-// GET /api/pos/products/barcode/:code — Barcode / SKU lookup with variant hint
-app.get('/products/barcode/:code', async (c) => {
+// GET /api/pos/cmrc_products/barcode/:code — Barcode / SKU lookup with variant hint
+app.get('/cmrc_products/barcode/:code', async (c) => {
   const tenantId = getTenantId(c);
   const code = c.req.param('code');
   try {
     const product = await c.env.DB.prepare(
       `SELECT id, sku, name, description, category, price, quantity, barcode,
               low_stock_threshold, has_variants
-       FROM products
+       FROM cmrc_products
        WHERE tenant_id = ? AND (barcode = ? OR sku = ?)
          AND is_active = 1 AND deleted_at IS NULL`,
     )
@@ -469,7 +469,7 @@ app.get('/products/barcode/:code', async (c) => {
     if (product.has_variants) {
       const { results } = await c.env.DB.prepare(
         `SELECT id, sku, option_name, option_value, price_delta, quantity
-         FROM product_variants
+         FROM cmrc_product_variants
          WHERE product_id = ? AND is_active = 1 AND deleted_at IS NULL
          ORDER BY option_name ASC, option_value ASC`,
       )
@@ -485,14 +485,14 @@ app.get('/products/barcode/:code', async (c) => {
   }
 });
 
-// GET /api/pos/products/:id/variants — Variant list for picker modal
-app.get('/products/:id/variants', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// GET /api/pos/cmrc_products/:id/variants — Variant list for picker modal
+app.get('/cmrc_products/:id/variants', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, sku, option_name, option_value, price_delta, quantity
-       FROM product_variants
+       FROM cmrc_product_variants
        WHERE product_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
        ORDER BY option_name ASC, option_value ASC`,
     ).bind(productId, tenantId).all();
@@ -507,20 +507,20 @@ app.get('/products/:id/variants', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'S
 // CUSTOMERS — Loyalty lookup + inline registration
 // ──────────────────────────────────────────────────────────────────────────────
 
-// GET /api/pos/customers/lookup?phone= — Loyalty lookup by phone
-app.get('/customers/lookup', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// GET /api/pos/cmrc_customers/lookup?phone= — Loyalty lookup by phone
+app.get('/cmrc_customers/lookup', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const phone = c.req.query('phone')?.trim();
   if (!phone) return c.json({ success: false, error: 'phone query param is required' }, 400);
   try {
     const customer = await c.env.DB.prepare(
-      'SELECT id, name, phone, loyalty_points, total_spend FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+      'SELECT id, name, phone, loyalty_points, total_spend FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
     ).bind(tenantId, phone).first<{ id: string; name: string | null; phone: string; loyalty_points: number; total_spend: number }>();
     if (!customer) return c.json({ success: false, error: 'Customer not found' }, 404);
 
-    // Fetch tier from customer_loyalty table (P11)
+    // Fetch tier from cmrc_customer_loyalty table (P11)
     const loyaltyRow = await c.env.DB.prepare(
-      'SELECT points, tier FROM customer_loyalty WHERE tenantId = ? AND customerId = ?'
+      'SELECT points, tier FROM cmrc_customer_loyalty WHERE tenantId = ? AND customerId = ?'
     ).bind(tenantId, customer.id).first<{ points: number; tier: string }>();
 
     return c.json({
@@ -540,8 +540,8 @@ app.get('/customers/lookup', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
   }
 });
 
-// POST /api/pos/customers — Create customer inline at POS
-app.post('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// POST /api/pos/cmrc_customers — Create customer inline at POS
+app.post('/cmrc_customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{ name: string; phone: string; email?: string }>();
   if (!body.phone?.trim() || !body.name?.trim()) {
@@ -551,7 +551,7 @@ app.post('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), as
   const id = `cust_pos_${now}_${crypto.randomUUID().slice(0, 8)}`;
   try {
     await c.env.DB.prepare(
-      `INSERT INTO customers (id, tenant_id, name, phone, email, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+      `INSERT INTO cmrc_customers (id, tenant_id, name, phone, email, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
     ).bind(id, tenantId, body.name.trim(), body.phone.trim(), body.email ?? null, now, now, now).run();
     return c.json({
@@ -564,13 +564,13 @@ app.post('/customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), as
   }
 });
 
-// GET /api/pos/products/low-stock — Reorder alerts
-app.get('/products/low-stock', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// GET /api/pos/cmrc_products/low-stock — Reorder alerts
+app.get('/cmrc_products/low-stock', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const threshold = Math.max(0, parseInt(c.req.query('threshold') ?? '10', 10));
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT id, sku, name, category, price, quantity, low_stock_threshold, barcode FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL AND quantity <= ? ORDER BY quantity ASC',
+      'SELECT id, sku, name, category, price, quantity, low_stock_threshold, barcode FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL AND quantity <= ? ORDER BY quantity ASC',
     )
       .bind(tenantId, threshold)
       .all();
@@ -581,8 +581,8 @@ app.get('/products/low-stock', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAF
   }
 });
 
-// POST /api/pos/products — Create product
-app.post('/products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// POST /api/pos/cmrc_products — Create product
+app.post('/cmrc_products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     sku: string;
@@ -598,7 +598,7 @@ app.post('/products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   const now = Date.now();
   try {
     await c.env.DB.prepare(
-      `INSERT INTO products (id, tenant_id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, created_at, updated_at)
+      `INSERT INTO cmrc_products (id, tenant_id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
@@ -623,13 +623,13 @@ app.post('/products', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   }
 });
 
-// GET /api/pos/products/:id — Get product by ID
-app.get('/products/:id', async (c) => {
+// GET /api/pos/cmrc_products/:id — Get product by ID
+app.get('/cmrc_products/:id', async (c) => {
   const tenantId = getTenantId(c);
   const id = c.req.param('id');
   try {
     const product = await c.env.DB.prepare(
-      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, is_active FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+      'SELECT id, sku, name, description, category, price, quantity, barcode, low_stock_threshold, is_active FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
     )
       .bind(id, tenantId)
       .first();
@@ -641,8 +641,8 @@ app.get('/products/:id', async (c) => {
   }
 });
 
-// PATCH /api/pos/products/:id — Update product fields
-app.patch('/products/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// PATCH /api/pos/cmrc_products/:id — Update product fields
+app.patch('/cmrc_products/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const id = c.req.param('id');
   const body = await c.req.json<Record<string, unknown>>();
@@ -663,7 +663,7 @@ app.patch('/products/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'])
   const values = fields.map((f) => body[f]);
   try {
     await c.env.DB.prepare(
-      `UPDATE products SET ${setClause}, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+      `UPDATE cmrc_products SET ${setClause}, updated_at = ? WHERE id = ? AND tenant_id = ?`,
     )
       .bind(...values, now, id, tenantId)
       .run();
@@ -703,7 +703,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   }
 
   // ── POS-E13: Bundle expansion — resolve bundle items into components for stock deduction ──
-  // Bundle items are identified when their product_id exists in product_bundles table.
+  // Bundle items are identified when their product_id exists in cmrc_product_bundles table.
   // The bundle's priceKobo is used for the order total; component stocks are deducted individually.
   // Atomic: if ANY component is out of stock, the whole checkout is rejected.
   const lineItems: LineItem[] = [];
@@ -712,14 +712,14 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
   for (const item of rawLineItems) {
     // Check if this item is a bundle
     const bundle = await c.env.DB.prepare(
-      `SELECT id, priceKobo FROM product_bundles WHERE id = ? AND tenantId = ? AND active = 1`,
+      `SELECT id, priceKobo FROM cmrc_product_bundles WHERE id = ? AND tenantId = ? AND active = 1`,
     ).bind(item.product_id, tenantId).first<{ id: string; priceKobo: number }>().catch(() => null);
 
     if (bundle) {
       // Fetch bundle components
       const { results: components } = await c.env.DB.prepare(
         `SELECT bi.productId, bi.quantity AS componentQty, p.name, p.price_kobo AS priceKobo, p.quantity AS stockQty
-         FROM bundle_items bi JOIN products p ON p.id = bi.productId AND p.tenant_id = ?
+         FROM cmrc_bundle_items bi JOIN cmrc_products p ON p.id = bi.productId AND p.tenant_id = ?
          WHERE bi.bundleId = ?`,
       ).bind(tenantId, bundle.id).all<{ productId: string; componentQty: number; name: string; priceKobo: number; stockQty: number }>();
 
@@ -797,7 +797,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     const stockResults = await c.env.DB.batch(
       lineItems.map((item) =>
         c.env.DB.prepare(
-          'SELECT id, quantity, name, version FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+          'SELECT id, quantity, name, version FROM cmrc_products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
         ).bind(item.product_id, tenantId),
       ),
     );
@@ -853,12 +853,12 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 
     if (body.redeem_points && body.redeem_points > 0 && body.customer_phone) {
       const custRow = await c.env.DB.prepare(
-        'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+        'SELECT id FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
       ).bind(tenantId, body.customer_phone).first<{ id: string }>();
       if (custRow) {
         redeemCustomerId = custRow.id;
         const loyRow = await c.env.DB.prepare(
-          'SELECT points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?',
+          'SELECT points FROM cmrc_customer_loyalty WHERE tenantId = ? AND customerId = ?',
         ).bind(tenantId, custRow.id).first<{ points: number }>();
         currentLoyaltyPoints = loyRow?.points ?? 0;
         const toRedeem = Math.min(body.redeem_points, currentLoyaltyPoints);
@@ -916,7 +916,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 
       const lockResult = await updateWithVersionLock(
         c.env.DB,
-        'products',
+        'cmrc_products',
         { quantity: stockInfo.newQty },
         { id: item.product_id, tenantId: tenantId!, expectedVersion: stockInfo.version },
       );
@@ -939,14 +939,14 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
     let resolvedCashierId: string | null = null;
     if (body.session_id) {
       const sessRow = await c.env.DB.prepare(
-        'SELECT cashier_id FROM pos_sessions WHERE id = ? AND tenant_id = ?',
+        'SELECT cashier_id FROM cmrc_pos_sessions WHERE id = ? AND tenant_id = ?',
       ).bind(body.session_id, tenantId).first<{ cashier_id: string | null }>();
       resolvedCashierId = sessRow?.cashier_id ?? null;
     }
 
     // Step 6c — Insert order (stock already deducted above)
     const insertStmt = c.env.DB.prepare(
-      `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal, discount, total_amount, payment_method, payments_json, session_id, cashier_id, payment_status, order_status, channel, created_at, updated_at)
+      `INSERT INTO cmrc_orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal, discount, total_amount, payment_method, payments_json, session_id, cashier_id, payment_status, order_status, channel, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`,
     ).bind(
       orderId,
@@ -980,12 +980,12 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
       void (async () => {
         try {
           const custId = redeemCustomerId ?? (await c.env.DB.prepare(
-            'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+            'SELECT id FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
           ).bind(tenantId, body.customer_phone).first<{ id: string }>())?.id;
           if (!custId) return;
 
           const existing = await c.env.DB.prepare(
-            'SELECT id, points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?',
+            'SELECT id, points FROM cmrc_customer_loyalty WHERE tenantId = ? AND customerId = ?',
           ).bind(tenantId, custId).first<{ id: string; points: number }>();
 
           const prevPoints = existing?.points ?? 0;
@@ -994,18 +994,18 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 
           if (existing) {
             await c.env.DB.prepare(
-              'UPDATE customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?',
+              'UPDATE cmrc_customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?',
             ).bind(newPoints, newTier, new Date(now).toISOString(), tenantId, custId).run();
           } else {
             const lid = `loy_${now}_${crypto.randomUUID().slice(0, 8)}`;
             await c.env.DB.prepare(
-              'INSERT OR IGNORE INTO customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+              'INSERT OR IGNORE INTO cmrc_customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
             ).bind(lid, tenantId, custId, Math.max(0, loyaltyEarned), evaluateLoyaltyTier(loyaltyEarned, loyaltyCfg), new Date(now).toISOString()).run();
           }
 
-          // Keep customers.loyalty_points in sync (backward compat)
+          // Keep cmrc_customers.loyalty_points in sync (backward compat)
           await c.env.DB.prepare(
-            'UPDATE customers SET loyalty_points = loyalty_points + ?, total_spend = total_spend + ?, updated_at = ? WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+            'UPDATE cmrc_customers SET loyalty_points = loyalty_points + ?, total_spend = total_spend + ?, updated_at = ? WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
           ).bind(loyaltyEarned - pointsRedeemed, total, now, tenantId, body.customer_phone).run();
         } catch { /* non-fatal */ }
       })();
@@ -1047,7 +1047,7 @@ app.post('/checkout', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), asy
 // ──────────────────────────────────────────────────────────────────────────────
 // VOID ORDER — PCI: requires reason, RBAC STAFF+, idempotent
 // ──────────────────────────────────────────────────────────────────────────────
-app.post('/orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+app.post('/cmrc_orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const orderId = c.req.param('id');
   const body = await c.req.json<{ reason?: string; session_id?: string }>();
@@ -1060,7 +1060,7 @@ app.post('/orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
 
   try {
     const order = await c.env.DB.prepare(
-      "SELECT id, order_status, total_amount FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL",
+      "SELECT id, order_status, total_amount FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL",
     )
       .bind(orderId, tenantId)
       .first<{ id: string; order_status: string; total_amount: number }>();
@@ -1076,7 +1076,7 @@ app.post('/orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
     }
 
     await c.env.DB.prepare(
-      "UPDATE orders SET order_status = 'voided', void_reason = ?, voided_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?",
+      "UPDATE cmrc_orders SET order_status = 'voided', void_reason = ?, voided_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?",
     )
       .bind(body.reason.trim(), now, now, orderId, tenantId)
       .run();
@@ -1102,16 +1102,16 @@ app.post('/orders/:id/void', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'
 // RECEIPT — Formatted receipt JSON with WhatsApp share URL
 // ──────────────────────────────────────────────────────────────────────────────
 
-// POST /api/pos/orders/:id/receipt — Generate receipt payload for print/share
+// POST /api/pos/cmrc_orders/:id/receipt — Generate receipt payload for print/share
 app.post(
-  '/orders/:id/receipt',
+  '/cmrc_orders/:id/receipt',
   requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
   async (c) => {
     const tenantId = getTenantId(c);
     const orderId = c.req.param('id');
     try {
       const order = await c.env.DB.prepare(
-        "SELECT id, total_amount, subtotal, discount, payment_method, payments_json, items_json, customer_email, customer_phone, order_status, created_at FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL",
+        "SELECT id, total_amount, subtotal, discount, payment_method, payments_json, items_json, customer_email, customer_phone, order_status, created_at FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL",
       )
         .bind(orderId, tenantId)
         .first<{
@@ -1167,7 +1167,7 @@ app.post(
         customer_email: order.customer_email ?? null,
         customer_phone: order.customer_phone ?? null,
         whatsapp_url: `https://wa.me/?text=${encodeURIComponent(whatsappText)}`,
-        print_url: `/api/pos/orders/${orderId}/receipt/print`,
+        print_url: `/api/pos/cmrc_orders/${orderId}/receipt/print`,
       };
 
       return c.json({ success: true, data: receipt }, 201);
@@ -1182,14 +1182,14 @@ app.post(
 // ORDERS
 // ──────────────────────────────────────────────────────────────────────────────
 
-// GET /api/pos/orders — List POS orders
-app.get('/orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// GET /api/pos/cmrc_orders — List POS cmrc_orders
+app.get('/cmrc_orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10), 500);
   const offset = parseInt(c.req.query('offset') ?? '0', 10);
   try {
     const { results } = await c.env.DB.prepare(
-      "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ? OFFSET ?",
+      "SELECT * FROM cmrc_orders WHERE tenant_id = ? AND channel = 'pos' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ? OFFSET ?",
     )
       .bind(tenantId, limit, offset)
       .all();
@@ -1283,7 +1283,7 @@ app.post('/receipts/send-whatsapp', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 
   // Fetch order — tenant-scoped
   const order = await c.env.DB.prepare(
     `SELECT id, total_amount, payment_method, order_status, created_at, items_json
-     FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+     FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
   ).bind(order_id.trim(), tenantId).first<{
     id: string; total_amount: number; payment_method: string;
     order_status: string; created_at: number; items_json: string | null;
@@ -1334,7 +1334,7 @@ app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (
       const payload = m.payload as Record<string, unknown>;
       try {
         const existing = await c.env.DB.prepare(
-          "SELECT id FROM orders WHERE tenant_id = ? AND channel = 'pos' AND id LIKE ?",
+          "SELECT id FROM cmrc_orders WHERE tenant_id = ? AND channel = 'pos' AND id LIKE ?",
         )
           .bind(tenantId, `%${m.entity_id}%`)
           .first();
@@ -1346,7 +1346,7 @@ app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (
 
         const id = `ord_sync_${now}_${crypto.randomUUID().slice(0, 8)}`;
         await c.env.DB.prepare(
-          `INSERT INTO orders (id, tenant_id, items_json, subtotal, discount, total_amount, payment_method, payment_status, order_status, channel, created_at, updated_at)
+          `INSERT INTO cmrc_orders (id, tenant_id, items_json, subtotal, discount, total_amount, payment_method, payment_status, order_status, channel, created_at, updated_at)
            VALUES (?, ?, ?, ?, 0, ?, ?, 'paid', 'fulfilled', 'pos', ?, ?)`,
         )
           .bind(
@@ -1385,7 +1385,7 @@ app.post('/sync', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (
       try {
         const rOrder = await c.env.DB.prepare(
           `SELECT id, total_amount, payment_method, order_status, created_at, items_json
-           FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+           FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
         ).bind(rOrderId, tenantId).first<{
           id: string; total_amount: number; payment_method: string;
           order_status: string; created_at: number; items_json: string | null;
@@ -1425,19 +1425,19 @@ app.get('/dashboard', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
     const todayTs = today.getTime();
 
     const summary = await c.env.DB.prepare(
-      "SELECT COUNT(*) as order_count, COALESCE(SUM(total_amount), 0) as total_revenue FROM orders WHERE tenant_id = ? AND channel = 'pos' AND payment_status = 'paid' AND order_status != 'voided' AND created_at >= ?",
+      "SELECT COUNT(*) as order_count, COALESCE(SUM(total_amount), 0) as total_revenue FROM cmrc_orders WHERE tenant_id = ? AND channel = 'pos' AND payment_status = 'paid' AND order_status != 'voided' AND created_at >= ?",
     )
       .bind(tenantId, todayTs)
       .first<{ order_count: number; total_revenue: number }>();
 
     const productCount = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+      'SELECT COUNT(*) as count FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
     )
       .bind(tenantId)
       .first<{ count: number }>();
 
     const lowStockCount = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL AND quantity <= low_stock_threshold',
+      'SELECT COUNT(*) as count FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL AND quantity <= low_stock_threshold',
     )
       .bind(tenantId)
       .first<{ count: number }>();
@@ -1458,17 +1458,17 @@ app.get('/dashboard', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OFFLINE CUSTOMER CACHE — Top 200 customers for Dexie seeding (POS-E05)
+// OFFLINE CUSTOMER CACHE — Top 200 cmrc_customers for Dexie seeding (POS-E05)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// GET /api/pos/orders/recent — Last N orders for the Recent Orders screen (offline receipt reprint)
-app.get('/orders/recent', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// GET /api/pos/cmrc_orders/recent — Last N cmrc_orders for the Recent Orders screen (offline receipt reprint)
+app.get('/cmrc_orders/recent', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10), 100);
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, order_status, total_amount, payment_method, customer_phone, items_json, session_id, created_at
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND deleted_at IS NULL
        ORDER BY created_at DESC
        LIMIT ?`,
@@ -1480,23 +1480,23 @@ app.get('/orders/recent', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
   }
 });
 
-// GET /api/pos/customers/top — Top 200 customers by last purchase for offline cache
-app.get('/customers/top', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// GET /api/pos/cmrc_customers/top — Top 200 cmrc_customers by last purchase for offline cache
+app.get('/cmrc_customers/top', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenant_id as tenantId, name, phone, creditBalanceKobo, loyalty_points as loyaltyPoints
-       FROM customers
+       FROM cmrc_customers
        WHERE tenant_id = ? AND deleted_at IS NULL
        ORDER BY lastPurchaseAt DESC
        LIMIT 200`,
     ).bind(tenantId).all();
     const now = Date.now();
-    const customers = (results as Array<Record<string, unknown>>).map((row) => ({
+    const cmrc_customers = (results as Array<Record<string, unknown>>).map((row) => ({
       ...row,
       updatedAt: now,
     }));
-    return c.json({ success: true, customers });
+    return c.json({ success: true, cmrc_customers });
   } catch (err) {
     console.error('[POS] route error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
@@ -1507,8 +1507,8 @@ app.get('/customers/top', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
 // PARTIAL RETURNS AND STORE CREDIT (POS-E04)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// POST /api/pos/orders/:id/return — Process a partial return
-app.post('/orders/:id/return', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
+// POST /api/pos/cmrc_orders/:id/return — Process a partial return
+app.post('/cmrc_orders/:id/return', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const originalOrderId = c.req.param('id');
 
@@ -1528,7 +1528,7 @@ app.post('/orders/:id/return', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAF
     // 1. Fetch original order — must belong to this tenant and be deliverable
     const order = await c.env.DB.prepare(
       `SELECT id, tenant_id, customer_phone, order_status, items_json
-       FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
     ).bind(originalOrderId, tenantId).first<{
       id: string; tenant_id: string; customer_phone: string | null;
       order_status: string; items_json: string | null;
@@ -1568,7 +1568,7 @@ app.post('/orders/:id/return', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAF
       // Restore stock for each returned item
       ...body.items.map((item) =>
         c.env.DB.prepare(
-          'UPDATE products SET quantity = quantity + ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
+          'UPDATE cmrc_products SET quantity = quantity + ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
         ).bind(item.quantity, now, item.productId, tenantId),
       ),
     ];
@@ -1577,7 +1577,7 @@ app.post('/orders/:id/return', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAF
     if (body.returnMethod === 'STORE_CREDIT' && order.customer_phone) {
       batchStmts.push(
         c.env.DB.prepare(
-          'UPDATE customers SET creditBalanceKobo = creditBalanceKobo + ?, updated_at = ? WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+          'UPDATE cmrc_customers SET creditBalanceKobo = creditBalanceKobo + ?, updated_at = ? WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
         ).bind(creditAmountKobo, now, tenantId, order.customer_phone),
       );
     }
@@ -1585,7 +1585,7 @@ app.post('/orders/:id/return', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAF
     // Insert return record
     batchStmts.push(
       c.env.DB.prepare(
-        `INSERT INTO order_returns (id, tenantId, originalOrderId, returnedItems, returnMethod, creditAmountKobo, processedBy, status, createdAt)
+        `INSERT INTO cmrc_order_returns (id, tenantId, originalOrderId, returnedItems, returnMethod, creditAmountKobo, processedBy, status, createdAt)
          VALUES (?, ?, ?, ?, ?, ?, NULL, 'PENDING', ?)`,
       ).bind(
         returnId, tenantId, originalOrderId,
@@ -1653,7 +1653,7 @@ app.post('/stock-adjustments', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), asy
     for (const adj of body.adjustments) {
       // Read current quantity
       const product = await c.env.DB.prepare(
-        'SELECT id, quantity FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+        'SELECT id, quantity FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
       ).bind(adj.productId, tenantId).first<{ id: string; quantity: number }>();
 
       if (!product) continue;
@@ -1664,10 +1664,10 @@ app.post('/stock-adjustments', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), asy
 
       await c.env.DB.batch([
         c.env.DB.prepare(
-          'UPDATE products SET quantity = ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
+          'UPDATE cmrc_products SET quantity = ?, updated_at = ? WHERE id = ? AND tenant_id = ?',
         ).bind(adj.countedQuantity, now, adj.productId, tenantId),
         c.env.DB.prepare(
-          `INSERT INTO stock_adjustment_log (id, tenantId, productId, previousQty, newQty, delta, reason, sessionId, createdAt)
+          `INSERT INTO cmrc_stock_adjustment_log (id, tenantId, productId, previousQty, newQty, delta, reason, sessionId, createdAt)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(
           logId, tenantId, adj.productId,
@@ -1716,13 +1716,13 @@ app.post(
       return c.json({ success: false, error: 'sessionId, amountKobo, category required' }, 400);
     }
     const session = await c.env.DB.prepare(
-      `SELECT id FROM pos_sessions WHERE id = ? AND tenant_id = ? AND status = 'open'`,
+      `SELECT id FROM cmrc_pos_sessions WHERE id = ? AND tenant_id = ? AND status = 'open'`,
     ).bind(body.sessionId, tenantId).first<{ id: string }>();
     if (!session) return c.json({ success: false, error: 'Open session not found' }, 404);
 
     const expId = `exp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     await c.env.DB.prepare(
-      `INSERT INTO session_expenses (id, tenantId, sessionId, amountKobo, category, note) VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO cmrc_session_expenses (id, tenantId, sessionId, amountKobo, category, note) VALUES (?, ?, ?, ?, ?, ?)`,
     ).bind(expId, tenantId, body.sessionId, body.amountKobo, body.category, body.note ?? null).run();
 
     return c.json({ success: true, data: { id: expId, amountKobo: body.amountKobo, category: body.category } }, 201);
@@ -1737,7 +1737,7 @@ app.get(
     const tenantId = getTenantId(c);
     const sessionId = c.req.param('sessionId');
     const { results } = await c.env.DB.prepare(
-      `SELECT id, amountKobo, category, note, createdAt FROM session_expenses WHERE sessionId = ? AND tenantId = ? ORDER BY createdAt`,
+      `SELECT id, amountKobo, category, note, createdAt FROM cmrc_session_expenses WHERE sessionId = ? AND tenantId = ? ORDER BY createdAt`,
     ).bind(sessionId, tenantId).all<Record<string, unknown>>();
     const total = (results ?? []).reduce((s, r) => s + ((r.amountKobo as number) ?? 0), 0);
     return c.json({ success: true, data: { expenses: results ?? [], totalExpensesKobo: total } });
@@ -1765,11 +1765,11 @@ app.post(
     const bundleId = `bndl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const stmts = [
       c.env.DB.prepare(
-        `INSERT INTO product_bundles (id, tenantId, name, description, priceKobo) VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO cmrc_product_bundles (id, tenantId, name, description, priceKobo) VALUES (?, ?, ?, ?, ?)`,
       ).bind(bundleId, tenantId, body.name, body.description ?? null, body.priceKobo),
       ...body.items.map(it =>
         c.env.DB.prepare(
-          `INSERT INTO bundle_items (id, bundleId, productId, quantity) VALUES (?, ?, ?, ?)`,
+          `INSERT INTO cmrc_bundle_items (id, bundleId, productId, quantity) VALUES (?, ?, ?, ?)`,
         ).bind(`bi_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, bundleId, it.productId, it.quantity),
       ),
     ];
@@ -1783,14 +1783,14 @@ app.post(
 app.get('/bundles', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
   const { results: bundles } = await c.env.DB.prepare(
-    `SELECT b.id, b.name, b.description, b.priceKobo, b.active FROM product_bundles b WHERE b.tenantId = ? AND b.active = 1 ORDER BY b.name`,
+    `SELECT b.id, b.name, b.description, b.priceKobo, b.active FROM cmrc_product_bundles b WHERE b.tenantId = ? AND b.active = 1 ORDER BY b.name`,
   ).bind(tenantId).all<{ id: string; name: string; description: string | null; priceKobo: number; active: number }>();
 
   const bundlesWithItems = await Promise.all(
     (bundles ?? []).map(async (b) => {
       const { results: items } = await c.env.DB.prepare(
-        `SELECT bi.productId, bi.quantity, p.name FROM bundle_items bi
-         LEFT JOIN products p ON p.id = bi.productId AND p.tenant_id = ?
+        `SELECT bi.productId, bi.quantity, p.name FROM cmrc_bundle_items bi
+         LEFT JOIN cmrc_products p ON p.id = bi.productId AND p.tenant_id = ?
          WHERE bi.bundleId = ?`,
       ).bind(tenantId, b.id).all<{ productId: string; quantity: number; name: string | null }>();
       return { ...b, items: items ?? [] };
@@ -1802,40 +1802,40 @@ app.get('/bundles', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async
 
 // ── POS-E14: Supplier and PO Management ──────────────────────────────────────
 
-// GET /suppliers
-app.get('/suppliers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// GET /cmrc_suppliers
+app.get('/cmrc_suppliers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const { results } = await c.env.DB.prepare(
-    `SELECT id, name, phone, email, address, createdAt FROM suppliers WHERE tenantId = ? ORDER BY name`,
+    `SELECT id, name, phone, email, address, createdAt FROM cmrc_suppliers WHERE tenantId = ? ORDER BY name`,
   ).bind(tenantId).all<Record<string, unknown>>();
-  return c.json({ success: true, data: { suppliers: results ?? [] } });
+  return c.json({ success: true, data: { cmrc_suppliers: results ?? [] } });
 });
 
-// POST /suppliers
-app.post('/suppliers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// POST /cmrc_suppliers
+app.post('/cmrc_suppliers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{ name: string; phone?: string; email?: string; address?: string }>();
   if (!body.name) return c.json({ success: false, error: 'name required' }, 400);
   const id = `sup_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   await c.env.DB.prepare(
-    `INSERT INTO suppliers (id, tenantId, name, phone, email, address) VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cmrc_suppliers (id, tenantId, name, phone, email, address) VALUES (?, ?, ?, ?, ?, ?)`,
   ).bind(id, tenantId, body.name, body.phone ?? null, body.email ?? null, body.address ?? null).run();
   return c.json({ success: true, data: { id, name: body.name } }, 201);
 });
 
-// GET /purchase-orders
-app.get('/purchase-orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// GET /purchase-cmrc_orders
+app.get('/purchase-cmrc_orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const { results } = await c.env.DB.prepare(
     `SELECT po.id, po.supplierId, po.status, po.expectedDelivery, po.createdAt, po.receivedAt, s.name AS supplierName
-     FROM purchase_orders po LEFT JOIN suppliers s ON s.id = po.supplierId AND s.tenantId = po.tenantId
+     FROM cmrc_purchase_orders po LEFT JOIN cmrc_suppliers s ON s.id = po.supplierId AND s.tenantId = po.tenantId
      WHERE po.tenantId = ? ORDER BY po.createdAt DESC LIMIT 100`,
   ).bind(tenantId).all<Record<string, unknown>>();
   return c.json({ success: true, data: { purchaseOrders: results ?? [] } });
 });
 
-// POST /purchase-orders
-app.post('/purchase-orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// POST /purchase-cmrc_orders
+app.post('/purchase-cmrc_orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     supplierId: string;
@@ -1847,11 +1847,11 @@ app.post('/purchase-orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async
   const poId = `po_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const stmts = [
     c.env.DB.prepare(
-      `INSERT INTO purchase_orders (id, tenantId, supplierId, expectedDelivery) VALUES (?, ?, ?, ?)`,
+      `INSERT INTO cmrc_purchase_orders (id, tenantId, supplierId, expectedDelivery) VALUES (?, ?, ?, ?)`,
     ).bind(poId, tenantId, body.supplierId, body.expectedDelivery ?? null),
     ...body.items.map(it =>
       c.env.DB.prepare(
-        `INSERT INTO purchase_order_items (id, poId, productId, quantityOrdered, unitCostKobo) VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO cmrc_purchase_order_items (id, poId, productId, quantityOrdered, unitCostKobo) VALUES (?, ?, ?, ?, ?)`,
       ).bind(`poi_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, poId, it.productId, it.quantityOrdered, it.unitCostKobo),
     ),
   ];
@@ -1859,9 +1859,9 @@ app.post('/purchase-orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async
   return c.json({ success: true, data: { id: poId, status: 'PENDING' } }, 201);
 });
 
-// POST /purchase-orders/:id/receive — receive PO items, update stock
+// POST /purchase-cmrc_orders/:id/receive — receive PO items, update stock
 app.post(
-  '/purchase-orders/:id/receive',
+  '/purchase-cmrc_orders/:id/receive',
   requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']),
   async (c) => {
     const tenantId = getTenantId(c);
@@ -1870,14 +1870,14 @@ app.post(
     if (!body.items?.length) return c.json({ success: false, error: 'items required' }, 400);
 
     const po = await c.env.DB.prepare(
-      `SELECT id FROM purchase_orders WHERE id = ? AND tenantId = ? AND status != 'RECEIVED'`,
+      `SELECT id FROM cmrc_purchase_orders WHERE id = ? AND tenantId = ? AND status != 'RECEIVED'`,
     ).bind(poId, tenantId).first<{ id: string }>();
     if (!po) return c.json({ success: false, error: 'Purchase order not found or already received' }, 404);
 
     // Fetch ordered quantities to detect overage (received > ordered → allowed but logged distinctly)
     const orderedMap = new Map<string, number>();
     const { results: orderedItems } = await c.env.DB.prepare(
-      `SELECT productId, quantityOrdered FROM purchase_order_items WHERE poId = ?`,
+      `SELECT productId, quantityOrdered FROM cmrc_purchase_order_items WHERE poId = ?`,
     ).bind(poId).all<{ productId: string; quantityOrdered: number }>();
     for (const oi of orderedItems ?? []) orderedMap.set(oi.productId, oi.quantityOrdered);
 
@@ -1888,15 +1888,15 @@ app.post(
       const reason = isOverage ? 'purchase_order_overage' : 'purchase_order_received';
       return [
         c.env.DB.prepare(
-          `UPDATE products SET quantity = quantity + ? WHERE id = ? AND tenant_id = ?`,
+          `UPDATE cmrc_products SET quantity = quantity + ? WHERE id = ? AND tenant_id = ?`,
         ).bind(it.receivedQty, it.productId, tenantId),
         c.env.DB.prepare(
-          `UPDATE purchase_order_items SET quantityReceived = ? WHERE poId = ? AND productId = ?`,
+          `UPDATE cmrc_purchase_order_items SET quantityReceived = ? WHERE poId = ? AND productId = ?`,
         ).bind(it.receivedQty, poId, it.productId),
         c.env.DB.prepare(
-          `INSERT INTO stock_adjustment_log (id, tenant_id, product_id, previous_qty, new_qty, delta, reason, created_at)
+          `INSERT INTO cmrc_stock_adjustment_log (id, tenant_id, product_id, previous_qty, new_qty, delta, reason, created_at)
            SELECT ?, ?, ?, quantity - ?, quantity, ?, ?, ?
-           FROM products WHERE id = ? AND tenant_id = ?`,
+           FROM cmrc_products WHERE id = ? AND tenant_id = ?`,
         ).bind(
           `sal_po_${now}_${Math.random().toString(36).slice(2, 6)}`,
           tenantId, it.productId, it.receivedQty, it.receivedQty, reason, now, it.productId, tenantId,
@@ -1904,7 +1904,7 @@ app.post(
       ];
     });
     stmts.push(
-      c.env.DB.prepare(`UPDATE purchase_orders SET status = 'RECEIVED', receivedAt = ? WHERE id = ? AND tenantId = ?`).bind(new Date().toISOString(), poId, tenantId),
+      c.env.DB.prepare(`UPDATE cmrc_purchase_orders SET status = 'RECEIVED', receivedAt = ? WHERE id = ? AND tenantId = ?`).bind(new Date().toISOString(), poId, tenantId),
     );
     await c.env.DB.batch(stmts);
 
@@ -1973,7 +1973,7 @@ app.get('/payment-status', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF'])
 // ──────────────────────────────────────────────────────────────────────────────
 // MICRO-HUB FULFILLMENT ROUTING (T-COM-01)
 // Physical POS outlets act as e-commerce micro-fulfillment centres.
-// Online storefront orders are routed to the nearest outlet at checkout.
+// Online storefront cmrc_orders are routed to the nearest outlet at checkout.
 // Cashiers pick/pack and emit order.ready_for_delivery to the logistics repo.
 // Invariants: [EVT] no dispatch logic here — logistics repo handles riders.
 //             [MTT] tenant_id enforced on every query.
@@ -1988,7 +1988,7 @@ app.post('/outlets', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => 
   const id = `out_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
   const now = new Date().toISOString();
   await c.env.DB.prepare(
-    `INSERT INTO pos_outlets (id, tenant_id, name, address, lat, lng, active, created_at, updated_at)
+    `INSERT INTO cmrc_pos_outlets (id, tenant_id, name, address, lat, lng, active, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).bind(id, tenantId, body.name.trim(), body.address ?? null, body.lat ?? null, body.lng ?? null, now, now).run();
   return c.json({ success: true, data: { id, name: body.name.trim(), address: body.address ?? null, lat: body.lat ?? null, lng: body.lng ?? null, active: true } }, 201);
@@ -1999,7 +1999,7 @@ app.get('/outlets', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async
   const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
   const { results } = await c.env.DB.prepare(
-    `SELECT id, name, address, lat, lng, active, created_at FROM pos_outlets WHERE tenant_id = ? ORDER BY name ASC`
+    `SELECT id, name, address, lat, lng, active, created_at FROM cmrc_pos_outlets WHERE tenant_id = ? ORDER BY name ASC`
   ).bind(tenantId).all<{ id: string; name: string; address: string | null; lat: number | null; lng: number | null; active: number; created_at: string }>();
   return c.json({ success: true, data: results ?? [] });
 });
@@ -2011,12 +2011,12 @@ app.patch('/outlets/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
   const outletId = c.req.param('id');
   const body = await c.req.json<{ name?: string; address?: string; lat?: number; lng?: number; active?: boolean }>();
   const existing = await c.env.DB.prepare(
-    `SELECT id FROM pos_outlets WHERE id = ? AND tenant_id = ?`
+    `SELECT id FROM cmrc_pos_outlets WHERE id = ? AND tenant_id = ?`
   ).bind(outletId, tenantId).first<{ id: string }>();
   if (!existing) return c.json({ success: false, error: 'Outlet not found' }, 404);
   const now = new Date().toISOString();
   await c.env.DB.prepare(
-    `UPDATE pos_outlets SET
+    `UPDATE cmrc_pos_outlets SET
        name    = COALESCE(?, name),
        address = COALESCE(?, address),
        lat     = COALESCE(?, lat),
@@ -2035,7 +2035,7 @@ app.patch('/outlets/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
   return c.json({ success: true, data: { id: outletId, updated: true } });
 });
 
-// ── GET /fulfillment-queue — orders assigned to an outlet, pending packing ────
+// ── GET /fulfillment-queue — cmrc_orders assigned to an outlet, pending packing ────
 // STAFF can filter by their outlet_id; ADMIN sees all or filters by outlet_id.
 app.get('/fulfillment-queue', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF']), async (c) => {
   const tenantId = getTenantId(c);
@@ -2045,7 +2045,7 @@ app.get('/fulfillment-queue', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF
   const { results } = await c.env.DB.prepare(
     `SELECT id, customer_phone, customer_email, items_json, total_amount, fulfillment_status,
             fulfillment_assigned_at, created_at, delivery_address_json
-     FROM orders
+     FROM cmrc_orders
      WHERE tenant_id = ? AND fulfillment_outlet_id = ?
        AND fulfillment_status IN ('assigned', 'picking')
        AND deleted_at IS NULL
@@ -2056,12 +2056,12 @@ app.get('/fulfillment-queue', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN', 'STAFF
     items_json: string; total_amount: number; fulfillment_status: string;
     fulfillment_assigned_at: string; created_at: string; delivery_address_json: string | null;
   }>();
-  const orders = (results ?? []).map(o => ({
+  const cmrc_orders = (results ?? []).map(o => ({
     ...o,
     items: (() => { try { return JSON.parse(o.items_json ?? '[]'); } catch { return []; } })(),
     delivery_address: (() => { try { return o.delivery_address_json ? JSON.parse(o.delivery_address_json) : null; } catch { return null; } })(),
   }));
-  return c.json({ success: true, data: orders });
+  return c.json({ success: true, data: cmrc_orders });
 });
 
 // ── PATCH /fulfillment-queue/:orderId/start — cashier begins picking items ────
@@ -2070,14 +2070,14 @@ app.patch('/fulfillment-queue/:orderId/start', requireRole(['SUPER_ADMIN', 'TENA
   if (!tenantId) return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
   const orderId = c.req.param('orderId');
   const order = await c.env.DB.prepare(
-    `SELECT id, fulfillment_status FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    `SELECT id, fulfillment_status FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
   ).bind(orderId, tenantId).first<{ id: string; fulfillment_status: string | null }>();
   if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
   if (order.fulfillment_status !== 'assigned') {
     return c.json({ success: false, error: `Cannot start picking: order is in '${order.fulfillment_status ?? 'unrouted'}' state` }, 409);
   }
   await c.env.DB.prepare(
-    `UPDATE orders SET fulfillment_status = 'picking', updated_at = ? WHERE id = ? AND tenant_id = ?`
+    `UPDATE cmrc_orders SET fulfillment_status = 'picking', updated_at = ? WHERE id = ? AND tenant_id = ?`
   ).bind(new Date().toISOString(), orderId, tenantId).run();
   return c.json({ success: true, data: { orderId, fulfillment_status: 'picking' } });
 });
@@ -2091,7 +2091,7 @@ app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TEN
   const orderId = c.req.param('orderId');
   const order = await c.env.DB.prepare(
     `SELECT id, fulfillment_status, fulfillment_outlet_id, total_amount, items_json, delivery_address_json
-     FROM orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+     FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
   ).bind(orderId, tenantId).first<{
     id: string; fulfillment_status: string | null; fulfillment_outlet_id: string | null;
     total_amount: number; items_json: string; delivery_address_json: string | null;
@@ -2102,7 +2102,7 @@ app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TEN
   }
   const now = new Date().toISOString();
   await c.env.DB.prepare(
-    `UPDATE orders SET fulfillment_status = 'packed', fulfillment_packed_at = ?, order_status = 'processing', updated_at = ?
+    `UPDATE cmrc_orders SET fulfillment_status = 'packed', fulfillment_packed_at = ?, order_status = 'processing', updated_at = ?
      WHERE id = ? AND tenant_id = ?`
   ).bind(now, now, orderId, tenantId).run();
 
@@ -2110,7 +2110,7 @@ app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TEN
   // Emit ORDER_PACKED (internal Commerce signal) and ORDER_READY_DELIVERY (logistics boundary).
   const outletRow = order.fulfillment_outlet_id
     ? await c.env.DB.prepare(
-        `SELECT name, address, lat, lng FROM pos_outlets WHERE id = ? AND tenant_id = ?`
+        `SELECT name, address, lat, lng FROM cmrc_pos_outlets WHERE id = ? AND tenant_id = ?`
       ).bind(order.fulfillment_outlet_id, tenantId).first<{ name: string; address: string | null; lat: number | null; lng: number | null }>().catch(() => null)
     : null;
 

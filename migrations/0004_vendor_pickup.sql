@@ -1,3 +1,3 @@
--- P05 Task 5: Add pickupAddress column to vendors table
+-- P05 Task 5: Add pickupAddress column to cmrc_vendors table
 -- JSON: { name, phone, street, city, state, lga }
-ALTER TABLE vendors ADD COLUMN IF NOT EXISTS pickupAddress TEXT;
+ALTER TABLE cmrc_vendors ADD COLUMN IF NOT EXISTS pickupAddress TEXT;

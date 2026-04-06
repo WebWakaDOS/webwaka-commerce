@@ -4,7 +4,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { singleVendorRouter } from './api';
 
-describe('GET /orders/:id/track — order tracking redirect (T-CVC-02)', () => {
+describe('GET /cmrc_orders/:id/track — order tracking redirect (T-CVC-02)', () => {
   const mockOrder = { 
     id: 'ord_sv_001', 
     order_status: 'confirmed', 
@@ -42,7 +42,7 @@ describe('GET /orders/:id/track — order tracking redirect (T-CVC-02)', () => {
       }), { status: 200 })),
     };
     const envWithBinding = { ...mockEnv, LOGISTICS_WORKER: mockLogisticsWorker };
-    const req = new Request('http://test/orders/ord_sv_001/track', { 
+    const req = new Request('http://test/cmrc_orders/ord_sv_001/track', { 
       headers: { 'x-tenant-id': 'tenant1' } 
     });
     const res = await singleVendorRouter.fetch(req, envWithBinding as any);
@@ -53,7 +53,7 @@ describe('GET /orders/:id/track — order tracking redirect (T-CVC-02)', () => {
 
   it('falls back to Commerce status when Logistics is unavailable', async () => {
     mockDb.first.mockResolvedValue(mockOrder);
-    const req = new Request('http://test/orders/ord_sv_001/track', { 
+    const req = new Request('http://test/cmrc_orders/ord_sv_001/track', { 
       headers: { 'x-tenant-id': 'tenant1' } 
     });
     const res = await singleVendorRouter.fetch(req, mockEnv as any);
@@ -66,7 +66,7 @@ describe('GET /orders/:id/track — order tracking redirect (T-CVC-02)', () => {
 
   it('returns 404 for non-existent order', async () => {
     mockDb.first.mockResolvedValue(null);
-    const req = new Request('http://test/orders/ord_notfound/track', { 
+    const req = new Request('http://test/cmrc_orders/ord_notfound/track', { 
       headers: { 'x-tenant-id': 'tenant1' } 
     });
     const res = await singleVendorRouter.fetch(req, mockEnv as any);

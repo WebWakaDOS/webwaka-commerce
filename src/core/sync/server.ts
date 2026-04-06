@@ -74,7 +74,7 @@ syncRouter.post('/sync', async (c) => {
 
           const lockResult = await updateWithVersionLock(
             c.env.DB,
-            'products',
+            'cmrc_products',
             { quantity: item.newQuantity },
             { id: item.productId, tenantId, expectedVersion: item.knownVersion },
           );
@@ -103,7 +103,7 @@ syncRouter.post('/sync', async (c) => {
       if (c.env?.DB) {
         try {
           const row = await c.env.DB.prepare(
-            `SELECT version FROM sync_versions
+            `SELECT version FROM cmrc_sync_versions
              WHERE tenant_id = ? AND entity_type = ? AND entity_id = ?
              LIMIT 1`,
           )
@@ -129,7 +129,7 @@ syncRouter.post('/sync', async (c) => {
         if (c.env?.DB) {
           try {
             await c.env.DB.prepare(
-              `INSERT INTO sync_versions (tenant_id, entity_type, entity_id, version, updated_at)
+              `INSERT INTO cmrc_sync_versions (tenant_id, entity_type, entity_id, version, updated_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT (tenant_id, entity_type, entity_id)
                DO UPDATE SET version = excluded.version, updated_at = excluded.updated_at`,

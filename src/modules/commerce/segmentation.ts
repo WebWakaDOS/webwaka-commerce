@@ -2,7 +2,7 @@
  * WebWaka — Customer Segmentation
  * Implementation Plan §3 Item 17 — Customer Segmentation
  *
- * Group customers based on purchase history and Lifetime Value (LTV):
+ * Group cmrc_customers based on purchase history and Lifetime Value (LTV):
  *   - RFM Model: Recency (last purchase), Frequency (order count), Monetary (total spend)
  *   - Segments: CHAMPIONS, LOYAL, AT_RISK, LOST, NEW, POTENTIAL_LOYALIST, CANT_LOSE
  *   - Segment data drives Abandoned Cart recovery, promo targeting, and loyalty tiers
@@ -18,9 +18,9 @@ import type { Env } from '../../worker';
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type CustomerSegmentLabel =
-  | 'CHAMPIONS'          // High R, High F, High M — best customers
+  | 'CHAMPIONS'          // High R, High F, High M — best cmrc_customers
   | 'LOYAL_CUSTOMERS'    // High F, High M, moderate R
-  | 'POTENTIAL_LOYALIST' // Recent customers with moderate frequency
+  | 'POTENTIAL_LOYALIST' // Recent cmrc_customers with moderate frequency
   | 'NEW_CUSTOMERS'      // Recent first-time buyers
   | 'AT_RISK'            // Formerly frequent, not purchased recently
   | 'CANT_LOSE_THEM'     // High spend historically, long dormant
@@ -33,7 +33,7 @@ export interface RFMScore {
   customerPhone?: string;
   customerEmail?: string;
   recencyDays: number;           // days since last purchase (lower = better)
-  frequencyCount: number;        // number of orders
+  frequencyCount: number;        // number of cmrc_orders
   monetaryKobo: number;          // total spend
   rScore: number;                // 1-5 (5 = best)
   fScore: number;
@@ -79,7 +79,7 @@ export function classifySegment(r: number, f: number, m: number): CustomerSegmen
 // ─── D1 aggregation ───────────────────────────────────────────────────────────
 
 /**
- * Compute RFM scores for all customers of a tenant using order history.
+ * Compute RFM scores for all cmrc_customers of a tenant using order history.
  * Runs a single aggregation query to avoid N+1 pattern.
  */
 export async function computeRfmScores(
@@ -110,7 +110,7 @@ export async function computeRfmScores(
               MIN(created_at) as first_order_at,
               COUNT(*) as order_count,
               SUM(total_amount) as total_spend_kobo
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND created_at >= ?
          AND order_status NOT IN ('CANCELLED', 'FAILED')
          AND customer_phone IS NOT NULL
@@ -167,7 +167,7 @@ export async function computeRfmScores(
 }
 
 /**
- * Get customers in a specific segment.
+ * Get cmrc_customers in a specific segment.
  */
 export async function getSegmentCustomers(
   db: D1Database,
@@ -210,7 +210,7 @@ segmentationRouter.get(
       data: {
         total_customers: scores.length,
         segment_summary: summary,
-        customers: filtered,
+        cmrc_customers: filtered,
         lookback_days: lookbackDays,
       },
     });

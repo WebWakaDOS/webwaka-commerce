@@ -1,7 +1,7 @@
 /**
  * COM-3: Multi-Vendor Marketplace API — Phase MV-1 + MV-2 + MV-3 Tests
  * L2 QA Layer: Auth, vendor isolation, tenant isolation, security hardening,
- *              cross-vendor catalog (FTS5/LIKE, KV cache), marketplace cart, umbrella orders.
+ *              cross-vendor catalog (FTS5/LIKE, KV cache), marketplace cart, umbrella cmrc_orders.
  * Invariants: vendor JWT scoping, tenant isolation, admin-key guard, NDPR, Nigeria-First
  *
  * Test count: MV-1 (40) + MV-2 (28) + MV-3 (50+) = 118+ total
@@ -142,7 +142,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data).toHaveProperty('total_products');
     });
 
-    it('returns zeros when no active vendors or products', async () => {
+    it('returns zeros when no active cmrc_vendors or cmrc_products', async () => {
       mockDb.first.mockResolvedValueOnce({ count: 0 }).mockResolvedValueOnce({ count: 0 });
       const res = await multiVendorRouter.fetch(makeRequest('GET', '/'), mockEnv as any);
       const data = await res.json() as any;
@@ -156,20 +156,20 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('GET /vendors (public — active only)', () => {
-    it('returns only active vendors', async () => {
+  describe('GET /cmrc_vendors (public — active only)', () => {
+    it('returns only active cmrc_vendors', async () => {
       mockDb.all.mockResolvedValue({
         results: [{ id: 'vnd_1', name: 'Vendor A', status: 'active' }],
       });
-      const res = await multiVendorRouter.fetch(makeRequest('GET', '/vendors'), mockEnv as any);
+      const res = await multiVendorRouter.fetch(makeRequest('GET', '/cmrc_vendors'), mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
       expect(data.success).toBe(true);
       expect(data.data).toHaveLength(1);
     });
 
-    it('returns empty array when no active vendors', async () => {
-      const res = await multiVendorRouter.fetch(makeRequest('GET', '/vendors'), mockEnv as any);
+    it('returns empty array when no active cmrc_vendors', async () => {
+      const res = await multiVendorRouter.fetch(makeRequest('GET', '/cmrc_vendors'), mockEnv as any);
       const data = await res.json() as any;
       expect(data.data).toEqual([]);
     });
@@ -178,7 +178,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.all.mockResolvedValue({
         results: [{ id: 'vnd_1', name: 'Vendor A', status: 'active', email: 'a@b.com' }],
       });
-      const res = await multiVendorRouter.fetch(makeRequest('GET', '/vendors'), mockEnv as any);
+      const res = await multiVendorRouter.fetch(makeRequest('GET', '/cmrc_vendors'), mockEnv as any);
       const data = await res.json() as any;
       expect(data.data[0]).not.toHaveProperty('bank_account');
       expect(data.data[0]).not.toHaveProperty('commission_rate');
@@ -189,10 +189,10 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   // MV-1 NEW TESTS: ADMIN AUTH GUARD
   // ───────────────────────────────────────────────────────────────────────────
 
-  describe('POST /vendors — admin authentication (G-2 fix)', () => {
+  describe('POST /cmrc_vendors — admin authentication (G-2 fix)', () => {
     it('returns 401 without x-admin-key', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('POST', '/vendors', { name: 'X', slug: 'x', email: 'x@x.com' }),
+        makeRequest('POST', '/cmrc_vendors', { name: 'X', slug: 'x', email: 'x@x.com' }),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -203,7 +203,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('registers vendor when admin key provided', async () => {
       mockDb.first.mockResolvedValue(null); // slug uniqueness check — no existing
       const res = await multiVendorRouter.fetch(
-        makeAdminRequest('POST', '/vendors', { name: 'Ade Stores', slug: 'ade-stores', email: 'ade@example.com', phone: '+2348012345678', commission_rate: 800 }),
+        makeAdminRequest('POST', '/cmrc_vendors', { name: 'Ade Stores', slug: 'ade-stores', email: 'ade@example.com', phone: '+2348012345678', commission_rate: 800 }),
         mockEnv as any,
       );
       expect(res.status).toBe(201);
@@ -214,7 +214,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('generates vendor ID with vnd_ prefix', async () => {
       mockDb.first.mockResolvedValue(null);
       const res = await multiVendorRouter.fetch(
-        makeAdminRequest('POST', '/vendors', { name: 'Bola Shop', slug: 'bola-shop', email: 'bola@example.com' }),
+        makeAdminRequest('POST', '/cmrc_vendors', { name: 'Bola Shop', slug: 'bola-shop', email: 'bola@example.com' }),
         mockEnv as any,
       );
       const data = await res.json() as any;
@@ -224,7 +224,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('rejects duplicate slug — Nigeria-First uniqueness guard', async () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_existing' }); // slug already taken
       const res = await multiVendorRouter.fetch(
-        makeAdminRequest('POST', '/vendors', { name: 'Dupe Shop', slug: 'existing-slug', email: 'dupe@example.com' }),
+        makeAdminRequest('POST', '/cmrc_vendors', { name: 'Dupe Shop', slug: 'existing-slug', email: 'dupe@example.com' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -234,7 +234,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
 
     it('requires name field', async () => {
       const res = await multiVendorRouter.fetch(
-        makeAdminRequest('POST', '/vendors', { slug: 'no-name', email: 'a@b.com' }),
+        makeAdminRequest('POST', '/cmrc_vendors', { slug: 'no-name', email: 'a@b.com' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -243,10 +243,10 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('PATCH /vendors/:id — admin authentication (G-2 fix)', () => {
+  describe('PATCH /cmrc_vendors/:id — admin authentication (G-2 fix)', () => {
     it('returns 401 without x-admin-key', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('PATCH', '/vendors/vnd_1', { status: 'active' }),
+        makeRequest('PATCH', '/cmrc_vendors/vnd_1', { status: 'active' }),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -255,7 +255,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('activates vendor with admin key', async () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1' }); // vendor exists
       const res = await multiVendorRouter.fetch(
-        makeAdminRequest('PATCH', '/vendors/vnd_1', { status: 'active' }),
+        makeAdminRequest('PATCH', '/cmrc_vendors/vnd_1', { status: 'active' }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -263,7 +263,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
 
     it('rejects invalid status values', async () => {
       const res = await multiVendorRouter.fetch(
-        makeAdminRequest('PATCH', '/vendors/vnd_1', { status: 'hacked' }),
+        makeAdminRequest('PATCH', '/cmrc_vendors/vnd_1', { status: 'hacked' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -274,7 +274,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 404 when vendor not found in this marketplace', async () => {
       mockDb.first.mockResolvedValue(null); // vendor doesn't exist for this tenant
       const res = await multiVendorRouter.fetch(
-        makeAdminRequest('PATCH', '/vendors/vnd_notexist', { status: 'active' }),
+        makeAdminRequest('PATCH', '/cmrc_vendors/vnd_notexist', { status: 'active' }),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -285,10 +285,10 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   // MV-1 NEW TESTS: VENDOR JWT AUTH + ISOLATION
   // ───────────────────────────────────────────────────────────────────────────
 
-  describe('POST /vendors/:id/products — vendor JWT + ownership (SEC-8 fix)', () => {
+  describe('POST /cmrc_vendors/:id/cmrc_products — vendor JWT + ownership (SEC-8 fix)', () => {
     it('returns 401 without JWT', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('POST', '/vendors/vnd_1/products', { sku: 'X', name: 'X', price: 1000, quantity: 1 }),
+        makeRequest('POST', '/cmrc_vendors/vnd_1/cmrc_products', { sku: 'X', name: 'X', price: 1000, quantity: 1 }),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -297,7 +297,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('adds product when vendor owns the catalog', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/products', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/cmrc_products', token, {
           sku: 'VND-001', name: 'Ankara Fabric', price: 35000, quantity: 50,
         }),
         mockEnv as any,
@@ -307,10 +307,10 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data.vendor_id).toBe('vnd_1');
     });
 
-    it('returns 403 when vendor tries to add products to ANOTHER vendor — isolation', async () => {
+    it('returns 403 when vendor tries to add cmrc_products to ANOTHER vendor — isolation', async () => {
       const token = await makeVendorToken('vnd_A', 'tnt_test'); // JWT belongs to vendor A
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_B/products', token, { // trying to add to vendor B
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_B/cmrc_products', token, { // trying to add to vendor B
           sku: 'INTRUDER-001', name: 'Fake Product', price: 1000, quantity: 1,
         }),
         mockEnv as any,
@@ -323,7 +323,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 401 with expired JWT', async () => {
       const token = await makeExpiredVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/products', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/cmrc_products', token, {
           sku: 'EXP-001', name: 'Test', price: 1000, quantity: 1,
         }),
         mockEnv as any,
@@ -334,7 +334,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('rejects non-integer price — kobo validation', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/products', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/cmrc_products', token, {
           sku: 'FLOAT-001', name: 'Bad Price', price: 35.50, quantity: 1,
         }),
         mockEnv as any,
@@ -347,7 +347,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when JWT tenant does not match request tenant — cross-tenant isolation', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_DIFFERENT'); // JWT for different marketplace
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/products', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/cmrc_products', token, {
           sku: 'XTENANT-001', name: 'Cross Tenant', price: 1000, quantity: 1,
         }, 'tnt_test'), // request for tnt_test
         mockEnv as any,
@@ -356,10 +356,10 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('PATCH /vendors/:id/products/:productId — vendor product update', () => {
+  describe('PATCH /cmrc_vendors/:id/cmrc_products/:productId — vendor product update', () => {
     it('returns 401 without JWT', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('PATCH', '/vendors/vnd_1/products/prod_1', { name: 'Updated Name', price: 40000, quantity: 10 }),
+        makeRequest('PATCH', '/cmrc_vendors/vnd_1/cmrc_products/prod_1', { name: 'Updated Name', price: 40000, quantity: 10 }),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -368,7 +368,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when vendor tries to edit another vendor\'s product', async () => {
       const token = await makeVendorToken('vnd_A', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('PATCH', '/vendors/vnd_B/products/prod_1', token, { name: 'Hack', price: 1000, quantity: 1 }),
+        makeVendorRequest('PATCH', '/cmrc_vendors/vnd_B/cmrc_products/prod_1', token, { name: 'Hack', price: 1000, quantity: 1 }),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -380,7 +380,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       mockDb.first.mockResolvedValueOnce(null); // product lookup returns null
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('PATCH', '/vendors/vnd_1/products/prod_nonexistent', token, { name: 'X', price: 1000, quantity: 1 }),
+        makeVendorRequest('PATCH', '/cmrc_vendors/vnd_1/cmrc_products/prod_nonexistent', token, { name: 'X', price: 1000, quantity: 1 }),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -391,7 +391,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValueOnce({ id: 'prod_1' }); // existing product
       mockDb.run.mockResolvedValueOnce({ success: true });
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('PATCH', '/vendors/vnd_1/products/prod_1', token, { name: 'Updated Fabric', price: 42000, quantity: 45 }),
+        makeVendorRequest('PATCH', '/cmrc_vendors/vnd_1/cmrc_products/prod_1', token, { name: 'Updated Fabric', price: 42000, quantity: 45 }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -404,7 +404,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       mockDb.first.mockResolvedValueOnce({ id: 'prod_1' }); // product exists check
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('PATCH', '/vendors/vnd_1/products/prod_1', token, { name: 'X', price: 42.5, quantity: 1 }),
+        makeVendorRequest('PATCH', '/cmrc_vendors/vnd_1/cmrc_products/prod_1', token, { name: 'X', price: 42.5, quantity: 1 }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -413,10 +413,10 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('DELETE /vendors/:id/products/:productId — vendor product delete', () => {
+  describe('DELETE /cmrc_vendors/:id/cmrc_products/:productId — vendor product delete', () => {
     it('returns 401 without JWT', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('DELETE', '/vendors/vnd_1/products/prod_1'),
+        makeRequest('DELETE', '/cmrc_vendors/vnd_1/cmrc_products/prod_1'),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -425,7 +425,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when vendor tries to delete another vendor\'s product', async () => {
       const token = await makeVendorToken('vnd_A', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('DELETE', '/vendors/vnd_B/products/prod_1', token, {}),
+        makeVendorRequest('DELETE', '/cmrc_vendors/vnd_B/cmrc_products/prod_1', token, {}),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -437,7 +437,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       mockDb.first.mockResolvedValueOnce(null);
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('DELETE', '/vendors/vnd_1/products/prod_nonexistent', token, {}),
+        makeVendorRequest('DELETE', '/cmrc_vendors/vnd_1/cmrc_products/prod_nonexistent', token, {}),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -448,7 +448,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValueOnce({ id: 'prod_1' });
       mockDb.run.mockResolvedValueOnce({ success: true });
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('DELETE', '/vendors/vnd_1/products/prod_1', token, {}),
+        makeVendorRequest('DELETE', '/cmrc_vendors/vnd_1/cmrc_products/prod_1', token, {}),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -458,11 +458,11 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('GET /vendors/:id/products/:productId/variants — public product variants', () => {
+  describe('GET /cmrc_vendors/:id/cmrc_products/:productId/variants — public product variants', () => {
     it('returns 404 when product not found', async () => {
       mockDb.first.mockResolvedValueOnce(null);
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/vendors/vnd_1/products/prod_nonexistent/variants'),
+        makeRequest('GET', '/cmrc_vendors/vnd_1/cmrc_products/prod_nonexistent/variants'),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -478,7 +478,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         ],
       });
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/vendors/vnd_1/products/prod_1/variants'),
+        makeRequest('GET', '/cmrc_vendors/vnd_1/cmrc_products/prod_1/variants'),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -493,7 +493,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValueOnce({ id: 'prod_1' });
       mockDb.all.mockResolvedValueOnce({ results: [] });
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/vendors/vnd_1/products/prod_1/variants'),
+        makeRequest('GET', '/cmrc_vendors/vnd_1/cmrc_products/prod_1/variants'),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -503,19 +503,19 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('GET /orders — vendor JWT scoped (G-2 fix)', () => {
+  describe('GET /cmrc_orders — vendor JWT scoped (G-2 fix)', () => {
     it('returns 401 without JWT', async () => {
-      const res = await multiVendorRouter.fetch(makeRequest('GET', '/orders'), mockEnv as any);
+      const res = await multiVendorRouter.fetch(makeRequest('GET', '/cmrc_orders'), mockEnv as any);
       expect(res.status).toBe(401);
     });
 
-    it('returns vendor-scoped marketplace orders', async () => {
+    it('returns vendor-scoped marketplace cmrc_orders', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       mockDb.all.mockResolvedValue({
         results: [{ id: 'ord_1', channel: 'marketplace', items_json: '[{"vendor_id":"vnd_1"}]' }],
       });
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', token),
+        makeVendorRequest('GET', '/cmrc_orders', token),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -524,12 +524,12 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data).toHaveLength(1);
     });
 
-    it('vendor A cannot access vendor B orders — DB query is vendor-scoped', async () => {
+    it('vendor A cannot access vendor B cmrc_orders — DB query is vendor-scoped', async () => {
       // Vendor A gets token and queries — mock returns empty (vendor B items only)
       const tokenA = await makeVendorToken('vnd_A', 'tnt_test');
-      mockDb.all.mockResolvedValue({ results: [] }); // no orders contain vnd_A items
+      mockDb.all.mockResolvedValue({ results: [] }); // no cmrc_orders contain vnd_A items
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', tokenA),
+        makeVendorRequest('GET', '/cmrc_orders', tokenA),
         mockEnv as any,
       );
       const data = await res.json() as any;
@@ -673,8 +673,8 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.error).toMatch(/[Tt]enant/i);
     });
 
-    it('GET /vendors only shows vendors from the correct marketplace tenant', async () => {
-      const res = await multiVendorRouter.fetch(makeRequest('GET', '/vendors', undefined, 'tnt_mkp_abuja'), mockEnv as any);
+    it('GET /cmrc_vendors only shows cmrc_vendors from the correct marketplace tenant', async () => {
+      const res = await multiVendorRouter.fetch(makeRequest('GET', '/cmrc_vendors', undefined, 'tnt_mkp_abuja'), mockEnv as any);
       // verify the DB was called with the correct tenant scope
       expect(mockDb.bind).toHaveBeenCalledWith('tnt_mkp_abuja');
     });
@@ -831,13 +831,13 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   // MV-2: KYC SUBMISSION ENDPOINT
   // ─────────────────────────────────────────────────────────────────────────
 
-  describe('POST /vendors/:id/kyc — KYC submission (vendor JWT required)', () => {
+  describe('POST /cmrc_vendors/:id/kyc — KYC submission (vendor JWT required)', () => {
     const validBvnHash = 'a'.repeat(64);
     const validNinHash = 'b'.repeat(64);
 
     it('returns 401 without vendor JWT', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('POST', '/vendors/vnd_1/kyc', { rc_number: 'RC-123456' }),
+        makeRequest('POST', '/cmrc_vendors/vnd_1/kyc', { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -846,7 +846,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when vendor tries to submit KYC for another vendor', async () => {
       const token = await makeVendorToken('vnd_A', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_B/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_B/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -857,7 +857,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when JWT tenant does not match header tenant', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_OTHER');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }, 'tnt_test'),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }, 'tnt_test'),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -866,7 +866,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when no KYC identifiers provided', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {}),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {}),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -877,7 +877,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bvn_hash is not a valid SHA-256 hex string', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: 'not-a-hash' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { bvn_hash: 'not-a-hash' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -888,7 +888,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when nin_hash is not 64 hex chars', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { nin_hash: 'tooshort' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { nin_hash: 'tooshort' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -899,7 +899,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bank_details account_number is not 10 digits', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-123456',
           bank_details: { bank_code: '058', account_number: '12345', account_name: 'ADE STORES' },
         }),
@@ -913,7 +913,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bank_details is missing account_name', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-123456',
           bank_details: { bank_code: '058', account_number: '0123456789', account_name: '' },
         }),
@@ -928,7 +928,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'submitted' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -940,7 +940,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'under_review' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -950,7 +950,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'approved' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -962,7 +962,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue(null);
       const token = await makeVendorToken('vnd_ghost', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_ghost/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_ghost/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -972,7 +972,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'none' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -985,7 +985,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' }); // re-submission after rejection
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-1234567',
           bvn_hash: validBvnHash,
           nin_hash: validNinHash,
@@ -1004,7 +1004,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: validBvnHash }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { bvn_hash: validBvnHash }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -1015,7 +1015,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const before = Date.now();
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
         mockEnv as any,
       );
       const after = Date.now();
@@ -1026,7 +1026,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // MV-2: DASHBOARD SCOPING (additional ledger / orders validation)
+  // MV-2: DASHBOARD SCOPING (additional ledger / cmrc_orders validation)
   // ─────────────────────────────────────────────────────────────────────────
 
   describe('Dashboard scoping — GET /ledger revenue aggregation', () => {
@@ -1061,8 +1061,8 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('Dashboard scoping — GET /orders vendor filter', () => {
-    it('only returns orders from the marketplace channel', async () => {
+  describe('Dashboard scoping — GET /cmrc_orders vendor filter', () => {
+    it('only returns cmrc_orders from the marketplace channel', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       mockDb.all.mockResolvedValue({
         results: [
@@ -1070,7 +1070,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         ],
       });
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', token),
+        makeVendorRequest('GET', '/cmrc_orders', token),
         mockEnv as any,
       );
       const data = await res.json() as any;
@@ -1081,7 +1081,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_xyz', 'tnt_test');
       mockDb.all.mockResolvedValue({ results: [] });
       await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', token),
+        makeVendorRequest('GET', '/cmrc_orders', token),
         mockEnv as any,
       );
       const bindArgs = mockDb.bind.mock.calls.flat();
@@ -1103,7 +1103,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         vendor_name: 'Chidi Electronics', vendor_slug: 'chidi-elec', rating_avg: null, rating_count: null, created_at: 2000 },
     ];
 
-    it('returns 200 with cross-vendor products from active vendors', async () => {
+    it('returns 200 with cross-vendor cmrc_products from active cmrc_vendors', async () => {
       mockDb.all.mockResolvedValue({ results: catalogRows });
       const res = await multiVendorRouter.fetch(
         makeRequest('GET', '/catalog'),
@@ -1138,7 +1138,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data[0]).not.toHaveProperty('cost_price');
     });
 
-    it('returns empty data array when no active vendor products', async () => {
+    it('returns empty data array when no active vendor cmrc_products', async () => {
       mockDb.all.mockResolvedValue({ results: [] });
       const res = await multiVendorRouter.fetch(
         makeRequest('GET', '/catalog'),
@@ -1324,9 +1324,9 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // MV-3: PUBLIC ORDER TRACKING — GET /orders/track
+  // MV-3: PUBLIC ORDER TRACKING — GET /cmrc_orders/track
   // ─────────────────────────────────────────────────────────────────────────
-  describe('GET /orders/track — buyer order tracking (MV-3)', () => {
+  describe('GET /cmrc_orders/track — buyer order tracking (MV-3)', () => {
     const umbrellaRow = {
       id: 'mkp_order_abc123', payment_status: 'pending', order_status: 'confirmed',
       vendor_count: 2, total_amount: 3500000,
@@ -1347,7 +1347,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       };
       const envWithBinding = { ...mockEnv, LOGISTICS_WORKER: mockLogisticsWorker };
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_order_abc123'),
+        makeRequest('GET', '/cmrc_orders/track?marketplace_order_id=mkp_order_abc123'),
         envWithBinding as any,
       );
       expect(res.status).toBe(302);
@@ -1359,7 +1359,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.all.mockResolvedValue({ results: childOrders });
       // No LOGISTICS_WORKER in mockEnv
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_order_abc123'),
+        makeRequest('GET', '/cmrc_orders/track?marketplace_order_id=mkp_order_abc123'),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -1372,7 +1372,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 404 when marketplace_order_id is not found', async () => {
       mockDb.first.mockResolvedValue(null);
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_nonexistent'),
+        makeRequest('GET', '/cmrc_orders/track?marketplace_order_id=mkp_nonexistent'),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -1382,7 +1382,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
 
     it('returns 400 when marketplace_order_id param is missing', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/orders/track'),
+        makeRequest('GET', '/cmrc_orders/track'),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -1394,7 +1394,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue(umbrellaRow);
       mockDb.all.mockResolvedValue({ results: [] });
       const res = await multiVendorRouter.fetch(
-        makeRequest('GET', '/orders/track?marketplace_order_id=mkp_order_abc123'),
+        makeRequest('GET', '/cmrc_orders/track?marketplace_order_id=mkp_order_abc123'),
         mockEnv as any,
       );
       const data = await res.json() as any;
@@ -1405,7 +1405,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('does not require authentication (public endpoint)', async () => {
       mockDb.first.mockResolvedValue(umbrellaRow);
       mockDb.all.mockResolvedValue({ results: [] });
-      const req = new Request('http://localhost/orders/track?marketplace_order_id=mkp_order_abc123', {
+      const req = new Request('http://localhost/cmrc_orders/track?marketplace_order_id=mkp_order_abc123', {
         headers: { 'x-tenant-id': 'tnt_test' },
       });
       const res = await multiVendorRouter.fetch(req, mockEnv as any);
@@ -1528,7 +1528,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(bd.vnd_2.subtotal).toBe(2400000); // 1200000 * 2
     });
 
-    it('total_amount is the sum across all vendors', async () => {
+    it('total_amount is the sum across all cmrc_vendors', async () => {
       const res = await multiVendorRouter.fetch(
         makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
         mockEnv as any,
@@ -1537,7 +1537,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data.total_amount).toBe(2500000 + 2400000);
     });
 
-    it('vendor_count matches the number of unique vendors', async () => {
+    it('vendor_count matches the number of unique cmrc_vendors', async () => {
       const res = await multiVendorRouter.fetch(
         makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
         mockEnv as any,
@@ -1791,13 +1791,13 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   // MV-2: KYC SUBMISSION ENDPOINT
   // ─────────────────────────────────────────────────────────────────────────
 
-  describe('POST /vendors/:id/kyc — KYC submission (vendor JWT required)', () => {
+  describe('POST /cmrc_vendors/:id/kyc — KYC submission (vendor JWT required)', () => {
     const validBvnHash = 'a'.repeat(64);
     const validNinHash = 'b'.repeat(64);
 
     it('returns 401 without vendor JWT', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('POST', '/vendors/vnd_1/kyc', { rc_number: 'RC-123456' }),
+        makeRequest('POST', '/cmrc_vendors/vnd_1/kyc', { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -1806,7 +1806,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when vendor tries to submit KYC for another vendor', async () => {
       const token = await makeVendorToken('vnd_A', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_B/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_B/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -1817,7 +1817,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when JWT tenant does not match header tenant', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_OTHER');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }, 'tnt_test'),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }, 'tnt_test'),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -1826,7 +1826,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when no KYC identifiers provided', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {}),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {}),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -1837,7 +1837,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bvn_hash is not a valid SHA-256 hex string', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: 'not-a-hash' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { bvn_hash: 'not-a-hash' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -1848,7 +1848,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when nin_hash is not 64 hex chars', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { nin_hash: 'tooshort' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { nin_hash: 'tooshort' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -1859,7 +1859,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bank_details account_number is not 10 digits', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-123456',
           bank_details: { bank_code: '058', account_number: '12345', account_name: 'ADE STORES' },
         }),
@@ -1873,7 +1873,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bank_details is missing account_name', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-123456',
           bank_details: { bank_code: '058', account_number: '0123456789', account_name: '' },
         }),
@@ -1888,7 +1888,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'submitted' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -1900,7 +1900,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'under_review' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -1910,7 +1910,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'approved' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -1922,7 +1922,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue(null);
       const token = await makeVendorToken('vnd_ghost', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_ghost/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_ghost/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -1932,7 +1932,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'none' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -1945,7 +1945,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' }); // re-submission after rejection
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-1234567',
           bvn_hash: validBvnHash,
           nin_hash: validNinHash,
@@ -1964,7 +1964,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: validBvnHash }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { bvn_hash: validBvnHash }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -1975,7 +1975,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const before = Date.now();
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
         mockEnv as any,
       );
       const after = Date.now();
@@ -1986,7 +1986,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // MV-2: DASHBOARD SCOPING (additional ledger / orders validation)
+  // MV-2: DASHBOARD SCOPING (additional ledger / cmrc_orders validation)
   // ─────────────────────────────────────────────────────────────────────────
 
   describe('Dashboard scoping — GET /ledger revenue aggregation', () => {
@@ -2021,8 +2021,8 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('Dashboard scoping — GET /orders vendor filter', () => {
-    it('only returns orders from the marketplace channel', async () => {
+  describe('Dashboard scoping — GET /cmrc_orders vendor filter', () => {
+    it('only returns cmrc_orders from the marketplace channel', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       mockDb.all.mockResolvedValue({
         results: [
@@ -2030,7 +2030,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         ],
       });
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', token),
+        makeVendorRequest('GET', '/cmrc_orders', token),
         mockEnv as any,
       );
       const data = await res.json() as any;
@@ -2041,7 +2041,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_xyz', 'tnt_test');
       mockDb.all.mockResolvedValue({ results: [] });
       await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', token),
+        makeVendorRequest('GET', '/cmrc_orders', token),
         mockEnv as any,
       );
       const bindArgs = mockDb.bind.mock.calls.flat();
@@ -2063,7 +2063,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         vendor_name: 'Chidi Electronics', vendor_slug: 'chidi-elec', rating_avg: null, rating_count: null, created_at: 2000 },
     ];
 
-    it('returns 200 with cross-vendor products from active vendors', async () => {
+    it('returns 200 with cross-vendor cmrc_products from active cmrc_vendors', async () => {
       mockDb.all.mockResolvedValue({ results: catalogRows });
       const res = await multiVendorRouter.fetch(
         makeRequest('GET', '/catalog'),
@@ -2098,7 +2098,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data[0]).not.toHaveProperty('cost_price');
     });
 
-    it('returns empty data array when no active vendor products', async () => {
+    it('returns empty data array when no active vendor cmrc_products', async () => {
       mockDb.all.mockResolvedValue({ results: [] });
       const res = await multiVendorRouter.fetch(
         makeRequest('GET', '/catalog'),
@@ -2370,7 +2370,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(bd.vnd_2.subtotal).toBe(2400000); // 1200000 * 2
     });
 
-    it('total_amount is the sum across all vendors', async () => {
+    it('total_amount is the sum across all cmrc_vendors', async () => {
       const res = await multiVendorRouter.fetch(
         makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
         mockEnv as any,
@@ -2379,7 +2379,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data.total_amount).toBe(2500000 + 2400000);
     });
 
-    it('vendor_count matches the number of unique vendors', async () => {
+    it('vendor_count matches the number of unique cmrc_vendors', async () => {
       const res = await multiVendorRouter.fetch(
         makeRequest('POST', '/cart', { items: twoVendorItems, ndpr_consent: true }),
         mockEnv as any,
@@ -2633,13 +2633,13 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   // MV-2: KYC SUBMISSION ENDPOINT
   // ─────────────────────────────────────────────────────────────────────────
 
-  describe('POST /vendors/:id/kyc — KYC submission (vendor JWT required)', () => {
+  describe('POST /cmrc_vendors/:id/kyc — KYC submission (vendor JWT required)', () => {
     const validBvnHash = 'a'.repeat(64);
     const validNinHash = 'b'.repeat(64);
 
     it('returns 401 without vendor JWT', async () => {
       const res = await multiVendorRouter.fetch(
-        makeRequest('POST', '/vendors/vnd_1/kyc', { rc_number: 'RC-123456' }),
+        makeRequest('POST', '/cmrc_vendors/vnd_1/kyc', { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(401);
@@ -2648,7 +2648,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when vendor tries to submit KYC for another vendor', async () => {
       const token = await makeVendorToken('vnd_A', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_B/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_B/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -2659,7 +2659,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 403 when JWT tenant does not match header tenant', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_OTHER');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }, 'tnt_test'),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }, 'tnt_test'),
         mockEnv as any,
       );
       expect(res.status).toBe(403);
@@ -2668,7 +2668,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when no KYC identifiers provided', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {}),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {}),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -2679,7 +2679,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bvn_hash is not a valid SHA-256 hex string', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: 'not-a-hash' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { bvn_hash: 'not-a-hash' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -2690,7 +2690,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when nin_hash is not 64 hex chars', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { nin_hash: 'tooshort' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { nin_hash: 'tooshort' }),
         mockEnv as any,
       );
       expect(res.status).toBe(400);
@@ -2701,7 +2701,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bank_details account_number is not 10 digits', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-123456',
           bank_details: { bank_code: '058', account_number: '12345', account_name: 'ADE STORES' },
         }),
@@ -2715,7 +2715,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     it('returns 400 when bank_details is missing account_name', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-123456',
           bank_details: { bank_code: '058', account_number: '0123456789', account_name: '' },
         }),
@@ -2730,7 +2730,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'submitted' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -2742,7 +2742,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'under_review' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -2752,7 +2752,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'approved' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(409);
@@ -2764,7 +2764,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue(null);
       const token = await makeVendorToken('vnd_ghost', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_ghost/kyc', token, { rc_number: 'RC-123456' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_ghost/kyc', token, { rc_number: 'RC-123456' }),
         mockEnv as any,
       );
       expect(res.status).toBe(404);
@@ -2774,7 +2774,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'none' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -2787,7 +2787,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' }); // re-submission after rejection
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, {
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, {
           rc_number: 'RC-1234567',
           bvn_hash: validBvnHash,
           nin_hash: validNinHash,
@@ -2806,7 +2806,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       mockDb.first.mockResolvedValue({ id: 'vnd_1', kyc_status: 'rejected' });
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { bvn_hash: validBvnHash }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { bvn_hash: validBvnHash }),
         mockEnv as any,
       );
       expect(res.status).toBe(200);
@@ -2817,7 +2817,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       const before = Date.now();
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('POST', '/vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
+        makeVendorRequest('POST', '/cmrc_vendors/vnd_1/kyc', token, { rc_number: 'RC-1234567' }),
         mockEnv as any,
       );
       const after = Date.now();
@@ -2828,7 +2828,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // MV-2: DASHBOARD SCOPING (additional ledger / orders validation)
+  // MV-2: DASHBOARD SCOPING (additional ledger / cmrc_orders validation)
   // ─────────────────────────────────────────────────────────────────────────
 
   describe('Dashboard scoping — GET /ledger revenue aggregation', () => {
@@ -2863,7 +2863,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
     });
   });
 
-  describe('Dashboard scoping — GET /orders vendor filter', () => {
+  describe('Dashboard scoping — GET /cmrc_orders vendor filter', () => {
     const cartItemsMv3 = [
       { product_id: 'prod_1', vendor_id: 'vnd_1', vendor_name: 'Ade', name: 'Aso-Oke', price: 2500000, quantity: 1 },
       { product_id: 'prod_2', vendor_id: 'vnd_2', vendor_name: 'Chidi', name: 'Speaker', price: 600000, quantity: 2 },
@@ -2882,7 +2882,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       created_at: Date.now() - 1000,
       updated_at: Date.now(),
     };
-    it('only returns orders from the marketplace channel', async () => {
+    it('only returns cmrc_orders from the marketplace channel', async () => {
       const token = await makeVendorToken('vnd_1', 'tnt_test');
       mockDb.all.mockResolvedValue({
         results: [
@@ -2890,7 +2890,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
         ],
       });
       const res = await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', token),
+        makeVendorRequest('GET', '/cmrc_orders', token),
         mockEnv as any,
       );
       const data = await res.json() as any;
@@ -2901,7 +2901,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       const token = await makeVendorToken('vnd_xyz', 'tnt_test');
       mockDb.all.mockResolvedValue({ results: [] });
       await multiVendorRouter.fetch(
-        makeVendorRequest('GET', '/orders', token),
+        makeVendorRequest('GET', '/cmrc_orders', token),
         mockEnv as any,
       );
       const bindArgs = mockDb.bind.mock.calls.flat();
@@ -2950,7 +2950,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data.item_count).toBe(3); // 1 + 2
     });
 
-    it('vendor_count matches number of vendors in breakdown', async () => {
+    it('vendor_count matches number of cmrc_vendors in breakdown', async () => {
       mockDb.first.mockResolvedValue(mockCartRow);
       const res = await multiVendorRouter.fetch(
         makeRequest('GET', '/cart/cart_mkp_abc123'),
@@ -3082,7 +3082,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(bd.vnd_1.payout).toBe(2500000 - bd.vnd_1.commission);
     });
 
-    it('vendor_count matches the number of distinct vendors in items', async () => {
+    it('vendor_count matches the number of distinct cmrc_vendors in items', async () => {
       mockDb.first.mockResolvedValue({ commission_rate: 800 });
       const res = await multiVendorRouter.fetch(
         makeRequest('POST', '/checkout', checkoutBody),
@@ -3153,14 +3153,14 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data.payment_reference).toMatch(/^pay_mkp_/);
     });
 
-    it('inserts umbrella record into marketplace_orders (DB INSERT called)', async () => {
+    it('inserts umbrella record into cmrc_marketplace_orders (DB INSERT called)', async () => {
       mockDb.first.mockResolvedValue({ commission_rate: 1000 });
       await multiVendorRouter.fetch(
         makeRequest('POST', '/checkout', checkoutBody),
         mockEnv as any,
       );
       const insertCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!).filter(
-        (sql: string) => sql.includes('marketplace_orders'),
+        (sql: string) => sql.includes('cmrc_marketplace_orders'),
       );
       expect(insertCalls.length).toBeGreaterThanOrEqual(1);
     });
@@ -3207,7 +3207,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data.item_count).toBe(3); // 1 + 2
     });
 
-    it('vendor_count matches number of vendors in breakdown', async () => {
+    it('vendor_count matches number of cmrc_vendors in breakdown', async () => {
       mockDb.first.mockResolvedValue(mockCartRow);
       const res = await multiVendorRouter.fetch(
         makeRequest('GET', '/cart/cart_mkp_abc123'),
@@ -3321,7 +3321,7 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(bd.vnd_1.payout).toBe(2500000 - bd.vnd_1.commission);
     });
 
-    it('vendor_count matches the number of distinct vendors in items', async () => {
+    it('vendor_count matches the number of distinct cmrc_vendors in items', async () => {
       mockDb.first.mockResolvedValue({ commission_rate: 800 });
       const res = await multiVendorRouter.fetch(
         makeRequest('POST', '/checkout', checkoutBody),
@@ -3392,14 +3392,14 @@ describe('COM-3 MV-1: Multi-Vendor Marketplace API', () => {
       expect(data.data.payment_reference).toMatch(/^pay_mkp_/);
     });
 
-    it('inserts umbrella record into marketplace_orders (DB INSERT called)', async () => {
+    it('inserts umbrella record into cmrc_marketplace_orders (DB INSERT called)', async () => {
       mockDb.first.mockResolvedValue({ commission_rate: 1000 });
       await multiVendorRouter.fetch(
         makeRequest('POST', '/checkout', checkoutBody),
         mockEnv as any,
       );
       const insertCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!).filter(
-        (sql: string) => sql.includes('marketplace_orders'),
+        (sql: string) => sql.includes('cmrc_marketplace_orders'),
       );
       expect(insertCalls.length).toBeGreaterThanOrEqual(1);
     });
@@ -3611,9 +3611,9 @@ describe('MV-4 Settlement escrow math', () => {
       .map((c: unknown[]) => c)
       .filter((args: unknown[]) => args.some((a: unknown) => typeof a === 'string' && (a as string).startsWith('stl_')));
     const holdUntilArg = insertCalls.length > 0 ? insertCalls[0] : null;
-    // Verify settlements INSERT was called (hold_until is a bind argument)
+    // Verify cmrc_settlements INSERT was called (hold_until is a bind argument)
     const allSqlCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
-    expect(allSqlCalls.some((sql: string) => sql.includes('settlements'))).toBe(true);
+    expect(allSqlCalls.some((sql: string) => sql.includes('cmrc_settlements'))).toBe(true);
     // Verify hold_until > before (escrow in future)
     if (holdUntilArg) {
       const holdUntilVal = holdUntilArg.find((a: unknown) => typeof a === 'number' && (a as number) > before + 5 * 86400000);
@@ -3649,7 +3649,7 @@ describe('MV-4 Settlement escrow math', () => {
     expect(d.data.vendor_breakdown.vnd_x.payout).toBe(950000);
   });
 
-  it('multiple vendors each get their own settlement_id and hold_until', async () => {
+  it('multiple cmrc_vendors each get their own settlement_id and hold_until', async () => {
     mockDb.first.mockResolvedValue({ commission_rate: 1000, settlement_hold_days: 7 });
     const res = await multiVendorRouter.fetch(
       makeRequest('POST', '/checkout', {
@@ -3709,7 +3709,7 @@ describe('MV-4 Settlement escrow math', () => {
     // Settlement amount = payout (not subtotal)
     const settlementInserts = mockDb.prepare.mock.calls
       .map((c: string[]) => c[0]!)
-      .filter((sql: string) => sql.includes('INSERT OR IGNORE INTO settlements'));
+      .filter((sql: string) => sql.includes('INSERT OR IGNORE INTO cmrc_settlements'));
     expect(settlementInserts.length).toBeGreaterThanOrEqual(1);
   });
 });
@@ -3766,7 +3766,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
     expect(d.success).toBe(true);
   });
 
-  it('charge.success updates orders payment_status to paid', async () => {
+  it('charge.success updates cmrc_orders payment_status to paid', async () => {
     const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
     const req = new Request('http://localhost/paystack/webhook', {
       method: 'POST',
@@ -3775,11 +3775,11 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
     });
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
     const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
-    const orderUpdate = updateCalls.find((sql: string) => sql.includes("payment_status = 'paid'") && sql.includes('orders'));
+    const orderUpdate = updateCalls.find((sql: string) => sql.includes("payment_status = 'paid'") && sql.includes('cmrc_orders'));
     expect(orderUpdate).toBeDefined();
   });
 
-  it('charge.success promotes eligible held settlements', async () => {
+  it('charge.success promotes eligible held cmrc_settlements', async () => {
     const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
     const req = new Request('http://localhost/paystack/webhook', {
       method: 'POST',
@@ -3788,7 +3788,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
     });
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
     const settlementUpdate = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!)
-      .find((sql: string) => sql.includes("'eligible'") && sql.includes('settlements'));
+      .find((sql: string) => sql.includes("'eligible'") && sql.includes('cmrc_settlements'));
     expect(settlementUpdate).toBeDefined();
   });
 
@@ -3806,7 +3806,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
     const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     const payoutUpdate = updateCalls.find((sql: string) =>
-      sql.includes("status = 'paid'") && sql.includes('payout_requests'),
+      sql.includes("status = 'paid'") && sql.includes('cmrc_payout_requests'),
     );
     expect(payoutUpdate).toBeDefined();
   });
@@ -3823,7 +3823,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
     expect(res.status).toBe(200);
   });
 
-  it('logs webhook event to paystack_webhook_log table', async () => {
+  it('logs webhook event to cmrc_paystack_webhook_log table', async () => {
     const sig = await makeWebhookSignature(PAYSTACK_SECRET, webhookBody);
     const req = new Request('http://localhost/paystack/webhook', {
       method: 'POST',
@@ -3832,7 +3832,7 @@ describe('MV-4 POST /paystack/webhook — HMAC-SHA512 signature verification', (
     });
     await multiVendorRouter.fetch(req, mockEnvWithPaystack as any);
     const insertLog = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!)
-      .find((sql: string) => sql.includes('paystack_webhook_log'));
+      .find((sql: string) => sql.includes('cmrc_paystack_webhook_log'));
     expect(insertLog).toBeDefined();
   });
 
@@ -4065,8 +4065,8 @@ describe('MV-4 POST /delivery-zones', () => {
   });
 });
 
-// ── Suite 6: Vendor settlements listing (9 tests) ────────────────────────────
-describe('MV-4 GET /vendors/:id/settlements', () => {
+// ── Suite 6: Vendor cmrc_settlements listing (9 tests) ────────────────────────────
+describe('MV-4 GET /cmrc_vendors/:id/cmrc_settlements', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mockDb.prepare.mockReturnThis();
@@ -4078,7 +4078,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
 
   it('returns 401 when no JWT provided', async () => {
     const res = await multiVendorRouter.fetch(
-      makeRequest('GET', '/vendors/vnd_1/settlements'),
+      makeRequest('GET', '/cmrc_vendors/vnd_1/cmrc_settlements'),
       mockEnv as any,
     );
     expect(res.status).toBe(401);
@@ -4086,17 +4086,17 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
 
   it('returns 403 when JWT vendor_id does not match route :id', async () => {
     const token = await makeVendorToken('vnd_other', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
     expect(res.status).toBe(403);
   });
 
-  it('returns empty list when no settlements exist', async () => {
+  it('returns empty list when no cmrc_settlements exist', async () => {
     mockDb.all.mockResolvedValue({ results: [] });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
@@ -4107,7 +4107,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
     expect(d.meta.held_total).toBe(0);
   });
 
-  it('computes eligible_total from settlements with status=eligible', async () => {
+  it('computes eligible_total from cmrc_settlements with status=eligible', async () => {
     const now = Date.now();
     mockDb.all.mockResolvedValue({
       results: [
@@ -4116,7 +4116,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
       ],
     });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
@@ -4125,20 +4125,20 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
     expect(d.meta.held_total).toBe(450000);
   });
 
-  it('promotes held→eligible settlements past hold_until before listing', async () => {
+  it('promotes held→eligible cmrc_settlements past hold_until before listing', async () => {
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     await multiVendorRouter.fetch(req, mockEnv as any);
     const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     const promotionUpdate = updateCalls.find((sql: string) =>
-      sql.includes("'eligible'") && sql.includes('settlements') && sql.includes('hold_until'),
+      sql.includes("'eligible'") && sql.includes('cmrc_settlements') && sql.includes('hold_until'),
     );
     expect(promotionUpdate).toBeDefined();
   });
 
-  it('returns total_count in meta matching number of settlements returned', async () => {
+  it('returns total_count in meta matching number of cmrc_settlements returned', async () => {
     const now = Date.now();
     mockDb.all.mockResolvedValue({
       results: [
@@ -4148,7 +4148,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
       ],
     });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
@@ -4158,7 +4158,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
 
   it('expired JWT is rejected with 401', async () => {
     const expiredToken = await makeExpiredVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${expiredToken}` },
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
@@ -4167,19 +4167,19 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
 
   it('settlement query scoped to tenant_id (tenant isolation)', async () => {
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     await multiVendorRouter.fetch(req, mockEnv as any);
     const settlementQueryCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!)
-      .filter((sql: string) => sql.includes('FROM settlements'));
+      .filter((sql: string) => sql.includes('FROM cmrc_settlements'));
     expect(settlementQueryCalls.length).toBeGreaterThanOrEqual(1);
   });
 
   it('returns success:true with data array regardless of empty results', async () => {
     mockDb.all.mockResolvedValue({ results: null }); // simulate null results edge case
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/settlements', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/cmrc_settlements', {
       headers: { 'x-tenant-id': 'tnt_test', Authorization: `Bearer ${token}` },
     });
     const res = await multiVendorRouter.fetch(req, mockEnv as any);
@@ -4190,7 +4190,7 @@ describe('MV-4 GET /vendors/:id/settlements', () => {
 });
 
 // ── Suite 7: Payout requests (10 tests) ──────────────────────────────────────
-describe('MV-4 POST /vendors/:id/payout-request', () => {
+describe('MV-4 POST /cmrc_vendors/:id/payout-request', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mockDb.prepare.mockReturnThis();
@@ -4203,7 +4203,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
 
   it('returns 401 when no JWT provided', async () => {
     const res = await multiVendorRouter.fetch(
-      makeRequest('POST', '/vendors/vnd_1/payout-request', {}),
+      makeRequest('POST', '/cmrc_vendors/vnd_1/payout-request', {}),
       mockEnv as any,
     );
     expect(res.status).toBe(401);
@@ -4211,7 +4211,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
 
   it('returns 403 when JWT vendor_id does not match route :id', async () => {
     const token = await makeVendorToken('vnd_other', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4224,7 +4224,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
     // First first() call = existingPayout SELECT → returns the pending record → 409
     mockDb.first.mockResolvedValueOnce({ id: 'pr_existing', status: 'pending' });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4235,11 +4235,11 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
     expect(d.error).toMatch(/already/i);
   });
 
-  it('returns 422 when no eligible settlements exist', async () => {
+  it('returns 422 when no eligible cmrc_settlements exist', async () => {
     mockDb.first.mockResolvedValue(null); // no existing payout
-    mockDb.all.mockResolvedValue({ results: [] }); // no eligible settlements
+    mockDb.all.mockResolvedValue({ results: [] }); // no eligible cmrc_settlements
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4258,7 +4258,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
       results: [{ id: 'stl_1', amount: 900000 }, { id: 'stl_2', amount: 450000 }],
     });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4277,7 +4277,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
       results: [{ id: 'stl_1', amount: 900000 }, { id: 'stl_2', amount: 450000 }],
     });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4287,7 +4287,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
     expect(d.data.amount).toBe(1350000);
   });
 
-  it('settlement_count in response matches number of eligible settlements', async () => {
+  it('settlement_count in response matches number of eligible cmrc_settlements', async () => {
     mockDb.first
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ bank_details_json: null });
@@ -4295,7 +4295,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
       results: [{ id: 'stl_1', amount: 900000 }, { id: 'stl_2', amount: 450000 }, { id: 'stl_3', amount: 300000 }],
     });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4305,13 +4305,13 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
     expect(d.data.settlement_count).toBe(3);
   });
 
-  it('updates settlements to released status and links payout_request_id', async () => {
+  it('updates cmrc_settlements to released status and links payout_request_id', async () => {
     mockDb.first
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ bank_details_json: null });
     mockDb.all.mockResolvedValue({ results: [{ id: 'stl_1', amount: 900000 }] });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4319,7 +4319,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
     await multiVendorRouter.fetch(req, mockEnv as any);
     const updateCalls = mockDb.prepare.mock.calls.map((c: string[]) => c[0]!);
     const settlementUpdate = updateCalls.find((sql: string) =>
-      sql.includes("status = 'released'") && sql.includes('settlements'),
+      sql.includes("status = 'released'") && sql.includes('cmrc_settlements'),
     );
     expect(settlementUpdate).toBeDefined();
   });
@@ -4330,7 +4330,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
       .mockResolvedValueOnce({ bank_details_json: null });
     mockDb.all.mockResolvedValue({ results: [{ id: 'stl_1', amount: 500000 }] });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4343,7 +4343,7 @@ describe('MV-4 POST /vendors/:id/payout-request', () => {
   it('processing status is also blocked (409) like pending', async () => {
     mockDb.first.mockResolvedValueOnce({ id: 'pr_processing', status: 'processing' });
     const token = await makeVendorToken('vnd_1', 'tnt_test');
-    const req = new Request('http://localhost/vendors/vnd_1/payout-request', {
+    const req = new Request('http://localhost/cmrc_vendors/vnd_1/payout-request', {
       method: 'POST',
       headers: { 'x-tenant-id': 'tnt_test', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({}),
@@ -4942,7 +4942,7 @@ describe('T-COM-05: Automated RMA Workflow', () => {
 
   // ── POST /rma/:id/vendor-dispute ─────────────────────────────────────────────
 
-  it('vendor disputes RMA → status ADMIN_REVIEW', async () => {
+  it('vendor cmrc_disputes RMA → status ADMIN_REVIEW', async () => {
     const token = await makeVendorToken('vnd_seller', 'tnt_test');
     mockDb.first.mockResolvedValueOnce({ ...MOCK_RMA });
     const res = await multiVendorRouter.fetch(
@@ -5129,7 +5129,7 @@ describe('T-COM-05: Automated RMA Workflow', () => {
       mockEnv as any,
     );
     expect(res.status).toBe(201);
-    // rma_requests INSERT was called (proves request was persisted before events)
+    // cmrc_rma_requests INSERT was called (proves request was persisted before events)
     expect(mockDb.run).toHaveBeenCalled();
   });
 

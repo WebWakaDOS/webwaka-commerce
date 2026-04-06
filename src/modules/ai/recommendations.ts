@@ -43,7 +43,7 @@ export async function computeCoOccurrenceMatrix(
        JOIN order_items oi2
          ON oi1.order_id = oi2.order_id
          AND oi1.product_id < oi2.product_id
-       JOIN orders o ON o.id = oi1.order_id
+       JOIN cmrc_orders o ON o.id = oi1.order_id
        WHERE o.tenant_id = ?
          AND o.created_at >= ?
          AND o.order_status NOT IN ('CANCELLED', 'FAILED')
@@ -100,19 +100,19 @@ export async function getRecommendations(
   const productIds = ranked.map((r) => r.productId);
   const placeholders = productIds.map(() => '?').join(',');
   interface ProductRow { id: string; name: string; price: number; image_url: string | null; sku: string }
-  let products: ProductRow[] = [];
+  let cmrc_products: ProductRow[] = [];
   try {
     const { results } = await db.prepare(
-      `SELECT id, name, price, image_url, sku FROM products
+      `SELECT id, name, price, image_url, sku FROM cmrc_products
        WHERE id IN (${placeholders}) AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL`
     ).bind(...productIds, tenantId).all<ProductRow>();
-    products = results;
+    cmrc_products = results;
   } catch {
     return [];
   }
 
   const scoreMap = new Map(ranked.map((r) => [r.productId, r.score]));
-  const recommendations: RecommendedProduct[] = products
+  const recommendations: RecommendedProduct[] = cmrc_products
     .map((p) => ({
       productId: p.id,
       productName: p.name,
@@ -140,7 +140,7 @@ async function fetchProductNames(db: D1Database, tenantId: string, productIds: s
   if (!productIds.length) return [];
   const placeholders = productIds.map(() => '?').join(',');
   const { results } = await db.prepare(
-    `SELECT name FROM products WHERE id IN (${placeholders}) AND tenant_id = ?`
+    `SELECT name FROM cmrc_products WHERE id IN (${placeholders}) AND tenant_id = ?`
   ).bind(...productIds, tenantId).all<{ name: string }>();
   return results.map((r) => r.name);
 }

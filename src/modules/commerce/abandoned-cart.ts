@@ -102,7 +102,7 @@ export async function processAbandonedCarts(
     const { results } = await db.prepare(
       `SELECT id, customer_phone, customer_name, total_kobo, abandoned_at,
               nudge_step, session_token, last_nudge_at
-       FROM abandoned_carts
+       FROM cmrc_abandoned_carts
        WHERE tenant_id = ? AND recovered_at IS NULL AND nudge_step < 3
          AND abandoned_at > ?
        ORDER BY abandoned_at ASC LIMIT 100`
@@ -138,7 +138,7 @@ export async function processAbandonedCarts(
       const expiry = now + 7 * 24 * 60 * 60 * 1000;
       try {
         await db.prepare(
-          `INSERT OR IGNORE INTO promo_codes
+          `INSERT OR IGNORE INTO cmrc_promo_codes
              (id, tenant_id, code, discount_type, discount_value, min_order_kobo,
               max_uses, current_uses, expires_at, is_active, created_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?)`
@@ -158,7 +158,7 @@ export async function processAbandonedCarts(
       await sms.sendMessage(cart.customer_phone, message);
 
       await db.prepare(
-        `UPDATE abandoned_carts SET nudge_step = ?, last_nudge_at = ?,
+        `UPDATE cmrc_abandoned_carts SET nudge_step = ?, last_nudge_at = ?,
          promo_code_applied = COALESCE(?, promo_code_applied), updated_at = ?
          WHERE id = ? AND tenant_id = ?`
       ).bind(nextStep, now, promoCode ?? null, now, cart.id, tenantId).run();
@@ -192,7 +192,7 @@ export async function markCartAbandoned(
   const now = Date.now();
   try {
     await db.prepare(
-      `INSERT OR IGNORE INTO abandoned_carts
+      `INSERT OR IGNORE INTO cmrc_abandoned_carts
          (id, tenant_id, session_token, customer_id, customer_phone, customer_email,
           items_json, total_kobo, abandoned_at, nudge_step, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
@@ -215,7 +215,7 @@ export async function markCartRecovered(
 ): Promise<void> {
   try {
     await db.prepare(
-      `UPDATE abandoned_carts SET recovered_at = ?, updated_at = ?
+      `UPDATE cmrc_abandoned_carts SET recovered_at = ?, updated_at = ?
        WHERE tenant_id = ? AND session_token = ? AND recovered_at IS NULL`
     ).bind(Date.now(), Date.now(), tenantId, sessionToken).run();
   } catch { /* non-fatal */ }
@@ -240,7 +240,7 @@ abandonedCartRouter.get(
       const { results } = await c.env.DB.prepare(
         `SELECT id, session_token, customer_phone, customer_email, total_kobo,
                 abandoned_at, nudge_step, recovered_at, created_at
-         FROM abandoned_carts
+         FROM cmrc_abandoned_carts
          WHERE tenant_id = ? AND recovered_at IS NULL
          ORDER BY abandoned_at DESC LIMIT 100`
       ).bind(tenantId).all();

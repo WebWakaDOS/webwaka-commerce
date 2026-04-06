@@ -233,7 +233,7 @@ dynamicPricingRouter.post('/evaluate', async (c) => {
       id: string; name: string; price: number; quantity: number; low_stock_threshold: number | null;
     }
     const product = await c.env.DB.prepare(
-      'SELECT id, name, price, quantity, low_stock_threshold FROM products WHERE id = ? AND tenant_id = ?'
+      'SELECT id, name, price, quantity, low_stock_threshold FROM cmrc_products WHERE id = ? AND tenant_id = ?'
     ).bind(body.product_id, tenantId).first<ProductRow>();
 
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
@@ -250,7 +250,7 @@ dynamicPricingRouter.post('/evaluate', async (c) => {
     const salesRow = await c.env.DB.prepare(
       `SELECT COALESCE(SUM(oi.quantity), 0) as units_sold
        FROM order_items oi
-       JOIN orders o ON o.id = oi.order_id
+       JOIN cmrc_orders o ON o.id = oi.order_id
        WHERE o.tenant_id = ? AND oi.product_id = ? AND o.created_at >= ?
          AND o.order_status NOT IN ('CANCELLED', 'FAILED')`
     ).bind(tenantId, body.product_id, since24h).first<{ units_sold: number }>();

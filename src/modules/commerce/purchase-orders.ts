@@ -2,7 +2,7 @@
  * WebWaka — Purchase Order (PO) Generator
  * Implementation Plan §3 Item 15 — Purchase Order Generator
  *
- * Automatically generates POs for suppliers when stock falls below the
+ * Automatically generates POs for cmrc_suppliers when stock falls below the
  * reorder point. Integrates with Inventory Forecasting for smart quantities.
  *
  * Features:
@@ -104,8 +104,8 @@ export function buildPurchaseOrder(params: {
 // ─── Auto-PO generation ───────────────────────────────────────────────────────
 
 /**
- * Scan low-stock products and auto-generate draft POs for each supplier.
- * Groups products by supplier_id (or 'DEFAULT_SUPPLIER' if not set).
+ * Scan low-stock cmrc_products and auto-generate draft POs for each supplier.
+ * Groups cmrc_products by supplier_id (or 'DEFAULT_SUPPLIER' if not set).
  * Returns the count of POs created.
  */
 export async function generateAutoPOs(
@@ -120,28 +120,28 @@ export async function generateAutoPOs(
     supplier_phone: string | null;
   }
 
-  let products: LowStockProduct[] = [];
+  let cmrc_products: LowStockProduct[] = [];
   try {
     const { results } = await db.prepare(
       `SELECT p.id, p.name, p.sku, p.quantity,
               p.reorder_qty, p.unit_cost_kobo,
               s.id as supplier_id, s.name as supplier_name, s.phone as supplier_phone
-       FROM products p
-       LEFT JOIN suppliers s ON s.id = p.supplier_id
+       FROM cmrc_products p
+       LEFT JOIN cmrc_suppliers s ON s.id = p.supplier_id
        WHERE p.tenant_id = ? AND p.is_active = 1 AND p.deleted_at IS NULL
          AND p.quantity <= COALESCE(p.low_stock_threshold, ?)
        ORDER BY p.quantity ASC LIMIT 100`
     ).bind(tenantId, reorderThreshold).all<LowStockProduct>();
-    products = results;
+    cmrc_products = results;
   } catch {
     return 0;
   }
 
-  if (!products.length) return 0;
+  if (!cmrc_products.length) return 0;
 
   // Group by supplier
   const supplierGroups = new Map<string, LowStockProduct[]>();
-  for (const p of products) {
+  for (const p of cmrc_products) {
     const key = p.supplier_id ?? 'DEFAULT';
     if (!supplierGroups.has(key)) supplierGroups.set(key, []);
     supplierGroups.get(key)!.push(p);
@@ -170,7 +170,7 @@ export async function generateAutoPOs(
 
     try {
       await db.prepare(
-        `INSERT INTO purchase_orders
+        `INSERT INTO cmrc_purchase_orders
            (id, po_number, tenant_id, supplier_id, supplier_name, supplier_phone,
             line_items_json, subtotal_kobo, vat_kobo, total_kobo, status,
             is_auto_generated, created_at, updated_at)
@@ -197,7 +197,7 @@ purchaseOrdersRouter.use('*', async (c, next) => {
   await next();
 });
 
-/** GET /api/commerce/purchase-orders */
+/** GET /api/commerce/purchase-cmrc_orders */
 purchaseOrdersRouter.get(
   '/',
   requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
@@ -206,7 +206,7 @@ purchaseOrdersRouter.get(
     const status = c.req.query('status') ?? '';
     try {
       const params: (string | number)[] = [tenantId];
-      let query = 'SELECT id, po_number, supplier_name, total_kobo, status, is_auto_generated, created_at FROM purchase_orders WHERE tenant_id = ?';
+      let query = 'SELECT id, po_number, supplier_name, total_kobo, status, is_auto_generated, created_at FROM cmrc_purchase_orders WHERE tenant_id = ?';
       if (status) { query += ' AND status = ?'; params.push(status); }
       query += ' ORDER BY created_at DESC LIMIT 50';
       const { results } = await c.env.DB.prepare(query).bind(...params).all();
@@ -218,7 +218,7 @@ purchaseOrdersRouter.get(
   }
 );
 
-/** POST /api/commerce/purchase-orders */
+/** POST /api/commerce/purchase-cmrc_orders */
 purchaseOrdersRouter.post(
   '/',
   requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
@@ -256,7 +256,7 @@ purchaseOrdersRouter.post(
 
     try {
       await c.env.DB.prepare(
-        `INSERT INTO purchase_orders
+        `INSERT INTO cmrc_purchase_orders
            (id, po_number, tenant_id, supplier_id, supplier_name, supplier_phone,
             line_items_json, subtotal_kobo, vat_kobo, total_kobo, status,
             expected_delivery_at, notes, is_auto_generated, created_at, updated_at)
@@ -289,7 +289,7 @@ purchaseOrdersRouter.post(
   }
 );
 
-/** PATCH /api/commerce/purchase-orders/:id/status */
+/** PATCH /api/commerce/purchase-cmrc_orders/:id/status */
 purchaseOrdersRouter.patch(
   '/:id/status',
   requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
@@ -303,7 +303,7 @@ purchaseOrdersRouter.patch(
     }
     try {
       await c.env.DB.prepare(
-        'UPDATE purchase_orders SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?'
+        'UPDATE cmrc_purchase_orders SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?'
       ).bind(body.status, Date.now(), id, tenantId).run();
 
       // If RECEIVED, bump product quantities (if received_items provided)
@@ -315,7 +315,7 @@ purchaseOrdersRouter.patch(
   }
 );
 
-/** POST /api/commerce/purchase-orders/auto-generate */
+/** POST /api/commerce/purchase-cmrc_orders/auto-generate */
 purchaseOrdersRouter.post(
   '/auto-generate',
   requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),

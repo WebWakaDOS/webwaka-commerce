@@ -82,7 +82,7 @@ export interface B2BOrder {
 }
 
 export interface MinimumOrderRule {
-  productId?: string;          // null = applies to all products
+  productId?: string;          // null = applies to all cmrc_products
   categoryId?: string;
   minQuantity: number;
   minValueKobo?: number;
@@ -141,7 +141,7 @@ const CREDIT_TERM_DAYS: Record<CreditTerm, number | null> = {
 
 /**
  * Compute the payment due date (epoch ms) for a credit-term order.
- * Returns null for PREPAID orders.
+ * Returns null for PREPAID cmrc_orders.
  */
 export function computePaymentDueAt(
   creditTerm: CreditTerm,

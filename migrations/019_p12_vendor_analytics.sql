@@ -1,6 +1,6 @@
 -- P12: Vendor Analytics Dashboard (MV-E15)
 
-CREATE TABLE IF NOT EXISTS vendor_daily_analytics (
+CREATE TABLE IF NOT EXISTS cmrc_vendor_daily_analytics (
   id                  TEXT PRIMARY KEY,
   vendorId            TEXT NOT NULL,
   tenantId            TEXT NOT NULL,
@@ -11,4 +11,4 @@ CREATE TABLE IF NOT EXISTS vendor_daily_analytics (
   repeatBuyerCount    INTEGER NOT NULL DEFAULT 0,
   UNIQUE(vendorId, tenantId, date)
 );
-CREATE INDEX IF NOT EXISTS idx_vendor_daily_analytics_vendor ON vendor_daily_analytics(tenantId, vendorId, date);
+CREATE INDEX IF NOT EXISTS idx_vendor_daily_analytics_vendor ON cmrc_vendor_daily_analytics(tenantId, vendorId, date);

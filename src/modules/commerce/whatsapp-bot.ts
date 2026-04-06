@@ -2,7 +2,7 @@
  * WebWaka — WhatsApp Commerce Bot
  * Implementation Plan §3 Item 20 — WhatsApp Commerce Bot
  *
- * Allow customers to browse and order directly via WhatsApp using Termii's
+ * Allow cmrc_customers to browse and order directly via WhatsApp using Termii's
  * WhatsApp Business API. Implements a stateful conversation flow:
  *
  *   1. Customer sends "Hi" or "Menu" → bot replies with product catalog
@@ -91,19 +91,19 @@ function formatKoboToNaira(kobo: number): string {
 }
 
 function buildMenuMessage(
-  products: Array<{ id: string; name: string; price: number; quantity: number }>,
+  cmrc_products: Array<{ id: string; name: string; price: number; quantity: number }>,
   page: number,
   perPage = 5,
 ): string {
   const start = page * perPage;
-  const slice = products.slice(start, start + perPage);
-  if (!slice.length) return '🛒 No more products. Reply *CART* to view your cart.';
+  const slice = cmrc_products.slice(start, start + perPage);
+  if (!slice.length) return '🛒 No more cmrc_products. Reply *CART* to view your cart.';
 
   const lines = slice.map(
     (p, i) => `*${start + i + 1}.* ${p.name} — ${formatKoboToNaira(p.price)}${p.quantity <= 0 ? ' _(Out of stock)_' : ''}`,
   );
 
-  const hasMore = products.length > start + perPage;
+  const hasMore = cmrc_products.length > start + perPage;
   const nav = hasMore ? '\nReply *MORE* for next page.' : '';
 
   return `🛍️ *WebWaka Store — Product Menu*\n\n${lines.join('\n')}\n\n${nav}\nReply a number to see details, *CART* to view cart, or *HELP* for commands.`;
@@ -120,18 +120,18 @@ function buildItemDetailMessage(
 function buildCartMessage(
   cart: WaBotSession['cart'],
 ): string {
-  if (!cart.length) return '🛒 Your cart is empty. Reply *MENU* to browse products.';
+  if (!cart.length) return '🛒 Your cart is empty. Reply *MENU* to browse cmrc_products.';
   const lines = cart.map((i) => `• ${i.productName} × ${i.quantity} = ${formatKoboToNaira(i.priceKobo * i.quantity)}`);
   const total = cart.reduce((s, i) => s + i.priceKobo * i.quantity, 0);
   return `🛒 *Your Cart*\n\n${lines.join('\n')}\n\n*Total: ${formatKoboToNaira(total)}*\n\nReply *CHECKOUT* to pay, *CLEAR* to empty cart, or *MENU* to continue shopping.`;
 }
 
 const HELP_MESSAGE = `🤖 *WebWaka Bot Commands*\n
-*MENU* — Browse products
+*MENU* — Browse cmrc_products
 *<number>* — View product details (e.g. "3")
 *ADD* — Add current item to cart
 *CART* — View your cart
-*MORE* — Next page of products
+*MORE* — Next page of cmrc_products
 *CHECKOUT* — Proceed to payment
 *TRACK <order_id>* — Track an order
 *CLEAR* — Empty your cart
@@ -167,47 +167,47 @@ export async function processWhatsAppMessage(
     session.state = 'BROWSING';
     session.lastProductListPage = 0;
     interface ProductRow { id: string; name: string; price: number; quantity: number }
-    let products: ProductRow[] = [];
+    let cmrc_products: ProductRow[] = [];
     try {
       const { results } = await db.prepare(
-        `SELECT id, name, price, quantity FROM products
+        `SELECT id, name, price, quantity FROM cmrc_products
          WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
          ORDER BY name ASC LIMIT 50`
       ).bind(tenantId).all<ProductRow>();
-      products = results;
+      cmrc_products = results;
     } catch { /* DB unavailable */ }
-    reply = buildMenuMessage(products, 0);
+    reply = buildMenuMessage(cmrc_products, 0);
   }
 
   // ── MORE (next page) ──────────────────────────────────────────────────────
   else if (text === 'MORE' && session.state === 'BROWSING') {
     session.lastProductListPage++;
     interface ProductRow { id: string; name: string; price: number; quantity: number }
-    let products: ProductRow[] = [];
+    let cmrc_products: ProductRow[] = [];
     try {
       const { results } = await db.prepare(
-        'SELECT id, name, price, quantity FROM products WHERE tenant_id = ? AND is_active = 1 ORDER BY name ASC LIMIT 50'
+        'SELECT id, name, price, quantity FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 ORDER BY name ASC LIMIT 50'
       ).bind(tenantId).all<ProductRow>();
-      products = results;
+      cmrc_products = results;
     } catch { /* no-op */ }
-    reply = buildMenuMessage(products, session.lastProductListPage);
+    reply = buildMenuMessage(cmrc_products, session.lastProductListPage);
   }
 
   // ── Number selection ──────────────────────────────────────────────────────
   else if (/^\d+$/.test(text) && session.state === 'BROWSING') {
     const idx = parseInt(text, 10) - 1;
     interface ProductRow { id: string; name: string; description: string | null; price: number; quantity: number }
-    let products: ProductRow[] = [];
+    let cmrc_products: ProductRow[] = [];
     try {
       const { results } = await db.prepare(
-        'SELECT id, name, description, price, quantity FROM products WHERE tenant_id = ? AND is_active = 1 ORDER BY name ASC LIMIT 50'
+        'SELECT id, name, description, price, quantity FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 ORDER BY name ASC LIMIT 50'
       ).bind(tenantId).all<ProductRow>();
-      products = results;
+      cmrc_products = results;
     } catch { /* no-op */ }
 
-    const product = products[idx];
+    const product = cmrc_products[idx];
     if (!product) {
-      reply = `❌ Invalid selection. Please reply with a number between 1 and ${products.length}.`;
+      reply = `❌ Invalid selection. Please reply with a number between 1 and ${cmrc_products.length}.`;
     } else {
       session.state = 'ITEM_DETAIL';
       session.lastSelectedProductId = product.id;
@@ -219,7 +219,7 @@ export async function processWhatsAppMessage(
   else if (text === 'ADD' && session.state === 'ITEM_DETAIL' && session.lastSelectedProductId) {
     interface ProductRow { id: string; name: string; price: number; quantity: number }
     const product = await db.prepare(
-      'SELECT id, name, price, quantity FROM products WHERE id = ? AND tenant_id = ?'
+      'SELECT id, name, price, quantity FROM cmrc_products WHERE id = ? AND tenant_id = ?'
     ).bind(session.lastSelectedProductId, tenantId).first<ProductRow>().catch(() => null);
 
     if (!product || product.quantity <= 0) {
@@ -265,7 +265,7 @@ export async function processWhatsAppMessage(
     const orderId = text.replace('TRACK ', '').trim();
     interface OrderRow { id: string; order_status: string; total_amount: number; created_at: number }
     const order = await db.prepare(
-      'SELECT id, order_status, total_amount, created_at FROM orders WHERE id = ? AND tenant_id = ?'
+      'SELECT id, order_status, total_amount, created_at FROM cmrc_orders WHERE id = ? AND tenant_id = ?'
     ).bind(orderId, tenantId).first<OrderRow>().catch(() => null);
 
     if (!order) {

@@ -183,7 +183,7 @@ describe('COM-4: Retail Extensions', () => {
       expect(callback.mock.calls[0]![0].name).toBe('Premium Motor Spirit');
     });
 
-    it('should get module products', () => {
+    it('should get module cmrc_products', () => {
       retailRegistry.addProduct(
         moduleId,
         'PMS001',
@@ -201,10 +201,10 @@ describe('COM-4: Retail Extensions', () => {
         800
       );
 
-      const products = retailRegistry.getModuleProducts(moduleId);
+      const cmrc_products = retailRegistry.getModuleProducts(moduleId);
 
-      expect(products.length).toBe(2);
-      expect(products.every(p => p.moduleId === moduleId)).toBe(true);
+      expect(cmrc_products.length).toBe(2);
+      expect(cmrc_products.every(p => p.moduleId === moduleId)).toBe(true);
     });
 
     it('should get a product by ID', () => {

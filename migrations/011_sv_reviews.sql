@@ -4,7 +4,7 @@
 -- Verified-purchase review system with star ratings
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS product_reviews (
+CREATE TABLE IF NOT EXISTS cmrc_product_reviews (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   product_id TEXT NOT NULL,
@@ -16,11 +16,11 @@ CREATE TABLE IF NOT EXISTS product_reviews (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   deleted_at INTEGER,
-  FOREIGN KEY (product_id) REFERENCES products(id)
+  FOREIGN KEY (product_id) REFERENCES cmrc_products(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_product_reviews_product
-  ON product_reviews(product_id, tenant_id, deleted_at);
+  ON cmrc_product_reviews(product_id, tenant_id, deleted_at);
 
 CREATE INDEX IF NOT EXISTS idx_product_reviews_customer
-  ON product_reviews(tenant_id, customer_phone, deleted_at);
+  ON cmrc_product_reviews(tenant_id, customer_phone, deleted_at);

@@ -1,7 +1,7 @@
 /**
  * WebWaka Commerce Suite — Inventory Sync Service (D1-backed)
  *
- * Replaces the in-memory Map with D1 queries against the `products` table.
+ * Replaces the in-memory Map with D1 queries against the `cmrc_products` table.
  * Conflict resolution strategies (last_write_wins / version_based) are preserved.
  *
  * Design notes:
@@ -69,7 +69,7 @@ export class InventorySyncService {
   private async applySync(item: InventoryItem, resolutionStrategy: string): Promise<void> {
     const existing = await this.db
       .prepare(
-        `SELECT id, version FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
+        `SELECT id, version FROM cmrc_products WHERE id = ? AND tenant_id = ? LIMIT 1`,
       )
       .bind(item.id, item.tenantId)
       .first<{ id: string; version: number }>();
@@ -80,7 +80,7 @@ export class InventorySyncService {
       if (resolutionStrategy === 'last_write_wins') {
         await this.db
           .prepare(
-            `UPDATE products SET quantity = ?, version = ?, updated_at = ?
+            `UPDATE cmrc_products SET quantity = ?, version = ?, updated_at = ?
              WHERE id = ? AND tenant_id = ?`,
           )
           .bind(item.quantity, item.version, now, item.id, item.tenantId)
@@ -89,7 +89,7 @@ export class InventorySyncService {
         if (item.version > existing.version) {
           await this.db
             .prepare(
-              `UPDATE products SET quantity = ?, version = ?, updated_at = ?
+              `UPDATE cmrc_products SET quantity = ?, version = ?, updated_at = ?
                WHERE id = ? AND tenant_id = ?`,
             )
             .bind(item.quantity, item.version, now, item.id, item.tenantId)
@@ -101,7 +101,7 @@ export class InventorySyncService {
     } else {
       await this.db
         .prepare(
-          `INSERT INTO products (id, tenant_id, sku, quantity, version, created_at, updated_at)
+          `INSERT INTO cmrc_products (id, tenant_id, sku, quantity, version, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (id) DO UPDATE SET quantity = excluded.quantity, version = excluded.version, updated_at = excluded.updated_at`,
         )

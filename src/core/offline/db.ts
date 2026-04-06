@@ -2,10 +2,10 @@
  * WebWaka Commerce Suite - Offline-First Dexie Database
  * Invariants: Offline-First, Build Once Use Infinitely
  * Uses IndexedDB via Dexie for client-side offline storage
- * v2: Added pos_receipts, pos_sessions tables for POS Phase 2
+ * v2: Added pos_receipts, cmrc_pos_sessions tables for POS Phase 2
  * v3: Added heldCarts for park/hold sale (POS Phase 4)
  * v4: Added storefrontCarts for single-vendor cart persistence (SV Phase 1)
- * v5: Added wishlists for customer offline wishlist (SV Phase 4)
+ * v5: Added cmrc_wishlists for customer offline wishlist (SV Phase 4)
  * v6: Added mvProducts for multi-vendor marketplace offline product cache (MV Offline-First)
  */
 import Dexie, { type Table } from 'dexie';
@@ -77,7 +77,7 @@ export interface PosReceipt {
   createdAt: number;
 }
 
-// ─── POS local session — mirror of server pos_sessions (Phase 2) ─────────────
+// ─── POS local session — mirror of server cmrc_pos_sessions (Phase 2) ─────────────
 export interface PosLocalSession {
   id: string;          // session_id e.g. sess_...
   tenantId: string;
@@ -243,15 +243,15 @@ export class CommerceOfflineDB extends Dexie {
   mutations!: Table<CommerceMutation, number>;
   cartItems!: Table<OfflineCartItem, number>;
   offlineOrders!: Table<OfflineOrder, number>;
-  products!: Table<OfflineProduct, string>;
+  cmrc_products!: Table<OfflineProduct, string>;
   posReceipts!: Table<PosReceipt, string>;
   posSessions!: Table<PosLocalSession, string>;
   heldCarts!: Table<HeldCart, string>;
   storefrontCarts!: Table<StorefrontCartSession, string>;
-  wishlists!: Table<OfflineWishlistItem, string>;
+  cmrc_wishlists!: Table<OfflineWishlistItem, string>;
   mvProducts!: Table<MvProduct, string>;
   syncConflicts!: Table<SyncConflict, string>; // P0-T02
-  customers!: Table<OfflineCustomer, string>;  // P03
+  cmrc_customers!: Table<OfflineCustomer, string>;  // P03
   onboardingState!: Table<OnboardingState, number>; // P03
   // v9 — COM module caches
   flashSales!: Table<CachedFlashSale, string>;
@@ -268,15 +268,15 @@ export class CommerceOfflineDB extends Dexie {
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, cachedAt',
+      cmrc_products: 'id, tenantId, sku, category, cachedAt',
     });
 
-    // v2 — adds pos_receipts, pos_sessions (Phase 2)
+    // v2 — adds pos_receipts, cmrc_pos_sessions (Phase 2)
     this.version(2).stores({
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, cachedAt',
+      cmrc_products: 'id, tenantId, sku, category, cachedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
     });
@@ -286,7 +286,7 @@ export class CommerceOfflineDB extends Dexie {
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, cachedAt',
+      cmrc_products: 'id, tenantId, sku, category, cachedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
@@ -297,24 +297,24 @@ export class CommerceOfflineDB extends Dexie {
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, cachedAt',
+      cmrc_products: 'id, tenantId, sku, category, cachedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
     });
 
-    // v5 — adds wishlists for customer offline wishlist (SV Phase 4)
+    // v5 — adds cmrc_wishlists for customer offline wishlist (SV Phase 4)
     this.version(5).stores({
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, cachedAt',
+      cmrc_products: 'id, tenantId, sku, category, cachedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
-      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      cmrc_wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
     });
 
     // v6 — adds mvProducts for multi-vendor marketplace offline product cache
@@ -322,12 +322,12 @@ export class CommerceOfflineDB extends Dexie {
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, cachedAt',
+      cmrc_products: 'id, tenantId, sku, category, cachedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
-      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      cmrc_wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
       mvProducts: 'id, tenantId, vendorId, cachedAt',
     });
 
@@ -336,30 +336,30 @@ export class CommerceOfflineDB extends Dexie {
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, cachedAt',
+      cmrc_products: 'id, tenantId, sku, category, cachedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
-      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      cmrc_wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
       mvProducts: 'id, tenantId, vendorId, cachedAt',
       syncConflicts: 'id, tenantId, entityType, resolvedAt',
     });
 
-    // v8 — P03: adds customers + onboardingState stores; extends products index with updatedAt
+    // v8 — P03: adds cmrc_customers + onboardingState stores; extends cmrc_products index with updatedAt
     this.version(8).stores({
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, updatedAt',
+      cmrc_products: 'id, tenantId, sku, category, updatedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
-      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      cmrc_wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
       mvProducts: 'id, tenantId, vendorId, cachedAt',
       syncConflicts: 'id, tenantId, entityType, resolvedAt',
-      customers: 'id, tenantId, phone, updatedAt',
+      cmrc_customers: 'id, tenantId, phone, updatedAt',
       onboardingState: '++id, tenantId, vendorId, step, updatedAt',
     });
 
@@ -369,15 +369,15 @@ export class CommerceOfflineDB extends Dexie {
       mutations: '++id, tenantId, entityType, entityId, status, timestamp',
       cartItems: '++id, tenantId, sessionToken, productId',
       offlineOrders: '++id, localId, tenantId, syncStatus, createdAt',
-      products: 'id, tenantId, sku, category, updatedAt',
+      cmrc_products: 'id, tenantId, sku, category, updatedAt',
       posReceipts: 'id, orderId, tenantId, createdAt',
       posSessions: 'id, tenantId, status, openedAt',
       heldCarts: 'id, tenantId, heldAt',
       storefrontCarts: 'id, tenantId, updatedAt',
-      wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
+      cmrc_wishlists: 'id, tenantId, customerId, productId, syncStatus, addedAt',
       mvProducts: 'id, tenantId, vendorId, cachedAt',
       syncConflicts: 'id, tenantId, entityType, resolvedAt',
-      customers: 'id, tenantId, phone, updatedAt',
+      cmrc_customers: 'id, tenantId, phone, updatedAt',
       onboardingState: '++id, tenantId, vendorId, step, updatedAt',
       // New in v9
       flashSales: 'id, tenantId, status, endsAt',
@@ -560,12 +560,12 @@ export async function toggleWishlistItem(
 ): Promise<'added' | 'removed'> {
   const db = getCommerceDB(tenantId);
   const id = `wl_${tenantId}_${customerId}_${product.id}`;
-  const existing = await db.wishlists.get(id);
+  const existing = await db.cmrc_wishlists.get(id);
   if (existing && existing.syncStatus !== 'REMOVED') {
-    await db.wishlists.update(id, { syncStatus: 'REMOVED' });
+    await db.cmrc_wishlists.update(id, { syncStatus: 'REMOVED' });
     return 'removed';
   }
-  await db.wishlists.put({
+  await db.cmrc_wishlists.put({
     id, tenantId, customerId,
     productId: product.id,
     productName: product.name,
@@ -580,7 +580,7 @@ export async function toggleWishlistItem(
 /** Get all active wishlist items for a customer. */
 export async function getWishlistItems(tenantId: string, customerId: string): Promise<OfflineWishlistItem[]> {
   const db = getCommerceDB(tenantId);
-  return db.wishlists
+  return db.cmrc_wishlists
     .where({ tenantId, customerId })
     .filter(i => i.syncStatus !== 'REMOVED')
     .toArray();
@@ -590,22 +590,22 @@ export async function getWishlistItems(tenantId: string, customerId: string): Pr
 export async function isWishlisted(tenantId: string, customerId: string, productId: string): Promise<boolean> {
   const db = getCommerceDB(tenantId);
   const id = `wl_${tenantId}_${customerId}_${productId}`;
-  const item = await db.wishlists.get(id);
+  const item = await db.cmrc_wishlists.get(id);
   return !!(item && item.syncStatus !== 'REMOVED');
 }
 
 // ─── Multi-Vendor marketplace product helpers (MV Offline-First) ─────────────
 
-/** Load all cached marketplace products for a tenant from IndexedDB. */
+/** Load all cached marketplace cmrc_products for a tenant from IndexedDB. */
 export async function getMvProducts(tenantId: string): Promise<MvProduct[]> {
   const db = getCommerceDB(tenantId);
   return db.mvProducts.where('tenantId').equals(tenantId).toArray();
 }
 
-/** Bulk-write marketplace products to the IndexedDB cache (upsert). */
-export async function cacheMvProducts(tenantId: string, products: MvProduct[]): Promise<void> {
+/** Bulk-write marketplace cmrc_products to the IndexedDB cache (upsert). */
+export async function cacheMvProducts(tenantId: string, cmrc_products: MvProduct[]): Promise<void> {
   const db = getCommerceDB(tenantId);
-  await db.mvProducts.bulkPut(products);
+  await db.mvProducts.bulkPut(cmrc_products);
 }
 
 /** Optimistically decrement a cached product's quantity after checkout. */

@@ -5,28 +5,28 @@
 -- ============================================================
 
 -- Enhanced promo code columns (D1: no IF NOT EXISTS on ADD COLUMN)
-ALTER TABLE promo_codes ADD COLUMN promoType TEXT NOT NULL DEFAULT 'PERCENTAGE';
-ALTER TABLE promo_codes ADD COLUMN minOrderValueKobo INTEGER;
-ALTER TABLE promo_codes ADD COLUMN maxUsesTotal INTEGER;
-ALTER TABLE promo_codes ADD COLUMN maxUsesPerCustomer INTEGER DEFAULT 1;
-ALTER TABLE promo_codes ADD COLUMN validFrom TEXT;
-ALTER TABLE promo_codes ADD COLUMN validUntil TEXT;
-ALTER TABLE promo_codes ADD COLUMN productScope TEXT;
-ALTER TABLE promo_codes ADD COLUMN usedCount INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE cmrc_promo_codes ADD COLUMN promoType TEXT NOT NULL DEFAULT 'PERCENTAGE';
+ALTER TABLE cmrc_promo_codes ADD COLUMN minOrderValueKobo INTEGER;
+ALTER TABLE cmrc_promo_codes ADD COLUMN maxUsesTotal INTEGER;
+ALTER TABLE cmrc_promo_codes ADD COLUMN maxUsesPerCustomer INTEGER DEFAULT 1;
+ALTER TABLE cmrc_promo_codes ADD COLUMN validFrom TEXT;
+ALTER TABLE cmrc_promo_codes ADD COLUMN validUntil TEXT;
+ALTER TABLE cmrc_promo_codes ADD COLUMN productScope TEXT;
+ALTER TABLE cmrc_promo_codes ADD COLUMN usedCount INTEGER NOT NULL DEFAULT 0;
 
 -- Per-customer promo usage tracking
-CREATE TABLE IF NOT EXISTS promo_usage (
+CREATE TABLE IF NOT EXISTS cmrc_promo_usage (
   id TEXT PRIMARY KEY,
   promoId TEXT NOT NULL,
   customerId TEXT NOT NULL,
   tenantId TEXT NOT NULL,
   usedAt TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_promo_usage_promo ON promo_usage(promoId, customerId);
-CREATE INDEX IF NOT EXISTS idx_promo_usage_tenant ON promo_usage(tenantId);
+CREATE INDEX IF NOT EXISTS idx_promo_usage_promo ON cmrc_promo_usage(promoId, customerId);
+CREATE INDEX IF NOT EXISTS idx_promo_usage_tenant ON cmrc_promo_usage(tenantId);
 
 -- Inventory sync audit log
-CREATE TABLE IF NOT EXISTS inventory_sync_log (
+CREATE TABLE IF NOT EXISTS cmrc_inventory_sync_log (
   id TEXT PRIMARY KEY,
   tenantId TEXT NOT NULL,
   productId TEXT NOT NULL,
@@ -34,4 +34,4 @@ CREATE TABLE IF NOT EXISTS inventory_sync_log (
   wishlistNotified INTEGER NOT NULL DEFAULT 0,
   createdAt TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_inventory_sync_log_tenant ON inventory_sync_log(tenantId);
+CREATE INDEX IF NOT EXISTS idx_inventory_sync_log_tenant ON cmrc_inventory_sync_log(tenantId);

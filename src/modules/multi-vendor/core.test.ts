@@ -10,7 +10,7 @@ describe('Multi Vendor Marketplace Core', () => {
     vi.clearAllMocks();
   });
 
-  it('should process checkout, split orders by vendor, and publish events', async () => {
+  it('should process checkout, split cmrc_orders by vendor, and publish events', async () => {
     const mockHandler = vi.fn();
     eventBus.subscribe('order.created', mockHandler);
     eventBus.subscribe('inventory.updated', mockHandler);

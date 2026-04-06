@@ -89,7 +89,7 @@ describe('EventBusRegistry (in-memory)', () => {
     await expect(bus.publish(makeEvent({ type: 'bad.event' }))).resolves.not.toThrow();
   });
 
-  it('global eventBus singleton should work for local-context subscriptions', async () => {
+  it('global eventBus singleton should work for local-context cmrc_subscriptions', async () => {
     const mockHandler = vi.fn();
     eventBus.subscribe('inventory.updated', mockHandler);
 

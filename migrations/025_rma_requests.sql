@@ -2,7 +2,7 @@
 -- T-COM-05: Multi-Vendor Automated RMA Workflow
 -- WebWaka Commerce Suite
 --
--- Adds rma_requests table to track the full return merchandise
+-- Adds cmrc_rma_requests table to track the full return merchandise
 -- authorization lifecycle from customer request to vendor
 -- approval/dispute to admin resolution and fintech escrow release.
 --
@@ -12,7 +12,7 @@
 --     → VENDOR_DISPUTED → ADMIN_REVIEW → REFUNDED | REJECTED
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS rma_requests (
+CREATE TABLE IF NOT EXISTS cmrc_rma_requests (
   id                   TEXT    PRIMARY KEY,
   tenant_id            TEXT    NOT NULL,
   order_id             TEXT    NOT NULL,
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS rma_requests (
 );
 
 -- Fast look-ups used by vendor dashboard and admin panel
-CREATE INDEX IF NOT EXISTS idx_rma_tenant_status   ON rma_requests(tenant_id, status);
-CREATE INDEX IF NOT EXISTS idx_rma_order           ON rma_requests(order_id);
-CREATE INDEX IF NOT EXISTS idx_rma_vendor_tenant   ON rma_requests(vendor_id, tenant_id);
-CREATE INDEX IF NOT EXISTS idx_rma_customer_email  ON rma_requests(customer_email, tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rma_tenant_status   ON cmrc_rma_requests(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_rma_order           ON cmrc_rma_requests(order_id);
+CREATE INDEX IF NOT EXISTS idx_rma_vendor_tenant   ON cmrc_rma_requests(vendor_id, tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rma_customer_email  ON cmrc_rma_requests(customer_email, tenant_id);

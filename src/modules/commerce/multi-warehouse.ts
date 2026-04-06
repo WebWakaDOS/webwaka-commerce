@@ -2,7 +2,7 @@
  * WebWaka — Multi-Warehouse Routing
  * Implementation Plan §3 Item 14 — Multi-Warehouse Management
  *
- * Route orders to the nearest warehouse using haversine distance calculation.
+ * Route cmrc_orders to the nearest warehouse using haversine distance calculation.
  * Each warehouse has:
  *   - GPS coordinates (lat/lng)
  *   - Its own stock levels (separate from global inventory)
@@ -299,7 +299,7 @@ warehouseRouter.get('/:id/stock', async (c) => {
               (ws.quantity_on_hand - ws.quantity_reserved) as quantity_available,
               ws.reorder_point, ws.updated_at
        FROM warehouse_stock ws
-       JOIN products p ON p.id = ws.product_id
+       JOIN cmrc_products p ON p.id = ws.product_id
        WHERE ws.warehouse_id = ? AND ws.tenant_id = ?
        ORDER BY quantity_available ASC`
     ).bind(warehouseId, tenantId).all();

@@ -104,7 +104,7 @@ describe('QA-COM-3 — MOQ Enforcement', () => {
     expect(violations[0]!.requiredQty).toBe(5); // global fallback
   });
 
-  it('skips products with no applicable rule', () => {
+  it('skips cmrc_products with no applicable rule', () => {
     const noRules: MinimumOrderRule[] = []; // empty rules
     expect(validateMoq(ITEMS, noRules)).toHaveLength(0);
   });
@@ -138,7 +138,7 @@ describe('QA-COM-3 — MOQ Enforcement', () => {
 describe('computePaymentDueAt', () => {
   const BASE = 1_700_000_000_000; // fixed epoch for deterministic tests
 
-  it('returns null for PREPAID orders', () => {
+  it('returns null for PREPAID cmrc_orders', () => {
     expect(computePaymentDueAt('PREPAID', BASE)).toBeNull();
   });
 
@@ -234,17 +234,17 @@ describe('buildB2BOrder', () => {
     expect(order.totalKobo).toBeGreaterThanOrEqual(0);
   });
 
-  it('sets status to CREDIT_PENDING for credit-term orders', () => {
+  it('sets status to CREDIT_PENDING for credit-term cmrc_orders', () => {
     const order = buildB2BOrder(baseParams);
     expect(order.status).toBe('CREDIT_PENDING');
   });
 
-  it('sets status to PENDING_PAYMENT for PREPAID orders', () => {
+  it('sets status to PENDING_PAYMENT for PREPAID cmrc_orders', () => {
     const order = buildB2BOrder({ ...baseParams, creditTerm: 'PREPAID' });
     expect(order.status).toBe('PENDING_PAYMENT');
   });
 
-  it('paymentDueAt is null for PREPAID orders', () => {
+  it('paymentDueAt is null for PREPAID cmrc_orders', () => {
     const order = buildB2BOrder({ ...baseParams, creditTerm: 'PREPAID' });
     expect(order.paymentDueAt).toBeUndefined();
   });

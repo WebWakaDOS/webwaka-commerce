@@ -14,38 +14,38 @@ export const jwtAuthMiddleware = coreJwtAuthMiddleware({
     // ── Global ────────────────────────────────────────────────────────────────
     { method: 'GET',  path: '/health' },
     // ── POS (catalog read is public for barcode scanners) ─────────────────────
-    { method: 'GET',  path: '/api/pos/products' },
+    { method: 'GET',  path: '/api/pos/cmrc_products' },
     // ── Single-Vendor: public buyer-facing routes ─────────────────────────────
-    { method: 'GET',  path: '/api/single-vendor/products' },
+    { method: 'GET',  path: '/api/single-vendor/cmrc_products' },
     { method: 'GET',  path: '/api/single-vendor/catalog' },
     { method: 'GET',  path: '/api/single-vendor/catalog/search' },
-    { method: 'GET',  path: '/api/single-vendor/products/by-slug/:slug' },
-    { method: 'GET',  path: '/api/single-vendor/products/:id' },
-    { method: 'GET',  path: '/api/single-vendor/products/:id/variants' },
-    { method: 'GET',  path: '/api/single-vendor/products/:id/reviews' },
+    { method: 'GET',  path: '/api/single-vendor/cmrc_products/by-slug/:slug' },
+    { method: 'GET',  path: '/api/single-vendor/cmrc_products/:id' },
+    { method: 'GET',  path: '/api/single-vendor/cmrc_products/:id/variants' },
+    { method: 'GET',  path: '/api/single-vendor/cmrc_products/:id/reviews' },
     { method: 'POST', path: '/api/single-vendor/cart' },
     { method: 'GET',  path: '/api/single-vendor/cart/:token' },
     { method: 'POST', path: '/api/single-vendor/promo/validate' },
     { method: 'POST', path: '/api/single-vendor/checkout' },
-    { method: 'GET',  path: '/api/single-vendor/orders/:id/track' }, // T-CVC-02: redirects to Logistics portal
+    { method: 'GET',  path: '/api/single-vendor/cmrc_orders/:id/track' }, // T-CVC-02: redirects to Logistics portal
     { method: 'GET',  path: '/api/single-vendor/shipping/estimate' },
     // NOTE: /api/single-vendor/delivery-zones removed (T-CVC-01) — returns 410 Gone
     { method: 'POST', path: '/api/single-vendor/auth/login' },
     { method: 'POST', path: '/api/single-vendor/auth/request-otp' },
     { method: 'POST', path: '/api/single-vendor/auth/verify-otp' },
-    { method: 'GET',  path: '/api/single-vendor/orders/:id/delivery-options' },
+    { method: 'GET',  path: '/api/single-vendor/cmrc_orders/:id/delivery-options' },
     // Paystack webhook — signed with HMAC-SHA512, not a JWT-protected route
     { method: 'POST', path: '/api/single-vendor/paystack/webhook' },
     // ── Multi-Vendor: public buyer-facing routes ───────────────────────────────
-    { method: 'GET',  path: '/api/multi-vendor/vendors' },
-    { method: 'GET',  path: '/api/multi-vendor/vendors/:id' },
-    { method: 'GET',  path: '/api/multi-vendor/vendors/:id/products' },
+    { method: 'GET',  path: '/api/multi-vendor/cmrc_vendors' },
+    { method: 'GET',  path: '/api/multi-vendor/cmrc_vendors/:id' },
+    { method: 'GET',  path: '/api/multi-vendor/cmrc_vendors/:id/cmrc_products' },
     { method: 'GET',  path: '/api/multi-vendor/catalog' },
     { method: 'GET',  path: '/api/multi-vendor/catalog/search' },
     { method: 'POST', path: '/api/multi-vendor/cart' },
     { method: 'GET',  path: '/api/multi-vendor/cart/:token' },
     { method: 'POST', path: '/api/multi-vendor/checkout' },
-    { method: 'GET',  path: '/api/multi-vendor/orders/track' }, // T-CVC-02: redirects to Logistics portal
+    { method: 'GET',  path: '/api/multi-vendor/cmrc_orders/track' }, // T-CVC-02: redirects to Logistics portal
     { method: 'GET',  path: '/api/multi-vendor/shipping/estimate' },
     // Vendor OTP auth — two canonical paths (MV-1 + MV-2 alias)
     { method: 'POST', path: '/api/multi-vendor/auth/vendor-request-otp' },
@@ -71,7 +71,7 @@ export const requireRole = coreRequireRole;
  * NEVER from request headers or body (cross-tenant injection prevention).
  *
  * Usage (inline on a vendor-guarded route):
- *   app.get('/vendor/orders', vendorAuthMiddleware, async (c) => {
+ *   app.get('/vendor/cmrc_orders', vendorAuthMiddleware, async (c) => {
  *     const vendorId = c.get('vendorId');
  *   });
  */

@@ -22,8 +22,9 @@ kv_namespaces = [
 
 [[env.production.d1_databases]]
 binding = "DB"
-database_name = "webwaka-commerce-db-prod"
-database_id   = "1cc45df9-36e5-44d4-8a3b-e8377881c00b"
+database_name = "webwaka-production-db"
+database_id   = "d01940d3-d69e-4455-94ba-bc2404cb3872"
+migrations_dir = "migrations"
 
 # CF Queues — event bus (P0-T01)
 [[env.production.queues.producers]]

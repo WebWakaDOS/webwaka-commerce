@@ -7,10 +7,10 @@
  *   VIP       — loyal customer discounted price
  *   WHOLESALE — bulk buyer discounted price
  *   B2B       — business-to-business negotiated price
- *   STAFF     — internal staff price
+ *   STAFF     — internal cmrc_staff price
  *
  * Price tiers are stored as a JSON blob in the `price_tiers` column on the
- * `products` table (Cloudflare D1). Each tier entry is:
+ * `cmrc_products` table (Cloudflare D1). Each tier entry is:
  *   { segment: CustomerSegment; price_kobo: number; min_quantity?: number }
  *
  * Invariants: Monetary values are integers (kobo). Build Once Use Infinitely.
@@ -125,16 +125,16 @@ export function resolvePriceTierLabel(
 // ─── Catalog enrichment ───────────────────────────────────────────────────────
 
 /**
- * Enrich an array of products with the effective price for a given segment.
+ * Enrich an array of cmrc_products with the effective price for a given segment.
  * Replaces `price` with the tier-resolved value and adds `original_price`
  * so the UI can display savings.
  */
 export function applySegmentPricing<T extends TieredProduct>(
-  products: T[],
+  cmrc_products: T[],
   segment: CustomerSegment,
   quantity = 1,
 ): Array<T & { price: number; original_price: number; tier_label: string }> {
-  return products.map((p) => {
+  return cmrc_products.map((p) => {
     const price = resolvePrice(p, segment, quantity);
     return {
       ...p,

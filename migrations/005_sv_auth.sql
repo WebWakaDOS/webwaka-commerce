@@ -5,8 +5,8 @@
 -- NDPR: consent recorded on every customer record
 -- ============================================================
 
--- customer_otps: ephemeral OTP records (TTL enforced by expires_at)
-CREATE TABLE IF NOT EXISTS customer_otps (
+-- cmrc_customer_otps: ephemeral OTP records (TTL enforced by expires_at)
+CREATE TABLE IF NOT EXISTS cmrc_customer_otps (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   phone TEXT NOT NULL,              -- E.164 format, e.g. +2348012345678
@@ -17,10 +17,10 @@ CREATE TABLE IF NOT EXISTS customer_otps (
   created_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_otps_phone ON customer_otps(tenant_id, phone, is_used, expires_at);
+CREATE INDEX IF NOT EXISTS idx_otps_phone ON cmrc_customer_otps(tenant_id, phone, is_used, expires_at);
 
--- wishlists: customer-product many-to-many (offline-first, synced)
-CREATE TABLE IF NOT EXISTS wishlists (
+-- cmrc_wishlists: customer-product many-to-many (offline-first, synced)
+CREATE TABLE IF NOT EXISTS cmrc_wishlists (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   customer_id TEXT NOT NULL,
@@ -29,11 +29,11 @@ CREATE TABLE IF NOT EXISTS wishlists (
   UNIQUE(tenant_id, customer_id, product_id)  -- idempotent add
 );
 
-CREATE INDEX IF NOT EXISTS idx_wishlists_customer ON wishlists(tenant_id, customer_id);
-CREATE INDEX IF NOT EXISTS idx_wishlists_product  ON wishlists(tenant_id, product_id);
+CREATE INDEX IF NOT EXISTS idx_wishlists_customer ON cmrc_wishlists(tenant_id, customer_id);
+CREATE INDEX IF NOT EXISTS idx_wishlists_product  ON cmrc_wishlists(tenant_id, product_id);
 
--- abandoned_carts: tracks carts not checked out after 1h (populated by cron)
-CREATE TABLE IF NOT EXISTS abandoned_carts (
+-- cmrc_abandoned_carts: tracks carts not checked out after 1h (populated by cron)
+CREATE TABLE IF NOT EXISTS cmrc_abandoned_carts (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   customer_id TEXT,
@@ -47,4 +47,4 @@ CREATE TABLE IF NOT EXISTS abandoned_carts (
   updated_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_abandoned_carts_nudge ON abandoned_carts(tenant_id, nudge_sent_at, recovered_at);
+CREATE INDEX IF NOT EXISTS idx_abandoned_carts_nudge ON cmrc_abandoned_carts(tenant_id, nudge_sent_at, recovered_at);

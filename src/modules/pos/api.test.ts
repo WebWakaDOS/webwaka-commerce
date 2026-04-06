@@ -72,24 +72,24 @@ describe('COM-1: POS API', () => {
     });
   });
 
-  // ─── GET /products ────────────────────────────────────────────────────────────
-  describe('GET /products', () => {
-    it('should list products with category filter', async () => {
+  // ─── GET /cmrc_products ────────────────────────────────────────────────────────────
+  describe('GET /cmrc_products', () => {
+    it('should list cmrc_products with category filter', async () => {
       mockDb.all.mockResolvedValue({ results: [{ id: 'prod_1', category: 'electronics' }] });
-      const req = makeRequest('GET', '/products?category=electronics');
+      const req = makeRequest('GET', '/cmrc_products?category=electronics');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
     });
 
-    it('should list products with search filter', async () => {
-      const req = makeRequest('GET', '/products?search=laptop');
+    it('should list cmrc_products with search filter', async () => {
+      const req = makeRequest('GET', '/cmrc_products?search=laptop');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
     });
 
-    it('should return empty array when no products found', async () => {
+    it('should return empty array when no cmrc_products found', async () => {
       mockDb.all.mockResolvedValue({ results: [] });
-      const req = makeRequest('GET', '/products');
+      const req = makeRequest('GET', '/cmrc_products');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -97,17 +97,17 @@ describe('COM-1: POS API', () => {
     });
 
     it('should respect limit and offset query params', async () => {
-      const req = makeRequest('GET', '/products?limit=10&offset=20');
+      const req = makeRequest('GET', '/cmrc_products?limit=10&offset=20');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
     });
   });
 
-  // ─── GET /products/barcode/:code ──────────────────────────────────────────────
-  describe('GET /products/barcode/:code', () => {
+  // ─── GET /cmrc_products/barcode/:code ──────────────────────────────────────────────
+  describe('GET /cmrc_products/barcode/:code', () => {
     it('should return product when barcode matches', async () => {
       mockDb.first.mockResolvedValue({ id: 'prod_1', barcode: '123456789', name: 'Suya Spice', price: 5000, quantity: 20 });
-      const req = makeRequest('GET', '/products/barcode/123456789');
+      const req = makeRequest('GET', '/cmrc_products/barcode/123456789');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -116,14 +116,14 @@ describe('COM-1: POS API', () => {
 
     it('should return 404 when barcode not found', async () => {
       mockDb.first.mockResolvedValue(null);
-      const req = makeRequest('GET', '/products/barcode/NOTFOUND');
+      const req = makeRequest('GET', '/cmrc_products/barcode/NOTFOUND');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(404);
     });
 
     it('should return product SKU in addition to barcode', async () => {
       mockDb.first.mockResolvedValue({ id: 'prod_1', barcode: 'ABC001', sku: 'SKU-001', name: 'Pepper', price: 2000, quantity: 50 });
-      const req = makeRequest('GET', '/products/barcode/ABC001');
+      const req = makeRequest('GET', '/cmrc_products/barcode/ABC001');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -133,7 +133,7 @@ describe('COM-1: POS API', () => {
 
     it('should match product by SKU (barcode fallback)', async () => {
       mockDb.first.mockResolvedValue({ id: 'prod_2', barcode: null, sku: 'SKU-999', name: 'Salt', price: 500, quantity: 100 });
-      const req = makeRequest('GET', '/products/barcode/SKU-999');
+      const req = makeRequest('GET', '/cmrc_products/barcode/SKU-999');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -142,23 +142,23 @@ describe('COM-1: POS API', () => {
 
     it('should return product quantity so caller can validate stock', async () => {
       mockDb.first.mockResolvedValue({ id: 'prod_3', barcode: 'XYZ-001', name: 'Oil', price: 15000, quantity: 3 });
-      const req = makeRequest('GET', '/products/barcode/XYZ-001');
+      const req = makeRequest('GET', '/cmrc_products/barcode/XYZ-001');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(typeof data.data.quantity).toBe('number');
     });
   });
 
-  // ─── GET /products/low-stock (Phase 2) ───────────────────────────────────────
-  describe('GET /products/low-stock — reorder alerts (Phase 2)', () => {
-    it('should return products at or below default threshold (10)', async () => {
+  // ─── GET /cmrc_products/low-stock (Phase 2) ───────────────────────────────────────
+  describe('GET /cmrc_products/low-stock — reorder alerts (Phase 2)', () => {
+    it('should return cmrc_products at or below default threshold (10)', async () => {
       mockDb.all.mockResolvedValue({
         results: [
           { id: 'prod_a', name: 'Yam Flour', quantity: 2, low_stock_threshold: 5 },
           { id: 'prod_b', name: 'Palm Oil', quantity: 8, low_stock_threshold: 10 },
         ],
       });
-      const req = makeRequest('GET', '/products/low-stock');
+      const req = makeRequest('GET', '/cmrc_products/low-stock');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -169,16 +169,16 @@ describe('COM-1: POS API', () => {
 
     it('should use threshold query param to override default', async () => {
       mockDb.all.mockResolvedValue({ results: [{ id: 'prod_a', name: 'Garri', quantity: 3 }] });
-      const req = makeRequest('GET', '/products/low-stock?threshold=5');
+      const req = makeRequest('GET', '/cmrc_products/low-stock?threshold=5');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
       expect(data.threshold).toBe(5);
     });
 
-    it('should return empty array when no products are low stock', async () => {
+    it('should return empty array when no cmrc_products are low stock', async () => {
       mockDb.all.mockResolvedValue({ results: [] });
-      const req = makeRequest('GET', '/products/low-stock');
+      const req = makeRequest('GET', '/cmrc_products/low-stock');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -190,7 +190,7 @@ describe('COM-1: POS API', () => {
       mockDb.all.mockResolvedValue({
         results: [{ id: 'p1', name: 'Banga Soup', quantity: 1 }],
       });
-      const req = makeRequest('GET', '/products/low-stock');
+      const req = makeRequest('GET', '/cmrc_products/low-stock');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(data.count).toBe(1);
@@ -198,22 +198,22 @@ describe('COM-1: POS API', () => {
 
     it('should return 503 when DB is unavailable', async () => {
       mockDb.all.mockRejectedValue(new Error('D1 timeout'));
-      const req = makeRequest('GET', '/products/low-stock');
+      const req = makeRequest('GET', '/cmrc_products/low-stock');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(503);
     });
 
     it('should return 400 when tenant ID is missing', async () => {
-      const req = new Request('http://localhost/products/low-stock', { method: 'GET' });
+      const req = new Request('http://localhost/cmrc_products/low-stock', { method: 'GET' });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(400);
     });
   });
 
-  // ─── POST /products ───────────────────────────────────────────────────────────
-  describe('POST /products', () => {
+  // ─── POST /cmrc_products ───────────────────────────────────────────────────────────
+  describe('POST /cmrc_products', () => {
     it('should create a product with valid data', async () => {
-      const req = makeRequest('POST', '/products', {
+      const req = makeRequest('POST', '/cmrc_products', {
         sku: 'SKU-001', name: 'Laptop', price: 500000, quantity: 10, category: 'electronics',
       });
       const res = await posRouter.fetch(req, mockEnv as any);
@@ -224,7 +224,7 @@ describe('COM-1: POS API', () => {
     });
 
     it('should store price as integer (kobo) — Nigeria-First invariant', async () => {
-      const req = makeRequest('POST', '/products', {
+      const req = makeRequest('POST', '/cmrc_products', {
         sku: 'SKU-002', name: 'Phone', price: 150000, quantity: 5,
       });
       const res = await posRouter.fetch(req, mockEnv as any);
@@ -233,7 +233,7 @@ describe('COM-1: POS API', () => {
     });
 
     it('should include tenant_id in created product', async () => {
-      const req = makeRequest('POST', '/products', {
+      const req = makeRequest('POST', '/cmrc_products', {
         sku: 'SKU-003', name: 'Chair', price: 25000, quantity: 3,
       }, 'tnt_abc');
       const res = await posRouter.fetch(req, mockEnv as any);
@@ -242,18 +242,18 @@ describe('COM-1: POS API', () => {
     });
   });
 
-  // ─── GET /products/:id ────────────────────────────────────────────────────────
-  describe('GET /products/:id', () => {
+  // ─── GET /cmrc_products/:id ────────────────────────────────────────────────────────
+  describe('GET /cmrc_products/:id', () => {
     it('should return 404 for non-existent product', async () => {
       mockDb.first.mockResolvedValue(null);
-      const req = makeRequest('GET', '/products/prod_nonexistent');
+      const req = makeRequest('GET', '/cmrc_products/prod_nonexistent');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(404);
     });
 
     it('should return product when found', async () => {
       mockDb.first.mockResolvedValue({ id: 'prod_1', name: 'Laptop', price: 500000 });
-      const req = makeRequest('GET', '/products/prod_1');
+      const req = makeRequest('GET', '/cmrc_products/prod_1');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -261,16 +261,16 @@ describe('COM-1: POS API', () => {
     });
   });
 
-  // ─── PATCH /products/:id ──────────────────────────────────────────────────────
-  describe('PATCH /products/:id', () => {
+  // ─── PATCH /cmrc_products/:id ──────────────────────────────────────────────────────
+  describe('PATCH /cmrc_products/:id', () => {
     it('should update product fields', async () => {
-      const req = makeRequest('PATCH', '/products/prod_1', { price: 45000, quantity: 8 });
+      const req = makeRequest('PATCH', '/cmrc_products/prod_1', { price: 45000, quantity: 8 });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
     });
 
     it('should return 400 if no valid fields provided', async () => {
-      const req = makeRequest('PATCH', '/products/prod_1', { invalid_field: 'value' });
+      const req = makeRequest('PATCH', '/cmrc_products/prod_1', { invalid_field: 'value' });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(400);
     });
@@ -724,11 +724,11 @@ describe('COM-1: POS API', () => {
     });
   });
 
-  // ─── POST /orders/:id/void ────────────────────────────────────────────────────
-  describe('POST /orders/:id/void', () => {
+  // ─── POST /cmrc_orders/:id/void ────────────────────────────────────────────────────
+  describe('POST /cmrc_orders/:id/void', () => {
     it('should void an order with a reason', async () => {
       mockDb.first.mockResolvedValue({ id: 'ord_pos_1', order_status: 'fulfilled', total_amount: 50000 });
-      const req = makeRequest('POST', '/orders/ord_pos_1/void', { reason: 'Customer changed mind' });
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_1/void', { reason: 'Customer changed mind' });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -739,7 +739,7 @@ describe('COM-1: POS API', () => {
     });
 
     it('should return 400 when reason is missing', async () => {
-      const req = makeRequest('POST', '/orders/ord_pos_1/void', {});
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_1/void', {});
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(400);
       const data = await res.json() as any;
@@ -747,21 +747,21 @@ describe('COM-1: POS API', () => {
     });
 
     it('should return 400 when reason is empty string', async () => {
-      const req = makeRequest('POST', '/orders/ord_pos_1/void', { reason: '   ' });
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_1/void', { reason: '   ' });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(400);
     });
 
     it('should return 404 when order does not exist', async () => {
       mockDb.first.mockResolvedValue(null);
-      const req = makeRequest('POST', '/orders/nonexistent/void', { reason: 'Duplicate' });
+      const req = makeRequest('POST', '/cmrc_orders/nonexistent/void', { reason: 'Duplicate' });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(404);
     });
 
     it('should be idempotent — voiding an already-voided order returns 200', async () => {
       mockDb.first.mockResolvedValue({ id: 'ord_pos_1', order_status: 'voided', total_amount: 50000 });
-      const req = makeRequest('POST', '/orders/ord_pos_1/void', { reason: 'Duplicate void' });
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_1/void', { reason: 'Duplicate void' });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
@@ -770,8 +770,8 @@ describe('COM-1: POS API', () => {
     });
   });
 
-  // ─── POST /orders/:id/receipt (Phase 2) ──────────────────────────────────────
-  describe('POST /orders/:id/receipt — receipt generation (Phase 2)', () => {
+  // ─── POST /cmrc_orders/:id/receipt (Phase 2) ──────────────────────────────────────
+  describe('POST /cmrc_orders/:id/receipt — receipt generation (Phase 2)', () => {
     const makeOrderRow = (overrides = {}) => ({
       id: 'ord_pos_abc',
       total_amount: 150000,
@@ -789,7 +789,7 @@ describe('COM-1: POS API', () => {
 
     it('should return 201 with full receipt JSON', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow());
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(201);
       const data = await res.json() as any;
@@ -798,7 +798,7 @@ describe('COM-1: POS API', () => {
 
     it('should have receipt_id prefixed with RCP_', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow());
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(data.data.receipt_id).toBe('RCP_ord_pos_abc');
@@ -806,7 +806,7 @@ describe('COM-1: POS API', () => {
 
     it('should include total in both kobo and naira string', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow({ total_amount: 150000 }));
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(data.data.total_kobo).toBe(150000);
@@ -815,7 +815,7 @@ describe('COM-1: POS API', () => {
 
     it('should include whatsapp_url with wa.me domain', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow());
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(data.data.whatsapp_url).toContain('wa.me');
@@ -824,7 +824,7 @@ describe('COM-1: POS API', () => {
 
     it('should parse items_json into array', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow());
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(Array.isArray(data.data.items)).toBe(true);
@@ -833,7 +833,7 @@ describe('COM-1: POS API', () => {
 
     it('should include issued_at timestamp (number)', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow());
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(typeof data.data.issued_at).toBe('number');
@@ -842,7 +842,7 @@ describe('COM-1: POS API', () => {
 
     it('should include subtotal_kobo and discount_kobo', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow({ subtotal: 160000, discount: 10000 }));
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       const data = await res.json() as any;
       expect(data.data.subtotal_kobo).toBe(160000);
@@ -851,7 +851,7 @@ describe('COM-1: POS API', () => {
 
     it('should return 404 for non-existent order', async () => {
       mockDb.first.mockResolvedValue(null);
-      const req = makeRequest('POST', '/orders/ord_ghost/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_ghost/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(404);
       const data = await res.json() as any;
@@ -860,14 +860,14 @@ describe('COM-1: POS API', () => {
 
     it('should return 503 when DB is unavailable', async () => {
       mockDb.first.mockRejectedValue(new Error('D1 timeout'));
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(503);
     });
 
     it('should handle null items_json gracefully (returns empty array)', async () => {
       mockDb.first.mockResolvedValue(makeOrderRow({ items_json: null, payments_json: null }));
-      const req = makeRequest('POST', '/orders/ord_pos_abc/receipt');
+      const req = makeRequest('POST', '/cmrc_orders/ord_pos_abc/receipt');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(201);
       const data = await res.json() as any;
@@ -876,17 +876,17 @@ describe('COM-1: POS API', () => {
     });
   });
 
-  // ─── GET /orders ──────────────────────────────────────────────────────────────
-  describe('GET /orders', () => {
-    it('should list POS orders', async () => {
+  // ─── GET /cmrc_orders ──────────────────────────────────────────────────────────────
+  describe('GET /cmrc_orders', () => {
+    it('should list POS cmrc_orders', async () => {
       mockDb.all.mockResolvedValue({ results: [{ id: 'ord_1', channel: 'pos' }] });
-      const req = makeRequest('GET', '/orders');
+      const req = makeRequest('GET', '/cmrc_orders');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
     });
 
     it('should respect limit and offset for pagination', async () => {
-      const req = makeRequest('GET', '/orders?limit=25&offset=50');
+      const req = makeRequest('GET', '/cmrc_orders?limit=25&offset=50');
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(200);
     });
@@ -1100,7 +1100,7 @@ describe('COM-1: POS API', () => {
       expect(body.error).toMatch(/outlet_id/i);
     });
 
-    it('GET /fulfillment-queue returns assigned orders for outlet', async () => {
+    it('GET /fulfillment-queue returns assigned cmrc_orders for outlet', async () => {
       mockDb.all.mockResolvedValue({
         results: [{
           id: 'ord_sv_1',
@@ -1201,8 +1201,8 @@ describe('COM-1: POS API', () => {
   // ─── Multi-tenancy isolation ──────────────────────────────────────────────────
   describe('Multi-tenancy isolation', () => {
     it('should isolate product data between tenants', async () => {
-      const req1 = makeRequest('GET', '/products', undefined, 'tenant_A');
-      const req2 = makeRequest('GET', '/products', undefined, 'tenant_B');
+      const req1 = makeRequest('GET', '/cmrc_products', undefined, 'tenant_A');
+      const req2 = makeRequest('GET', '/cmrc_products', undefined, 'tenant_B');
       const [res1, res2] = await Promise.all([
         posRouter.fetch(req1, mockEnv as any),
         posRouter.fetch(req2, mockEnv as any),
@@ -1212,7 +1212,7 @@ describe('COM-1: POS API', () => {
     });
 
     it('should reject requests without tenant header', async () => {
-      const req = new Request('http://localhost/products', { method: 'GET' });
+      const req = new Request('http://localhost/cmrc_products', { method: 'GET' });
       const res = await posRouter.fetch(req, mockEnv as any);
       expect(res.status).toBe(400);
     });

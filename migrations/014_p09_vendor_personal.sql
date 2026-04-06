@@ -2,4 +2,4 @@
 --       logo_url, businessNameForCac) stored as a single JSON blob.
 -- Applied after 013_vendor_orders.sql
 
-ALTER TABLE vendors ADD COLUMN onboarding_data_json TEXT;
+ALTER TABLE cmrc_vendors ADD COLUMN onboarding_data_json TEXT;

@@ -2,8 +2,8 @@
  * WebWaka — Product Bundles
  * Implementation Plan §3 Item 19 — Product Bundles
  *
- * Composite products ("Starter Kit") with bundled pricing:
- *   - A bundle consists of 2+ component products
+ * Composite cmrc_products ("Starter Kit") with bundled pricing:
+ *   - A bundle consists of 2+ component cmrc_products
  *   - Bundle has its own SKU, name, image, and discounted price
  *   - Stock is validated against each component's inventory
  *   - Checkout deducts from each component's stock individually
@@ -112,7 +112,7 @@ bundlesRouter.get('/', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT id, sku, name, description, image_url, components_json,
               bundle_price_kobo, computed_retail_price_kobo, savings_kobo, created_at
-       FROM product_bundles WHERE tenant_id = ? AND is_active = 1
+       FROM cmrc_product_bundles WHERE tenant_id = ? AND is_active = 1
        ORDER BY savings_kobo DESC`
     ).bind(tenantId).all();
 
@@ -127,7 +127,7 @@ bundlesRouter.get('/', async (c) => {
         try {
           const placeholders = productIds.map(() => '?').join(',');
           const { results: stockRows } = await c.env.DB.prepare(
-            `SELECT id, quantity FROM products WHERE id IN (${placeholders}) AND tenant_id = ?`
+            `SELECT id, quantity FROM cmrc_products WHERE id IN (${placeholders}) AND tenant_id = ?`
           ).bind(...productIds, tenantId).all<{ id: string; quantity: number }>();
           stockMap = new Map(stockRows.map((s) => [s.id, s.quantity]));
         } catch { /* non-fatal */ }
@@ -170,15 +170,15 @@ bundlesRouter.post(
     const productIds = body.components.map((c) => c.product_id);
     const placeholders = productIds.map(() => '?').join(',');
     interface ProductRow { id: string; name: string; price: number }
-    let products: ProductRow[] = [];
+    let cmrc_products: ProductRow[] = [];
     try {
       const { results } = await c.env.DB.prepare(
-        `SELECT id, name, price FROM products WHERE id IN (${placeholders}) AND tenant_id = ?`
+        `SELECT id, name, price FROM cmrc_products WHERE id IN (${placeholders}) AND tenant_id = ?`
       ).bind(...productIds, tenantId).all<ProductRow>();
-      products = results;
+      cmrc_products = results;
     } catch { /* test env */ }
 
-    const productMap = new Map(products.map((p) => [p.id, p]));
+    const productMap = new Map(cmrc_products.map((p) => [p.id, p]));
     const components: BundleComponent[] = body.components.map((comp) => ({
       productId: comp.product_id,
       productName: productMap.get(comp.product_id)?.name ?? comp.product_id,
@@ -198,7 +198,7 @@ bundlesRouter.post(
 
     try {
       await c.env.DB.prepare(
-        `INSERT INTO product_bundles
+        `INSERT INTO cmrc_product_bundles
            (id, tenant_id, sku, name, description, image_url, components_json,
             bundle_price_kobo, computed_retail_price_kobo, savings_kobo, is_active, created_at, updated_at)
          VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)`
@@ -228,7 +228,7 @@ bundlesRouter.patch(
     const now = Date.now();
     try {
       await c.env.DB.prepare(
-        `UPDATE product_bundles SET
+        `UPDATE cmrc_product_bundles SET
            bundle_price_kobo = COALESCE(?, bundle_price_kobo),
            is_active = COALESCE(?, is_active),
            updated_at = ?

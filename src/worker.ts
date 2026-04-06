@@ -6,8 +6,8 @@
  *
  * Security: All /api/* routes require JWT Bearer token (stored in SESSIONS_KV).
  * Replaces insecure x-tenant-id header-only authentication.
- * Public exceptions: GET /health, GET /api/pos/products,
- *                    GET /api/single-vendor/products, GET /api/multi-vendor/products
+ * Public exceptions: GET /health, GET /api/pos/cmrc_products,
+ *                    GET /api/single-vendor/cmrc_products, GET /api/multi-vendor/cmrc_products
  *
  * Event Bus: CF Queues (COMMERCE_EVENTS binding).
  * See src/core/event-bus/index.ts for publishEvent() usage in route handlers.
@@ -132,13 +132,13 @@ app.get('/sitemap.xml', async (c) => {
     }
 
     const { results } = await c.env.DB.prepare(
-      `SELECT slug, id, updated_at FROM products
+      `SELECT slug, id, updated_at FROM cmrc_products
        WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
        ORDER BY updated_at DESC LIMIT 1000`,
     ).bind(tenantId).all<{ slug: string | null; id: string; updated_at: number }>();
 
     const urls = results.map((p) => {
-      const path = p.slug ? `/products/${p.slug}` : `/products/${p.id}`;
+      const path = p.slug ? `/cmrc_products/${p.slug}` : `/cmrc_products/${p.id}`;
       const lastmod = new Date(p.updated_at).toISOString().split('T')[0];
       return `  <url>\n    <loc>${baseUrl}${path}</loc>\n    <lastmod>${lastmod}</lastmod>\n    <changefreq>weekly</changefreq>\n    <priority>0.8</priority>\n  </url>`;
     });
@@ -171,9 +171,9 @@ ${urls.join('\n')}
 });
 
 // ── SV-E15: OG Meta Edge Rendering for Social Sharing ────────────────────────
-// Intercepts bot/crawler requests to /products/:slug and returns OG meta HTML.
+// Intercepts bot/crawler requests to /cmrc_products/:slug and returns OG meta HTML.
 // Must be registered BEFORE the notFound handler.
-app.get('/products/:slug', async (c) => {
+app.get('/cmrc_products/:slug', async (c) => {
   const ua = c.req.header('User-Agent') ?? '';
   const isCrawler = /bot|crawl|slurp|spider|facebookexternalhit|whatsapp|telegram/i.test(ua);
 
@@ -190,7 +190,7 @@ app.get('/products/:slug', async (c) => {
   try {
     const product = await c.env.DB.prepare(
       `SELECT name, description, image_url AS imageUrl, price_kobo AS priceKobo
-       FROM products WHERE slug = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
+       FROM cmrc_products WHERE slug = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
     ).bind(slug, tenantId).first<{ name: string; description: string | null; imageUrl: string | null; priceKobo: number }>();
 
     if (!product) return c.notFound();
@@ -265,7 +265,7 @@ app.post('/webhooks/paystack', async (c) => {
 
           if ((pending?.cnt ?? 1) === 0) {
             await c.env.DB.prepare(
-              `UPDATE orders SET order_status = 'COMPLETED', payment_status = 'paid', updated_at = ? WHERE id = ?`,
+              `UPDATE cmrc_orders SET order_status = 'COMPLETED', payment_status = 'paid', updated_at = ? WHERE id = ?`,
             ).bind(Date.now(), leg.order_id).run();
           }
         }
@@ -442,12 +442,12 @@ export default {
     const now = Date.now();
 
     // ── T+7 Settlement Release: held → eligible ─────────────────────────────
-    // Runs every cron invocation; finds settlements whose hold period has expired
-    // and marks them as 'eligible' so vendors can request payout.
+    // Runs every cron invocation; finds cmrc_settlements whose hold period has expired
+    // and marks them as 'eligible' so cmrc_vendors can request payout.
     try {
       const { results: heldSettlements } = await env.DB.prepare(
         `SELECT id, tenant_id, vendor_id
-         FROM settlements
+         FROM cmrc_settlements
          WHERE status = 'held' AND hold_until <= ?
          LIMIT 200`,
       ).bind(now).all<{ id: string; tenant_id: string; vendor_id: string }>();
@@ -460,27 +460,27 @@ export default {
           await env.DB.batch(
             chunk.map(s =>
               env.DB.prepare(
-                `UPDATE settlements
+                `UPDATE cmrc_settlements
                  SET status = 'eligible', updated_at = ?
                  WHERE id = ? AND status = 'held'`,
               ).bind(now, s.id),
             ),
           );
         }
-        console.log(`[cron] Released ${heldSettlements.length} settlements to eligible`);
+        console.log(`[cron] Released ${heldSettlements.length} cmrc_settlements to eligible`);
       }
     } catch (err) {
       console.error('[cron] Settlement release error:', err);
     }
 
-    // ── Auto payout-request: create pending requests for vendors ────────────
-    // For each vendor+tenant that has eligible settlements and no pending payout
-    // request, automatically create a payout_request and release the settlements.
+    // ── Auto payout-request: create pending requests for cmrc_vendors ────────────
+    // For each vendor+tenant that has eligible cmrc_settlements and no pending payout
+    // request, automatically create a payout_request and release the cmrc_settlements.
     try {
       interface VendorEligible { vendor_id: string; tenant_id: string; total: number; count: number }
       const { results: eligibleGroups } = await env.DB.prepare(
         `SELECT vendor_id, tenant_id, SUM(amount) AS total, COUNT(*) AS count
-         FROM settlements
+         FROM cmrc_settlements
          WHERE status = 'eligible' AND payout_request_id IS NULL
          GROUP BY vendor_id, tenant_id
          LIMIT 20`,
@@ -489,7 +489,7 @@ export default {
       for (const group of eligibleGroups) {
         // Skip if a payout request is already pending for this vendor
         const existing = await env.DB.prepare(
-          `SELECT id FROM payout_requests
+          `SELECT id FROM cmrc_payout_requests
            WHERE vendor_id = ? AND tenant_id = ? AND status IN ('pending', 'processing')
            LIMIT 1`,
         ).bind(group.vendor_id, group.tenant_id).first<{ id: string }>();
@@ -497,7 +497,7 @@ export default {
 
         // Get settlement IDs to release
         const { results: stls } = await env.DB.prepare(
-          `SELECT id FROM settlements
+          `SELECT id FROM cmrc_settlements
            WHERE vendor_id = ? AND tenant_id = ? AND status = 'eligible' AND payout_request_id IS NULL`,
         ).bind(group.vendor_id, group.tenant_id).all<{ id: string }>();
         if (!stls.length) continue;
@@ -505,14 +505,14 @@ export default {
         const prId = `pr_auto_${now}_${group.vendor_id.slice(-6)}`;
         await env.DB.batch([
           env.DB.prepare(
-            `INSERT INTO payout_requests
+            `INSERT INTO cmrc_payout_requests
                (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
                 status, requested_at, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?, ?, ?)`,
           ).bind(prId, group.tenant_id, group.vendor_id, group.total, stls.length, now, now, now),
           ...stls.map(s =>
             env.DB.prepare(
-              `UPDATE settlements SET status = 'released', payout_request_id = ?, updated_at = ?
+              `UPDATE cmrc_settlements SET status = 'released', payout_request_id = ?, updated_at = ?
                WHERE id = ?`,
             ).bind(prId, now, s.id),
           ),
@@ -538,15 +538,15 @@ export default {
 
       const { results: firstNudgeCarts } = await env.DB.prepare(
         `SELECT cs.id, cs.tenant_id, cs.session_token, cs.items_json, cs.customer_phone, cs.created_at
-         FROM cart_sessions cs
+         FROM cmrc_cart_sessions cs
          WHERE cs.created_at < ? AND cs.customer_phone IS NOT NULL
            AND cs.status != 'COMPLETED'
            AND NOT EXISTS (
-             SELECT 1 FROM abandoned_carts ac
+             SELECT 1 FROM cmrc_abandoned_carts ac
              WHERE ac.cart_token = cs.session_token AND ac.nudge_sent_at IS NOT NULL
            )
            AND NOT EXISTS (
-             SELECT 1 FROM orders o
+             SELECT 1 FROM cmrc_orders o
              WHERE o.customer_phone = cs.customer_phone
                AND o.created_at > cs.created_at
                AND o.channel = 'storefront'
@@ -596,18 +596,18 @@ export default {
 
       const { results: secondNudgeCarts } = await env.DB.prepare(
         `SELECT cs.id, cs.tenant_id, cs.session_token, cs.items_json, cs.customer_phone, cs.created_at
-         FROM cart_sessions cs
+         FROM cmrc_cart_sessions cs
          WHERE cs.customer_phone IS NOT NULL
            AND cs.status != 'COMPLETED'
            AND EXISTS (
-             SELECT 1 FROM abandoned_carts ac
+             SELECT 1 FROM cmrc_abandoned_carts ac
              WHERE ac.cart_token = cs.session_token
                AND ac.nudge_sent_at IS NOT NULL
                AND ac.nudge_sent_at < ?
                AND ac.second_nudge_sent_at IS NULL
            )
            AND NOT EXISTS (
-             SELECT 1 FROM orders o
+             SELECT 1 FROM cmrc_orders o
              WHERE o.customer_phone = cs.customer_phone
                AND o.created_at > cs.created_at
                AND o.channel = 'storefront'
@@ -625,7 +625,7 @@ export default {
         let promoCode: string | null = null;
         try {
           const existingPromo = await env.DB.prepare(
-            `SELECT code FROM promo_codes
+            `SELECT code FROM cmrc_promo_codes
              WHERE tenant_id = ? AND discount_type = 'pct' AND discount_value = 10
                AND is_active = 1 AND (expires_at IS NULL OR expires_at > ?)
                AND deleted_at IS NULL
@@ -638,7 +638,7 @@ export default {
             promoCode = `COMEBACK10_${cart.tenant_id.slice(-6).toUpperCase()}`;
             const promoId = `promo_auto_${now}_${Math.random().toString(36).slice(2, 8)}`;
             await env.DB.prepare(
-              `INSERT OR IGNORE INTO promo_codes
+              `INSERT OR IGNORE INTO cmrc_promo_codes
                  (id, tenant_id, code, discount_type, discount_value, min_order_kobo,
                   max_uses, current_uses, is_active, created_at, updated_at)
                VALUES (?, ?, ?, 'pct', 10, 0, 1000, 0, 1, ?, ?)`,
@@ -680,7 +680,7 @@ export default {
 
       const { results: invites } = await env.DB.prepare(
         `SELECT id, tenant_id, customer_phone, order_id
-         FROM review_invites
+         FROM cmrc_review_invites
          WHERE send_at <= ? AND sent = 0
          LIMIT 100`,
       ).bind(now).all<ReviewInvite>();
@@ -691,12 +691,12 @@ export default {
             const sms = createSmsProvider(env.TERMII_API_KEY);
             await sms.sendOtp(
               invite.customer_phone,
-              `How was your order? Leave a review and help other shoppers: https://webwaka.shop/${invite.tenant_id}/orders/${invite.order_id}/review`,
+              `How was your order? Leave a review and help other shoppers: https://webwaka.shop/${invite.tenant_id}/cmrc_orders/${invite.order_id}/review`,
               'whatsapp',
             );
           }
           await env.DB.prepare(
-            `UPDATE review_invites SET sent = 1, sent_at = ? WHERE id = ?`,
+            `UPDATE cmrc_review_invites SET sent = 1, sent_at = ? WHERE id = ?`,
           ).bind(now, invite.id).run();
         } catch {
           // Non-fatal — will retry on next cron run
@@ -713,14 +713,14 @@ export default {
       const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
 
       interface ActiveVendor { id: string; marketplace_tenant_id: string; phone: string | null }
-      const { results: vendors } = await env.DB.prepare(
+      const { results: cmrc_vendors } = await env.DB.prepare(
         `SELECT id, marketplace_tenant_id, phone
-         FROM vendors
+         FROM cmrc_vendors
          WHERE status = 'active' AND deleted_at IS NULL
          LIMIT 200`,
       ).bind().all<ActiveVendor>();
 
-      for (const vendor of vendors) {
+      for (const vendor of cmrc_vendors) {
         try {
           const tenantId = vendor.marketplace_tenant_id;
 
@@ -728,23 +728,23 @@ export default {
             `SELECT
                COUNT(*) AS total_orders,
                SUM(CASE WHEN order_status = 'DELIVERED' THEN 1 ELSE 0 END) AS delivered_orders
-             FROM orders
+             FROM cmrc_orders
              WHERE vendor_id = ? AND tenant_id = ? AND created_at >= ?`,
           ).bind(vendor.id, tenantId, thirtyDaysAgo).first<{ total_orders: number; delivered_orders: number }>();
 
           const ratingRow = await env.DB.prepare(
             `SELECT AVG(pr.rating) AS avg_rating
-             FROM product_reviews pr
-             JOIN products p ON p.id = pr.product_id
+             FROM cmrc_product_reviews pr
+             JOIN cmrc_products p ON p.id = pr.product_id
              WHERE p.vendor_id = ? AND pr.tenant_id = ? AND pr.created_at >= ?
                AND pr.status = 'APPROVED'`,
           ).bind(vendor.id, tenantId, thirtyDaysAgo).first<{ avg_rating: number | null }>();
 
           const disputeRow = await env.DB.prepare(
             `SELECT COUNT(*) AS dispute_count
-             FROM disputes
+             FROM cmrc_disputes
              WHERE tenant_id = ? AND order_id IN (
-               SELECT id FROM orders WHERE vendor_id = ? AND tenant_id = ? AND created_at >= ?
+               SELECT id FROM cmrc_orders WHERE vendor_id = ? AND tenant_id = ? AND created_at >= ?
              )`,
           ).bind(tenantId, vendor.id, tenantId, thirtyDaysAgo).first<{ dispute_count: number }>();
 
@@ -768,14 +768,14 @@ export default {
           else if (score >= 60) badge = 'TRUSTED';
 
           await env.DB.prepare(
-            `UPDATE vendors SET performanceScore = ?, badge = ?, scoreUpdatedAt = ? WHERE id = ?`,
+            `UPDATE cmrc_vendors SET performanceScore = ?, badge = ?, scoreUpdatedAt = ? WHERE id = ?`,
           ).bind(score, badge, new Date(now).toISOString(), vendor.id).run();
 
           if (score < 40 && vendor.phone && env.TERMII_API_KEY) {
             const sms = createSmsProvider(env.TERMII_API_KEY);
             await sms.sendOtp(
               vendor.phone,
-              `Your WebWaka store performance score is ${score}/100. To improve: fulfil orders faster (${Math.round(fulfillmentRate * 100)}% rate), resolve disputes promptly, and encourage customer reviews. Contact support for help.`,
+              `Your WebWaka store performance score is ${score}/100. To improve: fulfil cmrc_orders faster (${Math.round(fulfillmentRate * 100)}% rate), resolve cmrc_disputes promptly, and encourage customer reviews. Contact support for help.`,
               'whatsapp',
             ).catch(() => {});
           }
@@ -783,7 +783,7 @@ export default {
           // Non-fatal per vendor — skip and continue
         }
       }
-      console.log(`[cron] Vendor scoring complete for ${vendors.length} vendors`);
+      console.log(`[cron] Vendor scoring complete for ${cmrc_vendors.length} cmrc_vendors`);
     } catch (err) {
       console.error('[cron] Vendor scoring error:', err);
     }
@@ -794,7 +794,7 @@ export default {
       const nowIso = new Date().toISOString();
 
       const activateResult = await env.DB.prepare(
-        `UPDATE marketplace_campaigns
+        `UPDATE cmrc_marketplace_campaigns
          SET status = 'ACTIVE'
          WHERE startDate <= ? AND endDate > ? AND status = 'DRAFT'`
       ).bind(nowIso, nowIso).run();
@@ -803,7 +803,7 @@ export default {
       }
 
       const endResult = await env.DB.prepare(
-        `UPDATE marketplace_campaigns
+        `UPDATE cmrc_marketplace_campaigns
          SET status = 'ENDED'
          WHERE endDate <= ? AND status = 'ACTIVE'`
       ).bind(nowIso).run();
@@ -815,7 +815,7 @@ export default {
     }
 
     // ── Daily vendor analytics snapshot (MV-E15) ──────────────────────────────
-    // Aggregates each vendor's daily revenue/orders from orders table.
+    // Aggregates each vendor's daily revenue/cmrc_orders from cmrc_orders table.
     // Run daily via cron trigger; idempotent via INSERT OR REPLACE.
     try {
       const today = new Date().toISOString().slice(0, 10);
@@ -823,7 +823,7 @@ export default {
       const dayEnd = dayStart + 24 * 60 * 60 * 1000 - 1;
 
       const { results: activeVendors } = await env.DB.prepare(
-        `SELECT id, marketplace_tenant_id AS tenantId FROM vendors WHERE status = 'active'`
+        `SELECT id, marketplace_tenant_id AS tenantId FROM cmrc_vendors WHERE status = 'active'`
       ).all<{ id: string; tenantId: string }>();
 
       for (const v of activeVendors ?? []) {
@@ -833,15 +833,15 @@ export default {
              COALESCE(SUM(total_amount), 0)          AS revenueKobo,
              COUNT(DISTINCT customer_id)             AS customerCount,
              (SELECT COUNT(DISTINCT customer_id)
-              FROM orders
+              FROM cmrc_orders
               WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid'
                 AND customer_id IN (
-                  SELECT customer_id FROM orders
+                  SELECT customer_id FROM cmrc_orders
                   WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid'
                     AND created_at < ?
                 )
              )                                       AS repeatBuyerCount
-           FROM orders
+           FROM cmrc_orders
            WHERE vendor_id = ? AND tenant_id = ? AND payment_status = 'paid'
              AND created_at >= ? AND created_at <= ?`
         ).bind(
@@ -854,13 +854,13 @@ export default {
         const analyticsId = `vda_${v.id}_${today}`;
 
         await env.DB.prepare(
-          `INSERT OR REPLACE INTO vendor_daily_analytics
+          `INSERT OR REPLACE INTO cmrc_vendor_daily_analytics
              (id, vendorId, tenantId, date, revenueKobo, orderCount, avgOrderValueKobo, repeatBuyerCount)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(analyticsId, v.id, v.tenantId, today, row.revenueKobo, row.orderCount, avgOrderValue, row.repeatBuyerCount).run();
       }
 
-      console.log(`[cron] Vendor analytics snapshot complete for ${(activeVendors ?? []).length} vendors on ${today}`);
+      console.log(`[cron] Vendor analytics snapshot complete for ${(activeVendors ?? []).length} cmrc_vendors on ${today}`);
     } catch (err) {
       console.error('[cron] Vendor analytics error:', err);
     }
@@ -869,17 +869,17 @@ export default {
     try {
       const nowIso = new Date().toISOString().replace('T', ' ').slice(0, 19);
       const activated = await env.DB.prepare(
-        `UPDATE flash_sales SET active = 1 WHERE startTime <= ? AND endTime > ? AND active = 0`,
+        `UPDATE cmrc_flash_sales SET active = 1 WHERE startTime <= ? AND endTime > ? AND active = 0`,
       ).bind(nowIso, nowIso).run();
       const deactivated = await env.DB.prepare(
-        `UPDATE flash_sales SET active = 0 WHERE endTime <= ? AND active = 1`,
+        `UPDATE cmrc_flash_sales SET active = 0 WHERE endTime <= ? AND active = 1`,
       ).bind(nowIso).run();
       if ((activated.meta?.changes ?? 0) > 0 || (deactivated.meta?.changes ?? 0) > 0) {
         console.log(`[cron] Flash sales: activated=${activated.meta?.changes ?? 0} deactivated=${deactivated.meta?.changes ?? 0}`);
       }
-      // Invalidate KV cache for products with changed flash sale status
+      // Invalidate KV cache for cmrc_products with changed flash sale status
       const affectedProducts = await env.DB.prepare(
-        `SELECT DISTINCT productId, tenantId FROM flash_sales WHERE active = 1`,
+        `SELECT DISTINCT productId, tenantId FROM cmrc_flash_sales WHERE active = 1`,
       ).all<{ productId: string; tenantId: string }>();
       for (const p of affectedProducts.results ?? []) {
         await env.CATALOG_CACHE?.delete(`catalog:${p.tenantId}:product:${p.productId}`).catch(() => {});
@@ -896,9 +896,9 @@ export default {
                 s.retryCount, s.productName,
                 p.name AS pName, p.price_kobo AS priceKobo,
                 c.phone AS customerPhone
-         FROM subscriptions s
-         LEFT JOIN products p ON p.id = s.productId AND p.tenant_id = s.tenantId
-         LEFT JOIN customers c ON c.id = s.customerId AND c.tenant_id = s.tenantId
+         FROM cmrc_subscriptions s
+         LEFT JOIN cmrc_products p ON p.id = s.productId AND p.tenant_id = s.tenantId
+         LEFT JOIN cmrc_customers c ON c.id = s.customerId AND c.tenant_id = s.tenantId
          WHERE s.status = 'ACTIVE' AND DATE(s.nextChargeDate) <= DATE(?)`,
       ).bind(today2).all<{
         id: string; tenantId: string; customerId: string; productId: string;
@@ -925,11 +925,11 @@ export default {
             nextCharge.setDate(nextCharge.getDate() + sub.frequencyDays);
             await env.DB.batch([
               env.DB.prepare(
-                `INSERT INTO orders (id, tenant_id, customer_id, total_amount, payment_method, payment_status, order_status, payment_reference, created_at)
+                `INSERT INTO cmrc_orders (id, tenant_id, customer_id, total_amount, payment_method, payment_status, order_status, payment_reference, created_at)
                  VALUES (?, ?, ?, ?, 'subscription', 'paid', 'PROCESSING', ?, ?)`,
               ).bind(orderId, sub.tenantId, sub.customerId, price, chargeData.data.reference, Date.now()),
               env.DB.prepare(
-                `UPDATE subscriptions SET nextChargeDate = ?, retryCount = 0 WHERE id = ?`,
+                `UPDATE cmrc_subscriptions SET nextChargeDate = ?, retryCount = 0 WHERE id = ?`,
               ).bind(nextCharge.toISOString().slice(0, 10), sub.id),
             ]);
             console.log(`[cron] Subscription ${sub.id} charged OK — next: ${nextCharge.toISOString().slice(0, 10)}`);
@@ -937,7 +937,7 @@ export default {
             const newRetry = (sub.retryCount ?? 0) + 1;
             if (newRetry >= 3) {
               await env.DB.prepare(
-                `UPDATE subscriptions SET status = 'CANCELLED', retryCount = ?, lastFailedAt = ? WHERE id = ?`,
+                `UPDATE cmrc_subscriptions SET status = 'CANCELLED', retryCount = ?, lastFailedAt = ? WHERE id = ?`,
               ).bind(newRetry, new Date().toISOString(), sub.id).run();
               // Send WhatsApp cancellation notice
               if (sub.customerPhone && env.TERMII_API_KEY) {
@@ -947,7 +947,7 @@ export default {
               console.log(`[cron] Subscription ${sub.id} cancelled after 3 failed charges`);
             } else {
               await env.DB.prepare(
-                `UPDATE subscriptions SET retryCount = ?, lastFailedAt = ? WHERE id = ?`,
+                `UPDATE cmrc_subscriptions SET retryCount = ?, lastFailedAt = ? WHERE id = ?`,
               ).bind(newRetry, new Date().toISOString(), sub.id).run();
               console.log(`[cron] Subscription ${sub.id} charge failed (retry ${newRetry}/3)`);
             }

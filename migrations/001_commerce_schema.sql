@@ -5,7 +5,7 @@
 -- ============================================================
 -- INVENTORY & PRODUCTS
 -- ============================================================
-CREATE TABLE IF NOT EXISTS products (
+CREATE TABLE IF NOT EXISTS cmrc_products (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   vendor_id TEXT,
@@ -27,14 +27,14 @@ CREATE TABLE IF NOT EXISTS products (
   deleted_at INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_products_tenant ON products(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_products_sku ON products(tenant_id, sku);
-CREATE INDEX IF NOT EXISTS idx_products_vendor ON products(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_products_tenant ON cmrc_products(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_products_sku ON cmrc_products(tenant_id, sku);
+CREATE INDEX IF NOT EXISTS idx_products_vendor ON cmrc_products(vendor_id);
 
 -- ============================================================
 -- VENDORS (Multi-Vendor Marketplace)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS vendors (
+CREATE TABLE IF NOT EXISTS cmrc_vendors (
   id TEXT PRIMARY KEY,
   marketplace_tenant_id TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -51,12 +51,12 @@ CREATE TABLE IF NOT EXISTS vendors (
   deleted_at INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_vendors_marketplace ON vendors(marketplace_tenant_id);
+CREATE INDEX IF NOT EXISTS idx_vendors_marketplace ON cmrc_vendors(marketplace_tenant_id);
 
 -- ============================================================
 -- ORDERS
 -- ============================================================
-CREATE TABLE IF NOT EXISTS orders (
+CREATE TABLE IF NOT EXISTS cmrc_orders (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   vendor_id TEXT,
@@ -80,15 +80,15 @@ CREATE TABLE IF NOT EXISTS orders (
   deleted_at INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_orders_tenant ON orders(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_orders_vendor ON orders(vendor_id);
-CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(tenant_id, order_status);
-CREATE INDEX IF NOT EXISTS idx_orders_payment ON orders(tenant_id, payment_status);
+CREATE INDEX IF NOT EXISTS idx_orders_tenant ON cmrc_orders(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_orders_vendor ON cmrc_orders(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON cmrc_orders(tenant_id, order_status);
+CREATE INDEX IF NOT EXISTS idx_orders_payment ON cmrc_orders(tenant_id, payment_status);
 
 -- ============================================================
 -- CART SESSIONS (for online storefronts)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS cart_sessions (
+CREATE TABLE IF NOT EXISTS cmrc_cart_sessions (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   customer_id TEXT,
@@ -99,13 +99,13 @@ CREATE TABLE IF NOT EXISTS cart_sessions (
   updated_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_carts_tenant ON cart_sessions(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_carts_token ON cart_sessions(session_token);
+CREATE INDEX IF NOT EXISTS idx_carts_tenant ON cmrc_cart_sessions(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_carts_token ON cmrc_cart_sessions(session_token);
 
 -- ============================================================
 -- CUSTOMERS
 -- ============================================================
-CREATE TABLE IF NOT EXISTS customers (
+CREATE TABLE IF NOT EXISTS cmrc_customers (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -121,14 +121,14 @@ CREATE TABLE IF NOT EXISTS customers (
   deleted_at INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_customers_tenant ON customers(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_customers_email ON customers(tenant_id, email);
-CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(tenant_id, phone);
+CREATE INDEX IF NOT EXISTS idx_customers_tenant ON cmrc_customers(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_customers_email ON cmrc_customers(tenant_id, email);
+CREATE INDEX IF NOT EXISTS idx_customers_phone ON cmrc_customers(tenant_id, phone);
 
 -- ============================================================
 -- LEDGER (Financial audit trail)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS ledger_entries (
+CREATE TABLE IF NOT EXISTS cmrc_ledger_entries (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   vendor_id TEXT,
@@ -141,13 +141,13 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   created_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_ledger_tenant ON ledger_entries(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_ledger_order ON ledger_entries(order_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_tenant ON cmrc_ledger_entries(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_order ON cmrc_ledger_entries(order_id);
 
 -- ============================================================
 -- SYNC MUTATIONS (Offline-first support)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS sync_mutations (
+CREATE TABLE IF NOT EXISTS cmrc_sync_mutations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT NOT NULL,
   entity_type TEXT NOT NULL,
@@ -160,4 +160,4 @@ CREATE TABLE IF NOT EXISTS sync_mutations (
   applied_at INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_sync_tenant ON sync_mutations(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_sync_tenant ON cmrc_sync_mutations(tenant_id, status);

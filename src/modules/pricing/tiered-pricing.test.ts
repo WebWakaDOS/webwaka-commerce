@@ -1,7 +1,7 @@
 /**
  * QA-COM-2 — Tiered Pricing Engine Unit Tests
  *
- * Certifies: "The GET /products endpoint correctly returns the discounted
+ * Certifies: "The GET /cmrc_products endpoint correctly returns the discounted
  * price for a customer in the 'Wholesale' segment."
  *
  * Also satisfies QA-COM-4 (unit tests for pricing engines).
@@ -231,7 +231,7 @@ describe('segmentFromJwtPayload — RBAC bypass prevention', () => {
     expect(segmentFromJwtPayload({ role: 'wholesale' })).toBe('WHOLESALE');
     expect(segmentFromJwtPayload({ role: 'vip' })).toBe('VIP');
     expect(segmentFromJwtPayload({ role: 'b2b' })).toBe('B2B');
-    expect(segmentFromJwtPayload({ role: 'staff' })).toBe('STAFF');
+    expect(segmentFromJwtPayload({ role: 'cmrc_staff' })).toBe('STAFF');
   });
 
   it('prefers customer_segment over role when both present', () => {
@@ -250,7 +250,7 @@ describe('segmentFromJwtPayload — RBAC bypass prevention', () => {
 describe('applySegmentPricing — catalog enrichment', () => {
   const catalog: TieredProduct[] = [PRODUCT_WITH_TIERS, PRODUCT_NO_TIERS, PRODUCT_ALREADY_PARSED];
 
-  it('enriches all products with the correct segment price', () => {
+  it('enriches all cmrc_products with the correct segment price', () => {
     const enriched = applySegmentPricing(catalog, 'WHOLESALE', 10);
     expect(enriched[0]!.price).toBe(380_000);  // WHOLESALE tier matched
     expect(enriched[1]!.price).toBe(50_000);   // no tiers, base price

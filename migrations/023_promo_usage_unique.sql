@@ -2,7 +2,7 @@
 -- T-COM-03 QA Fix: Per-customer promo usage query performance
 -- WebWaka Commerce Suite
 --
--- Adds a covering index on promo_usage(promoId, customerId, tenantId)
+-- Adds a covering index on cmrc_promo_usage(promoId, customerId, tenantId)
 -- to speed up the per-customer COUNT(*) query executed on every
 -- checkout that includes a promo with maxUsesPerCustomer > 0.
 --
@@ -21,4 +21,4 @@
 
 -- Non-unique covering index for the COUNT(*) per-customer query
 CREATE INDEX IF NOT EXISTS idx_promo_usage_customer
-  ON promo_usage(promoId, customerId, tenantId);
+  ON cmrc_promo_usage(promoId, customerId, tenantId);

@@ -1,6 +1,6 @@
 -- Migration 0002: Event handler target tables
--- platform_order_log: receives order.created events for cross-module audit
-CREATE TABLE IF NOT EXISTS platform_order_log (
+-- cmrc_platform_order_log: receives order.created events for cross-module audit
+CREATE TABLE IF NOT EXISTS cmrc_platform_order_log (
   id          TEXT PRIMARY KEY,
   tenant_id   TEXT NOT NULL,
   order_id    TEXT NOT NULL,
@@ -8,8 +8,8 @@ CREATE TABLE IF NOT EXISTS platform_order_log (
   created_at  TEXT NOT NULL
 );
 
--- shift_analytics: populated by shift.closed event handler (Z-report data)
-CREATE TABLE IF NOT EXISTS shift_analytics (
+-- cmrc_shift_analytics: populated by shift.closed event handler (Z-report data)
+CREATE TABLE IF NOT EXISTS cmrc_shift_analytics (
   id              TEXT PRIMARY KEY,
   tenant_id       TEXT NOT NULL,
   session_id      TEXT NOT NULL,
@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS shift_analytics (
   recorded_at     TEXT NOT NULL
 );
 
--- kyc_review_queue: vendor KYC submissions queued for manual review
-CREATE TABLE IF NOT EXISTS kyc_review_queue (
+-- cmrc_kyc_review_queue: vendor KYC submissions queued for manual review
+CREATE TABLE IF NOT EXISTS cmrc_kyc_review_queue (
   id           TEXT PRIMARY KEY,
   tenant_id    TEXT NOT NULL,
   vendor_id    TEXT NOT NULL,

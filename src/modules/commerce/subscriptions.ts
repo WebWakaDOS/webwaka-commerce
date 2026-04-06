@@ -26,7 +26,7 @@ export interface SubscriptionPlan {
   tenantId: string;
   name: string;                   // e.g. "Monthly Coffee Box"
   description?: string;
-  productIds: string[];           // products included in this plan
+  productIds: string[];           // cmrc_products included in this plan
   priceKobo: number;              // recurring charge amount
   interval: BillingInterval;
   trialDays: number;              // 0 = no trial
@@ -177,7 +177,7 @@ subscriptionsRouter.use('*', async (c, next) => {
   await next();
 });
 
-/** GET /api/subscriptions/plans — list active subscription plans (public) */
+/** GET /api/cmrc_subscriptions/plans — list active subscription plans (public) */
 subscriptionsRouter.get('/plans', async (c) => {
   const tenantId = getTenantId(c)!;
   try {
@@ -193,7 +193,7 @@ subscriptionsRouter.get('/plans', async (c) => {
   }
 });
 
-/** POST /api/subscriptions/plans — create a plan (admin) */
+/** POST /api/cmrc_subscriptions/plans — create a plan (admin) */
 subscriptionsRouter.post(
   '/plans',
   requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
@@ -231,7 +231,7 @@ subscriptionsRouter.post(
   }
 );
 
-/** POST /api/subscriptions — Subscribe a customer */
+/** POST /api/cmrc_subscriptions — Subscribe a customer */
 subscriptionsRouter.post('/', async (c) => {
   const tenantId = getTenantId(c)!;
   const body = await c.req.json<{
@@ -271,7 +271,7 @@ subscriptionsRouter.post('/', async (c) => {
     });
 
     await c.env.DB.prepare(
-      `INSERT INTO subscriptions
+      `INSERT INTO cmrc_subscriptions
          (id, tenant_id, plan_id, customer_id, customer_email, customer_phone,
           paystack_auth_code, paystack_customer_code, status, quantity,
           delivery_address_json, current_period_start, current_period_end,
@@ -293,14 +293,14 @@ subscriptionsRouter.post('/', async (c) => {
   }
 });
 
-/** PATCH /api/subscriptions/:id/pause — pause subscription */
+/** PATCH /api/cmrc_subscriptions/:id/pause — pause subscription */
 subscriptionsRouter.patch('/:id/pause', async (c) => {
   const tenantId = getTenantId(c)!;
   const id = c.req.param('id');
   const now = Date.now();
   try {
     await c.env.DB.prepare(
-      `UPDATE subscriptions SET status = 'PAUSED', paused_at = ?, updated_at = ?
+      `UPDATE cmrc_subscriptions SET status = 'PAUSED', paused_at = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ? AND status = 'ACTIVE'`
     ).bind(now, now, id, tenantId).run();
     return c.json({ success: true, data: { id, status: 'PAUSED' } });
@@ -310,7 +310,7 @@ subscriptionsRouter.patch('/:id/pause', async (c) => {
   }
 });
 
-/** PATCH /api/subscriptions/:id/cancel — cancel subscription */
+/** PATCH /api/cmrc_subscriptions/:id/cancel — cancel subscription */
 subscriptionsRouter.patch('/:id/cancel', async (c) => {
   const tenantId = getTenantId(c)!;
   const id = c.req.param('id');
@@ -318,7 +318,7 @@ subscriptionsRouter.patch('/:id/cancel', async (c) => {
   const now = Date.now();
   try {
     await c.env.DB.prepare(
-      `UPDATE subscriptions SET status = 'CANCELLED', cancelled_at = ?,
+      `UPDATE cmrc_subscriptions SET status = 'CANCELLED', cancelled_at = ?,
        cancel_reason = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ? AND status IN ('ACTIVE', 'PAUSED')`
     ).bind(now, body.reason ?? null, now, id, tenantId).run();
@@ -329,7 +329,7 @@ subscriptionsRouter.patch('/:id/cancel', async (c) => {
   }
 });
 
-/** GET /api/subscriptions/my — current customer's subscriptions (requires JWT) */
+/** GET /api/cmrc_subscriptions/my — current customer's cmrc_subscriptions (requires JWT) */
 subscriptionsRouter.get('/my', async (c) => {
   const tenantId = getTenantId(c)!;
   const email = c.req.query('email') ?? '';
@@ -338,7 +338,7 @@ subscriptionsRouter.get('/my', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT s.id, s.plan_id, sp.name as plan_name, s.status, s.quantity,
               s.current_period_end, s.next_charge_at, s.created_at
-       FROM subscriptions s
+       FROM cmrc_subscriptions s
        JOIN subscription_plans sp ON sp.id = s.plan_id
        WHERE s.tenant_id = ? AND s.customer_email = ?
        ORDER BY s.created_at DESC`

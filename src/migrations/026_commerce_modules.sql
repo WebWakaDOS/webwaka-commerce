@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS subscription_plans (
 CREATE INDEX IF NOT EXISTS idx_sub_plans_tenant ON subscription_plans (tenant_id, is_active);
 
 -- ── Subscriptions ─────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS subscriptions (
+CREATE TABLE IF NOT EXISTS cmrc_subscriptions (
   id                       TEXT PRIMARY KEY,
   tenant_id                TEXT NOT NULL,
   plan_id                  TEXT NOT NULL,
@@ -45,8 +45,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   created_at               INTEGER NOT NULL,
   updated_at               INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_subs_tenant ON subscriptions (tenant_id, status, next_charge_at);
-CREATE INDEX IF NOT EXISTS idx_subs_customer ON subscriptions (tenant_id, customer_email);
+CREATE INDEX IF NOT EXISTS idx_subs_tenant ON cmrc_subscriptions (tenant_id, status, next_charge_at);
+CREATE INDEX IF NOT EXISTS idx_subs_customer ON cmrc_subscriptions (tenant_id, customer_email);
 
 -- ── Gift Cards ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS gift_cards (
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS gift_card_redemptions (
 CREATE INDEX IF NOT EXISTS idx_gc_redemptions_card ON gift_card_redemptions (tenant_id, gift_card_id);
 
 -- ── Flash Sales ───────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS flash_sales (
+CREATE TABLE IF NOT EXISTS cmrc_flash_sales (
   id                TEXT PRIMARY KEY,
   tenant_id         TEXT NOT NULL,
   name              TEXT NOT NULL,
@@ -99,10 +99,10 @@ CREATE TABLE IF NOT EXISTS flash_sales (
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_flash_sales_tenant ON flash_sales (tenant_id, status, ends_at);
+CREATE INDEX IF NOT EXISTS idx_flash_sales_tenant ON cmrc_flash_sales (tenant_id, status, ends_at);
 
 -- ── Product Bundles ───────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS product_bundles (
+CREATE TABLE IF NOT EXISTS cmrc_product_bundles (
   id                          TEXT PRIMARY KEY,
   tenant_id                   TEXT NOT NULL,
   sku                         TEXT NOT NULL,
@@ -117,11 +117,11 @@ CREATE TABLE IF NOT EXISTS product_bundles (
   created_at                  INTEGER NOT NULL,
   updated_at                  INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_bundles_sku ON product_bundles (tenant_id, sku);
-CREATE INDEX IF NOT EXISTS idx_bundles_active ON product_bundles (tenant_id, is_active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bundles_sku ON cmrc_product_bundles (tenant_id, sku);
+CREATE INDEX IF NOT EXISTS idx_bundles_active ON cmrc_product_bundles (tenant_id, is_active);
 
 -- ── Purchase Orders ───────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS purchase_orders (
+CREATE TABLE IF NOT EXISTS cmrc_purchase_orders (
   id                  TEXT PRIMARY KEY,
   po_number           TEXT NOT NULL,
   tenant_id           TEXT NOT NULL,
@@ -139,10 +139,10 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_pos_tenant ON purchase_orders (tenant_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_pos_tenant ON cmrc_purchase_orders (tenant_id, status, created_at);
 
 -- ── Suppliers ─────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS suppliers (
+CREATE TABLE IF NOT EXISTS cmrc_suppliers (
   id         TEXT PRIMARY KEY,
   tenant_id  TEXT NOT NULL,
   name       TEXT NOT NULL,
@@ -151,10 +151,10 @@ CREATE TABLE IF NOT EXISTS suppliers (
   address    TEXT,
   created_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_suppliers_tenant ON suppliers (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_suppliers_tenant ON cmrc_suppliers (tenant_id);
 
 -- ── Commission Rules ──────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS commission_rules (
+CREATE TABLE IF NOT EXISTS cmrc_commission_rules (
   id              TEXT PRIMARY KEY,
   tenant_id       TEXT NOT NULL,
   cashier_id      TEXT NOT NULL,
@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS commission_rules (
   is_active       INTEGER NOT NULL DEFAULT 1,
   created_at      INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_comm_rules_cashier ON commission_rules (tenant_id, cashier_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_comm_rules_cashier ON cmrc_commission_rules (tenant_id, cashier_id, is_active);
 
 -- ── Commission Entries ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS commission_entries (
@@ -271,19 +271,19 @@ CREATE TABLE IF NOT EXISTS b2b_orders (
 CREATE INDEX IF NOT EXISTS idx_b2b_orders_tenant ON b2b_orders (tenant_id, b2b_account_id, status);
 
 -- ── Abandoned Carts extended columns ─────────────────────────────────────────
--- Note: abandoned_carts was created in migration 001_commerce_schema.sql
+-- Note: cmrc_abandoned_carts was created in migration 001_commerce_schema.sql
 -- This adds the `nudge_step` and `promo_code_applied` and `customer_name` columns
 -- if they don't already exist (SQLite does not support ALTER TABLE ADD COLUMN IF NOT EXISTS
 -- natively, so we use a try-safe approach by checking the info_schema equivalent).
 -- In production, run this only once.
-ALTER TABLE abandoned_carts ADD COLUMN customer_name TEXT;
-ALTER TABLE abandoned_carts ADD COLUMN promo_code_applied TEXT;
-ALTER TABLE abandoned_carts ADD COLUMN last_nudge_at INTEGER;
-ALTER TABLE abandoned_carts ADD COLUMN nudge_step INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE cmrc_abandoned_carts ADD COLUMN customer_name TEXT;
+ALTER TABLE cmrc_abandoned_carts ADD COLUMN promo_code_applied TEXT;
+ALTER TABLE cmrc_abandoned_carts ADD COLUMN last_nudge_at INTEGER;
+ALTER TABLE cmrc_abandoned_carts ADD COLUMN nudge_step INTEGER NOT NULL DEFAULT 0;
 
--- ── products: add B2B / pricing columns ──────────────────────────────────────
-ALTER TABLE products ADD COLUMN moq INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE products ADD COLUMN unit_cost_kobo INTEGER;
-ALTER TABLE products ADD COLUMN reorder_qty INTEGER NOT NULL DEFAULT 10;
-ALTER TABLE products ADD COLUMN supplier_id TEXT;
-ALTER TABLE products ADD COLUMN price_tiers_json TEXT;
+-- ── cmrc_products: add B2B / pricing columns ──────────────────────────────────────
+ALTER TABLE cmrc_products ADD COLUMN moq INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE cmrc_products ADD COLUMN unit_cost_kobo INTEGER;
+ALTER TABLE cmrc_products ADD COLUMN reorder_qty INTEGER NOT NULL DEFAULT 10;
+ALTER TABLE cmrc_products ADD COLUMN supplier_id TEXT;
+ALTER TABLE cmrc_products ADD COLUMN price_tiers_json TEXT;

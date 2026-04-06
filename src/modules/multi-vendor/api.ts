@@ -1,26 +1,26 @@
 /**
  * COM-3: Multi-Vendor Marketplace API — Phase MV-1 + MV-2 + MV-3
  * Auth, security hardening, KYC schema, vendor isolation, vendor onboarding,
- * cross-vendor catalog, marketplace cart, umbrella orders.
+ * cross-vendor catalog, marketplace cart, umbrella cmrc_orders.
  * Invariants: Nigeria-First (Paystack split in MV-3), Multi-tenancy, NDPR, Build Once Use Infinitely
  *
  * Auth model:
- *   Public  : GET /vendors (active only), GET /vendors/:id/products, GET /catalog,
+ *   Public  : GET /cmrc_vendors (active only), GET /cmrc_vendors/:id/cmrc_products, GET /catalog,
  *             GET /cart/:token, POST /cart, POST /checkout
- *   Admin   : POST /vendors, PATCH /vendors/:id  (requireRole SUPER_ADMIN | TENANT_ADMIN)
- *   Vendor  : POST /vendors/:id/products, GET /orders, GET /ledger,
- *             POST /vendors/:id/kyc  (Bearer JWT, role='vendor')
+ *   Admin   : POST /cmrc_vendors, PATCH /cmrc_vendors/:id  (requireRole SUPER_ADMIN | TENANT_ADMIN)
+ *   Vendor  : POST /cmrc_vendors/:id/cmrc_products, GET /cmrc_orders, GET /ledger,
+ *             POST /cmrc_vendors/:id/kyc  (Bearer JWT, role='vendor')
  *
  * MV-2 additions:
  *   POST /vendor-auth/request-otp  — alias for /auth/vendor-request-otp (canonical path)
  *   POST /vendor-auth/verify-otp   — alias for /auth/vendor-verify-otp
- *   POST /vendors/:id/kyc          — vendor submits rc_number, bvn_hash, nin_hash, bank_details
+ *   POST /cmrc_vendors/:id/kyc          — vendor submits rc_number, bvn_hash, nin_hash, bank_details
  *
  * MV-3 additions:
  *   GET  /catalog                  — cross-vendor cursor-paginated catalog, KV cache, FTS5 search
  *   POST /cart                     — create/update marketplace cart with per-vendor breakdown
  *   GET  /cart/:token              — return cart session with vendor_breakdown_json
- *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
+ *   POST /checkout                 — upgraded: creates cmrc_marketplace_orders umbrella + child cmrc_orders
  */
 import { Hono } from 'hono';
 import { getTenantId, requireRole, signJWT, verifyJWT, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider, createAiClient } from '@webwaka/core';
@@ -69,7 +69,7 @@ async function kvCheckRL(
 /**
  * Resolve the effective commission rate (basis points) for a given vendor/category.
  * Priority: 1) vendor+date match → 2) category+date match → 3) default 1000 bps (10%)
- * Uses `commission_rules` from migration 0003 (columns: tenantId, vendorId, category,
+ * Uses `cmrc_commission_rules` from migration 0003 (columns: tenantId, vendorId, category,
  * rateBps, effectiveFrom, effectiveUntil).
  */
 async function resolveCommissionRate(
@@ -81,9 +81,9 @@ async function resolveCommissionRate(
 ): Promise<number> {
   const now = new Date().toISOString();
 
-  // 1. Vendor-specific rule from commission_rules table
+  // 1. Vendor-specific rule from cmrc_commission_rules table
   const vendorRule = await db.prepare(
-    `SELECT rateBps FROM commission_rules
+    `SELECT rateBps FROM cmrc_commission_rules
      WHERE tenantId = ? AND vendorId = ?
        AND (effectiveFrom IS NULL OR effectiveFrom <= ?)
        AND (effectiveUntil IS NULL OR effectiveUntil > ?)
@@ -95,7 +95,7 @@ async function resolveCommissionRate(
   // 2. Category-wide rule (no vendorId restriction)
   if (category) {
     const catRule = await db.prepare(
-      `SELECT rateBps FROM commission_rules
+      `SELECT rateBps FROM cmrc_commission_rules
        WHERE tenantId = ? AND category = ? AND vendorId IS NULL
          AND (effectiveFrom IS NULL OR effectiveFrom <= ?)
          AND (effectiveUntil IS NULL OR effectiveUntil > ?)
@@ -105,7 +105,7 @@ async function resolveCommissionRate(
     if (catRule?.rateBps != null) return catRule.rateBps;
   }
 
-  // 3. Vendor's own commission_rate field (backward-compat with vendors table)
+  // 3. Vendor's own commission_rate field (backward-compat with cmrc_vendors table)
   if (vendorDefaultBps != null) return vendorDefaultBps;
 
   // 4. Platform-wide default: 10% (1000 bps)
@@ -164,7 +164,7 @@ app.use('*', async (c, next) => {
 /**
  * POST /auth/vendor-request-otp
  * Sends a 6-digit OTP via Termii SMS to the vendor's registered phone.
- * Vendor must already be registered in the `vendors` table for this marketplace.
+ * Vendor must already be registered in the `cmrc_vendors` table for this marketplace.
  */
 app.post('/auth/vendor-request-otp', async (c) => {
   const tenantId = getTenantId(c);
@@ -187,7 +187,7 @@ app.post('/auth/vendor-request-otp', async (c) => {
   try {
     // Verify vendor exists and is active for this marketplace
     const vendor = await c.env.DB.prepare(
-      "SELECT id, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; status: string }>();
 
     if (!vendor) {
@@ -204,7 +204,7 @@ app.post('/auth/vendor-request-otp', async (c) => {
     const otpId = `votp_${now}_${Math.random().toString(36).slice(2, 8)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+      `INSERT INTO cmrc_customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
@@ -245,7 +245,7 @@ app.post('/auth/vendor-verify-otp', async (c) => {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
     const otpRow = await c.env.DB.prepare(
       `SELECT id, otp_hash, is_used, attempts, expires_at
-       FROM customer_otps
+       FROM cmrc_customer_otps
        WHERE tenant_id = ? AND phone = ? AND is_used = 0
        ORDER BY created_at DESC LIMIT 1`
     ).bind(tenantId, e164).first<OtpRow>();
@@ -256,14 +256,14 @@ app.post('/auth/vendor-verify-otp', async (c) => {
 
     const inputHash = await hashOtp(otp);
     if (inputHash !== otpRow.otp_hash) {
-      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      await c.env.DB.prepare('UPDATE cmrc_customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
       return c.json({ success: false, error: 'Incorrect OTP' }, 401);
     }
 
-    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+    await c.env.DB.prepare('UPDATE cmrc_customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
 
     const vendor = await c.env.DB.prepare(
-      "SELECT id, name, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, name, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; name: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor account not found' }, 404);
@@ -297,17 +297,17 @@ app.post('/auth/vendor-verify-otp', async (c) => {
 
 /**
  * GET / — Marketplace overview (public)
- * Returns count of ACTIVE vendors and all live products for this marketplace.
+ * Returns count of ACTIVE cmrc_vendors and all live cmrc_products for this marketplace.
  */
 app.get('/', async (c) => {
   const tenantId = getTenantId(c);
   try {
     const vendorCount = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM vendors WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL"
+      "SELECT COUNT(*) as count FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL"
     ).bind(tenantId).first<{ count: number }>();
     const productCount = await c.env.DB.prepare(
-      `SELECT COUNT(*) as count FROM products p
-       INNER JOIN vendors v ON p.vendor_id = v.id
+      `SELECT COUNT(*) as count FROM cmrc_products p
+       INNER JOIN cmrc_vendors v ON p.vendor_id = v.id
        WHERE p.tenant_id = ? AND p.is_active = 1 AND p.deleted_at IS NULL
          AND v.status = 'active' AND v.deleted_at IS NULL`
     ).bind(tenantId).first<{ count: number }>();
@@ -325,16 +325,16 @@ app.get('/', async (c) => {
 });
 
 /**
- * GET /vendors — List ACTIVE vendors only (fix G-3)
- * Public endpoint — does NOT expose pending/suspended vendors.
+ * GET /cmrc_vendors — List ACTIVE cmrc_vendors only (fix G-3)
+ * Public endpoint — does NOT expose pending/suspended cmrc_vendors.
  * Returns safe fields only: no bank_account, no internal commission details.
  */
-app.get('/vendors', async (c) => {
+app.get('/cmrc_vendors', async (c) => {
   const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, name, slug, email, phone, address, status, performanceScore, badge, scoreUpdatedAt, created_at, updated_at
-       FROM vendors
+       FROM cmrc_vendors
        WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL
        ORDER BY name ASC`
     ).bind(tenantId).all();
@@ -346,19 +346,19 @@ app.get('/vendors', async (c) => {
 });
 
 /**
- * GET /vendors/:id/products — List vendor's active products (public browsing)
+ * GET /cmrc_vendors/:id/cmrc_products — List vendor's active cmrc_products (public browsing)
  * Verifies vendor is active before returning its catalog.
  * Does NOT expose cost_price (avoid COM-2 G-SEC-1 regression).
  * MV-3 will add cursor pagination and KV cache.
  */
-app.get('/vendors/:id/products', async (c) => {
+app.get('/cmrc_vendors/:id/cmrc_products', async (c) => {
   const tenantId = getTenantId(c);
   const vendorId = c.req.param('id');
 
   try {
     // Guard: vendor must be active and belong to this marketplace
     const vendor = await c.env.DB.prepare(
-      "SELECT id, status FROM vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
+      "SELECT id, status FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
     ).bind(vendorId, tenantId).first<{ id: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
@@ -367,7 +367,7 @@ app.get('/vendors/:id/products', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenant_id, vendor_id, sku, name, description, category,
               price, quantity, unit, image_url, barcode, has_variants, is_active, created_at, updated_at
-       FROM products
+       FROM cmrc_products
        WHERE vendor_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
        ORDER BY name ASC
        LIMIT 100`
@@ -380,10 +380,10 @@ app.get('/vendors/:id/products', async (c) => {
 });
 
 /**
- * GET /vendors/:id/products/:productId/variants — List product variants (public)
+ * GET /cmrc_vendors/:id/cmrc_products/:productId/variants — List product variants (public)
  * Returns grouped variant options so the storefront can render a picker.
  */
-app.get('/vendors/:id/products/:productId/variants', async (c) => {
+app.get('/cmrc_vendors/:id/cmrc_products/:productId/variants', async (c) => {
   const tenantId = getTenantId(c);
   const vendorId = c.req.param('id');
   const productId = c.req.param('productId');
@@ -391,21 +391,21 @@ app.get('/vendors/:id/products/:productId/variants', async (c) => {
   try {
     // Guard: product must belong to this vendor and tenant, and be active
     const product = await c.env.DB.prepare(
-      "SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL"
+      "SELECT id FROM cmrc_products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL"
     ).bind(productId, vendorId, tenantId).first<{ id: string }>();
 
     if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
 
     const { results } = await c.env.DB.prepare(
       `SELECT id, option_name, option_value, price_delta, quantity
-       FROM product_variants
+       FROM cmrc_product_variants
        WHERE product_id = ?
        ORDER BY option_name ASC, option_value ASC`
     ).bind(productId).all();
 
     return c.json({ success: true, data: { variants: results } });
   } catch (err) {
-    console.error('GET /vendors/:id/products/:productId/variants error:', err);
+    console.error('GET /cmrc_vendors/:id/cmrc_products/:productId/variants error:', err);
     return c.json({ success: false, error: 'Failed to load product variants' }, 500);
   }
 });
@@ -415,11 +415,11 @@ app.get('/vendors/:id/products/:productId/variants', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors — Register a new vendor (admin only)
+ * POST /cmrc_vendors — Register a new vendor (admin only)
  * Sets status = 'pending' awaiting KYC review and admin activation.
  * bank_account stored as Paystack subaccount code in MV-2 (see MULTI_VENDOR_REVIEW_AND_ENHANCEMENTS.md §7.2).
  */
-app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.post('/cmrc_vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
   const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
@@ -447,13 +447,13 @@ app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => 
   try {
     // Guard: slug must be unique per marketplace (G-3 / missing UNIQUE index — enforced here until migration 006)
     const existing = await c.env.DB.prepare(
-      "SELECT id FROM vendors WHERE marketplace_tenant_id = ? AND slug = ? AND deleted_at IS NULL"
+      "SELECT id FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND slug = ? AND deleted_at IS NULL"
     ).bind(tenantId, body.slug.trim()).first<{ id: string }>();
 
     if (existing) return c.json({ success: false, error: `Slug '${body.slug}' is already taken` }, 409);
 
     await c.env.DB.prepare(
-      `INSERT INTO vendors
+      `INSERT INTO cmrc_vendors
          (id, marketplace_tenant_id, name, slug, email, phone, address,
           bank_account, bank_code, commission_rate, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
@@ -474,11 +474,11 @@ app.post('/vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => 
 });
 
 /**
- * PATCH /vendors/:id — Update vendor status or commission (admin only)
+ * PATCH /cmrc_vendors/:id — Update vendor status or commission (admin only)
  * Valid status values: pending, active, suspended.
- * Suspended vendors immediately disappear from public GET /vendors.
+ * Suspended cmrc_vendors immediately disappear from public GET /cmrc_vendors.
  */
-app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.patch('/cmrc_vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
   const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
@@ -510,7 +510,7 @@ app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
   const now = Date.now();
   try {
     const vendor = await c.env.DB.prepare(
-      "SELECT id FROM vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
+      "SELECT id FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
     ).bind(id, tenantId).first<{ id: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
@@ -519,7 +519,7 @@ app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
       ? JSON.stringify(body.pickupAddress)
       : null;
     await c.env.DB.prepare(
-      `UPDATE vendors
+      `UPDATE cmrc_vendors
        SET status = COALESCE(?, status),
            commission_rate = COALESCE(?, commission_rate),
            pickupAddress = COALESCE(?, pickupAddress),
@@ -539,20 +539,20 @@ app.patch('/vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors/:id/products — Add product to vendor's catalog (vendor JWT required)
+ * POST /cmrc_vendors/:id/cmrc_products — Add product to vendor's catalog (vendor JWT required)
  * SEC-8 fix: verifies URL vendor_id matches the authenticated vendor's JWT claim.
- * Tenant isolation: products inserted with both tenant_id and vendor_id.
+ * Tenant isolation: cmrc_products inserted with both tenant_id and vendor_id.
  */
-app.post('/vendors/:id/products', async (c) => {
+app.post('/cmrc_vendors/:id/cmrc_products', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
   const vendorId = c.req.param('id');
   const tenantId = getTenantId(c);
 
-  // SEC-8: Vendor can only add products to their own catalog
+  // SEC-8: Vendor can only add cmrc_products to their own catalog
   if (vendor.vendorId !== vendorId) {
-    return c.json({ success: false, error: 'You may only add products to your own vendor catalog' }, 403);
+    return c.json({ success: false, error: 'You may only add cmrc_products to your own vendor catalog' }, 403);
   }
   // Tenant cross-check: JWT tenant must match header
   if (vendor.tenantId !== tenantId) {
@@ -583,7 +583,7 @@ app.post('/vendors/:id/products', async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO products
+      `INSERT INTO cmrc_products
          (id, tenant_id, vendor_id, sku, name, description, category,
           price, quantity, image_url, is_active, has_variants, version, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1, ?, ?)`
@@ -607,10 +607,10 @@ app.post('/vendors/:id/products', async (c) => {
 });
 
 /**
- * PATCH /vendors/:id/products/:productId — Update a vendor product (vendor JWT required)
- * Vendor can only edit products in their own catalog.
+ * PATCH /cmrc_vendors/:id/cmrc_products/:productId — Update a vendor product (vendor JWT required)
+ * Vendor can only edit cmrc_products in their own catalog.
  */
-app.patch('/vendors/:id/products/:productId', async (c) => {
+app.patch('/cmrc_vendors/:id/cmrc_products/:productId', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
@@ -619,7 +619,7 @@ app.patch('/vendors/:id/products/:productId', async (c) => {
   const tenantId = getTenantId(c);
 
   if (vendor.vendorId !== vendorId) {
-    return c.json({ success: false, error: 'You may only edit products in your own vendor catalog' }, 403);
+    return c.json({ success: false, error: 'You may only edit cmrc_products in your own vendor catalog' }, 403);
   }
   if (vendor.tenantId !== tenantId) {
     return c.json({ success: false, error: 'Tenant mismatch' }, 403);
@@ -627,7 +627,7 @@ app.patch('/vendors/:id/products/:productId', async (c) => {
 
   // Confirm product belongs to this vendor
   const existing = await c.env.DB.prepare(
-    "SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
+    "SELECT id FROM cmrc_products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
   ).bind(productId, vendorId, tenantId).first<{ id: string }>();
   if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
 
@@ -661,7 +661,7 @@ app.patch('/vendors/:id/products/:productId', async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `UPDATE products SET ${fields.join(', ')} WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL`
+      `UPDATE cmrc_products SET ${fields.join(', ')} WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL`
     ).bind(...values).run();
     return c.json({ success: true, data: { id: productId } });
   } catch (err) {
@@ -671,10 +671,10 @@ app.patch('/vendors/:id/products/:productId', async (c) => {
 });
 
 /**
- * DELETE /vendors/:id/products/:productId — Soft-delete a vendor product (vendor JWT required)
- * Vendor can only delete products in their own catalog.
+ * DELETE /cmrc_vendors/:id/cmrc_products/:productId — Soft-delete a vendor product (vendor JWT required)
+ * Vendor can only delete cmrc_products in their own catalog.
  */
-app.delete('/vendors/:id/products/:productId', async (c) => {
+app.delete('/cmrc_vendors/:id/cmrc_products/:productId', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
@@ -683,20 +683,20 @@ app.delete('/vendors/:id/products/:productId', async (c) => {
   const tenantId = getTenantId(c);
 
   if (vendor.vendorId !== vendorId) {
-    return c.json({ success: false, error: 'You may only delete products from your own vendor catalog' }, 403);
+    return c.json({ success: false, error: 'You may only delete cmrc_products from your own vendor catalog' }, 403);
   }
   if (vendor.tenantId !== tenantId) {
     return c.json({ success: false, error: 'Tenant mismatch' }, 403);
   }
 
   const existing = await c.env.DB.prepare(
-    "SELECT id FROM products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
+    "SELECT id FROM cmrc_products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
   ).bind(productId, vendorId, tenantId).first<{ id: string }>();
   if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
 
   try {
     await c.env.DB.prepare(
-      "UPDATE products SET deleted_at = ?, is_active = 0 WHERE id = ? AND vendor_id = ? AND tenant_id = ?"
+      "UPDATE cmrc_products SET deleted_at = ?, is_active = 0 WHERE id = ? AND vendor_id = ? AND tenant_id = ?"
     ).bind(Date.now(), productId, vendorId, tenantId).run();
     return c.json({ success: true, data: { id: productId } });
   } catch (err) {
@@ -706,12 +706,12 @@ app.delete('/vendors/:id/products/:productId', async (c) => {
 });
 
 /**
- * GET /orders — Vendor's marketplace orders (vendor JWT required)
- * Scoped: returns only orders containing items from the authenticated vendor.
- * NOTE: Uses items_json LIKE pattern (flat model). MV-2 replaces with vendor_orders table.
- * Tenant isolation: orders.tenant_id = marketplace tenant, channel = 'marketplace'.
+ * GET /cmrc_orders — Vendor's marketplace cmrc_orders (vendor JWT required)
+ * Scoped: returns only cmrc_orders containing items from the authenticated vendor.
+ * NOTE: Uses items_json LIKE pattern (flat model). MV-2 replaces with cmrc_vendor_orders table.
+ * Tenant isolation: cmrc_orders.tenant_id = marketplace tenant, channel = 'marketplace'.
  */
-app.get('/orders', async (c) => {
+app.get('/cmrc_orders', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
@@ -721,14 +721,14 @@ app.get('/orders', async (c) => {
   }
 
   try {
-    // Filter marketplace orders that contain items from this vendor
-    // MV-2 TODO: replace with SELECT from vendor_orders table once umbrella+child model is in place
+    // Filter marketplace cmrc_orders that contain items from this vendor
+    // MV-2 TODO: replace with SELECT from cmrc_vendor_orders table once umbrella+child model is in place
     const vendorPattern = `%"vendor_id":"${vendor.vendorId}"%`;
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenant_id, customer_email, subtotal, total_amount,
               payment_method, payment_status, order_status, payment_reference,
               items_json, channel, created_at, updated_at
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND channel = 'marketplace'
          AND items_json LIKE ?
          AND deleted_at IS NULL
@@ -764,8 +764,8 @@ app.get('/orders', async (c) => {
 
 /**
  * GET /ledger — Vendor's ledger entries (vendor JWT required)
- * Scoped to vendor_id from JWT — cannot read other vendors' financial data.
- * Tenant isolation: ledger_entries.tenant_id + vendor_id both checked.
+ * Scoped to vendor_id from JWT — cannot read other cmrc_vendors' financial data.
+ * Tenant isolation: cmrc_ledger_entries.tenant_id + vendor_id both checked.
  */
 app.get('/ledger', async (c) => {
   const vendor = await authenticateVendor(c);
@@ -779,7 +779,7 @@ app.get('/ledger', async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at
-       FROM ledger_entries
+       FROM cmrc_ledger_entries
        WHERE tenant_id = ? AND vendor_id = ?
        ORDER BY created_at DESC
        LIMIT 200`
@@ -849,11 +849,11 @@ async function getVendorShippingCost(
 
 /**
  * POST /checkout — Marketplace checkout (MV-4 upgrade)
- * MV-3: Creates marketplace_orders umbrella + per-vendor child orders + ledger entries.
+ * MV-3: Creates cmrc_marketplace_orders umbrella + per-vendor child cmrc_orders + ledger entries.
  * MV-4 adds:
  *   - Server-side Paystack transaction verify (when PAYSTACK_SECRET set + method='paystack')
  *   - Amount mismatch guard (prevents partial-payment fraud)
- *   - Per-vendor settlement records in `settlements` table (T+7 escrow default)
+ *   - Per-vendor settlement records in `cmrc_settlements` table (T+7 escrow default)
  *   - Vendor settlement_hold_days respected per vendor
  */
 app.post('/checkout', ndprConsentMiddleware, async (c) => {
@@ -888,7 +888,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
   try {
     const stockStmts = body.items.map((item) =>
       c.env.DB.prepare(
-        'SELECT id, quantity, version FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+        'SELECT id, quantity, version FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
       ).bind(item.product_id, tenantId),
     );
     const batchRows = await c.env.DB.batch<{ id: string; quantity: number; version: number }>(stockStmts);
@@ -970,7 +970,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       // Flash sale — use salePriceKobo if there's an active sale for this product
       try {
         const fs = await c.env.DB.prepare(
-          `SELECT salePriceKobo FROM flash_sales WHERE productId = ? AND tenantId = ? AND active = 1
+          `SELECT salePriceKobo FROM cmrc_flash_sales WHERE productId = ? AND tenantId = ? AND active = 1
            AND startTime <= ? AND endTime > ? AND quantitySold < quantityLimit LIMIT 1`,
         ).bind(item.product_id, getTenantId(c), nowIso, nowIso).first<{ salePriceKobo: number }>();
         if (fs && typeof fs.salePriceKobo === 'number') effectivePrice = fs.salePriceKobo;
@@ -980,7 +980,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       if (effectivePrice === item.price) {
         try {
           const tier = await c.env.DB.prepare(
-            `SELECT priceKobo FROM product_price_tiers WHERE productId = ? AND tenantId = ? AND minQty <= ? ORDER BY minQty DESC LIMIT 1`,
+            `SELECT priceKobo FROM cmrc_product_price_tiers WHERE productId = ? AND tenantId = ? AND minQty <= ? ORDER BY minQty DESC LIMIT 1`,
           ).bind(item.product_id, getTenantId(c), item.quantity).first<{ priceKobo: number }>();
           if (tier && typeof tier.priceKobo === 'number') effectivePrice = tier.priceKobo;
         } catch { /* non-fatal */ }
@@ -1023,17 +1023,17 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       // T-COM-04: per-vendor shipping fee (kobo) from Logistics Unified Delivery Zone API
       shippingKobo: number;
     }> = {};
-    // T-COM-04: Running total shipping across all vendor sub-orders
+    // T-COM-04: Running total shipping across all vendor sub-cmrc_orders
     let totalShippingKobo = 0;
     // T-COM-04: LOGISTICS_WORKER Service Binding (undefined in test/local envs — falls back to 0)
     const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
 
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const vendorRow = await c.env.DB.prepare(
-        'SELECT commission_rate, name, pickupAddress FROM vendors WHERE id = ? AND marketplace_tenant_id = ?'
+        'SELECT commission_rate, name, pickupAddress FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?'
       ).bind(vendorId, tenantId).first<{ commission_rate: number; name?: string; pickupAddress?: string }>();
 
-      // MV-E02: Resolve commission via rule engine (vendor/category/vendors.commission_rate/default cascade)
+      // MV-E02: Resolve commission via rule engine (vendor/category/cmrc_vendors.commission_rate/default cascade)
       const firstItemCategory: string | null = (group.items[0] as { category?: string | null } | undefined)?.category ?? null;
       const vendorDefaultBps = vendorRow?.commission_rate ?? undefined;
       const rateBps = await resolveCommissionRate(c.env.DB, tenantId!, vendorId, firstItemCategory, vendorDefaultBps);
@@ -1061,8 +1061,8 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       };
     }
 
-    // ── Insert marketplace_orders umbrella ───────────────────────────────────
-    // total_amount includes subtotal + consolidated shipping from all vendors (T-COM-04)
+    // ── Insert cmrc_marketplace_orders umbrella ───────────────────────────────────
+    // total_amount includes subtotal + consolidated shipping from all cmrc_vendors (T-COM-04)
     const grandTotal = subtotal + totalShippingKobo;
     // Shipping breakdown per vendor (shippingKobo per vendor_id) for customer receipt
     const shippingBreakdown: Record<string, number> = {};
@@ -1071,7 +1071,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
     }
 
     await c.env.DB.prepare(
-      `INSERT INTO marketplace_orders
+      `INSERT INTO cmrc_marketplace_orders
          (id, tenant_id, customer_email, customer_phone, items_json, vendor_count,
           subtotal, total_amount, total_shipping_kobo, shipping_breakdown_json,
           payment_method, payment_reference, payment_status,
@@ -1090,7 +1090,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       now, now,
     ).run();
 
-    // ── Insert per-vendor child orders ───────────────────────────────────────
+    // ── Insert per-vendor child cmrc_orders ───────────────────────────────────────
     const vendorSubOrderIds: Record<string, string> = {};
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const childId = `ord_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
@@ -1102,7 +1102,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       const childTotal = childSubtotal + childShippingKobo;
 
       await c.env.DB.prepare(
-        `INSERT INTO orders
+        `INSERT INTO cmrc_orders
            (id, tenant_id, customer_email, items_json, subtotal, discount, total_amount,
             shipping_kobo, payment_method, payment_status, order_status, channel, payment_reference,
             marketplace_order_id, created_at, updated_at)
@@ -1125,7 +1125,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         if (snap !== undefined) {
           const lockResult = await updateWithVersionLock(
             c.env.DB,
-            'products',
+            'cmrc_products',
             { quantity: snap.quantity - item.quantity },
             { id: item.product_id, tenantId: tenantId!, expectedVersion: snap.version },
           );
@@ -1157,14 +1157,14 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       const led2 = `led_${now + 1}_${Math.random().toString(36).slice(2, 9)}`;
 
       await c.env.DB.prepare(
-        `INSERT INTO ledger_entries
+        `INSERT INTO cmrc_ledger_entries
            (id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at)
          VALUES (?, ?, ?, ?, 'commission', ?, 'CREDIT', ?, ?, ?)`
       ).bind(led1, tenantId, vendorId, childId, bd.commission,
         `Commission from umbrella order ${mkpOrderId}`, paymentRef, now).run();
 
       await c.env.DB.prepare(
-        `INSERT INTO ledger_entries
+        `INSERT INTO cmrc_ledger_entries
            (id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at)
          VALUES (?, ?, ?, ?, 'revenue', ?, 'CREDIT', ?, ?, ?)`
       ).bind(led2, tenantId, vendorId, childId, bd.payout,
@@ -1173,14 +1173,14 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       // ── MV-4: Settlement record (T+hold_days escrow) ──────────────────────
       // Fetch vendor's settlement_hold_days (default 7 if column not yet migrated)
       const vendorHoldRow = await c.env.DB.prepare(
-        `SELECT settlement_hold_days FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
+        `SELECT settlement_hold_days FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`
       ).bind(vendorId, tenantId).first<{ settlement_hold_days?: number }>();
       const holdDays = vendorHoldRow?.settlement_hold_days ?? 7;
       const holdUntil = now + holdDays * 24 * 60 * 60 * 1000;
       const stlId = `stl_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
       await c.env.DB.prepare(
-        `INSERT OR IGNORE INTO settlements
+        `INSERT OR IGNORE INTO cmrc_settlements
            (id, tenant_id, vendor_id, order_id, marketplace_order_id, amount, commission,
             commission_rate, hold_days, hold_until, status, payment_reference, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?)`
@@ -1199,7 +1199,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
       // Running balance: read last entry, then apply delta
       try {
         const lastEntry = await c.env.DB.prepare(
-          `SELECT balanceKobo FROM vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
+          `SELECT balanceKobo FROM cmrc_vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
         ).bind(vendorId, tenantId).first<{ balanceKobo: number }>();
         const prevBalance = lastEntry?.balanceKobo ?? 0;
 
@@ -1207,7 +1207,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         const saleEntryId = `vle_sale_${now}_${Math.random().toString(36).slice(2, 9)}`;
         const balanceAfterSale = prevBalance + bd.payout;
         await c.env.DB.prepare(
-          `INSERT INTO vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+          `INSERT INTO cmrc_vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
            VALUES (?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?)`,
         ).bind(
           saleEntryId, tenantId, vendorId,
@@ -1220,7 +1220,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         const commEntryId = `vle_comm_${now}_${Math.random().toString(36).slice(2, 9)}`;
         const balanceAfterComm = balanceAfterSale - bd.commission;
         await c.env.DB.prepare(
-          `INSERT INTO vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+          `INSERT INTO cmrc_vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
            VALUES (?, ?, ?, 'COMMISSION', ?, ?, ?, ?, ?, ?)`,
         ).bind(
           commEntryId, tenantId, vendorId,
@@ -1229,7 +1229,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
           childId, new Date(now + 1).toISOString(),
         ).run();
       } catch (ledgerErr) {
-        console.warn('[MV][checkout] vendor_ledger_entries write failed (non-fatal):', ledgerErr);
+        console.warn('[MV][checkout] cmrc_vendor_ledger_entries write failed (non-fatal):', ledgerErr);
       }
 
       // ── Publish per-vendor delivery request ──────────────────────────────
@@ -1273,23 +1273,23 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         const phone = body.customer_phone ?? '';
         if (!phone) return;
         const custRow = await c.env.DB.prepare(
-          'SELECT id FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+          'SELECT id FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
         ).bind(tenantId, phone).first<{ id: string }>();
         if (!custRow) return;
         const existing = await c.env.DB.prepare(
-          'SELECT id, points FROM customer_loyalty WHERE tenantId = ? AND customerId = ?'
+          'SELECT id, points FROM cmrc_customer_loyalty WHERE tenantId = ? AND customerId = ?'
         ).bind(tenantId, custRow.id).first<{ id: string; points: number }>();
         const prevPts = existing?.points ?? 0;
         const newPts = prevPts + mvLoyaltyEarned;
         const newTierMv = evaluateLoyaltyTierMv(newPts, mvLoyaltyCfg);
         if (existing) {
           await c.env.DB.prepare(
-            'UPDATE customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
+            'UPDATE cmrc_customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
           ).bind(newPts, newTierMv, new Date(now).toISOString(), tenantId, custRow.id).run();
         } else {
           const lid = `loy_mv_${now}_${Math.random().toString(36).slice(2, 9)}`;
           await c.env.DB.prepare(
-            'INSERT OR IGNORE INTO customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
+            'INSERT OR IGNORE INTO cmrc_customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
           ).bind(lid, tenantId, custRow.id, mvLoyaltyEarned, evaluateLoyaltyTierMv(mvLoyaltyEarned, mvLoyaltyCfg), new Date(now).toISOString()).run();
         }
       } catch { /* non-fatal */ }
@@ -1303,7 +1303,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
         marketplace_order_id: mkpOrderId,
         subtotal,
         vat_kobo: mvVatKobo,
-        // T-COM-04: total_amount = subtotal + consolidated shipping across all vendor sub-orders
+        // T-COM-04: total_amount = subtotal + consolidated shipping across all vendor sub-cmrc_orders
         total_amount: grandTotal,
         total_shipping_kobo: totalShippingKobo,
         // Per-vendor shipping fee for customer receipt / UI split shipment display
@@ -1445,7 +1445,7 @@ app.post('/vendor/register', async (c) => {
   try {
     // ── Guard: phone uniqueness per marketplace ────────────────────────────
     const existing = await c.env.DB.prepare(
-      'SELECT id FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+      'SELECT id FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL',
     ).bind(tenantId, e164).first<{ id: string }>();
     if (existing) {
       return c.json({
@@ -1477,7 +1477,7 @@ app.post('/vendor/register', async (c) => {
 
     // ── Insert vendor row ──────────────────────────────────────────────────
     await c.env.DB.prepare(
-      `INSERT INTO vendors
+      `INSERT INTO cmrc_vendors
          (id, marketplace_tenant_id, name, slug, phone,
           bank_account, bank_code, commission_rate, status,
           bvn_hash, rc_number, bank_details_json,
@@ -1557,7 +1557,7 @@ app.post('/vendor-auth/request-otp', async (c) => {
 
   try {
     const vendor = await c.env.DB.prepare(
-      "SELECT id, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'No vendor account found with this phone number' }, 404);
@@ -1570,7 +1570,7 @@ app.post('/vendor-auth/request-otp', async (c) => {
     const otpId = `votp_${now}_${Math.random().toString(36).slice(2, 8)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+      `INSERT INTO cmrc_customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
@@ -1609,7 +1609,7 @@ app.post('/vendor-auth/verify-otp', async (c) => {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
     const otpRow = await c.env.DB.prepare(
       `SELECT id, otp_hash, is_used, attempts, expires_at
-       FROM customer_otps
+       FROM cmrc_customer_otps
        WHERE tenant_id = ? AND phone = ? AND is_used = 0
        ORDER BY created_at DESC LIMIT 1`
     ).bind(tenantId, e164).first<OtpRow>();
@@ -1620,14 +1620,14 @@ app.post('/vendor-auth/verify-otp', async (c) => {
 
     const inputHash = await hashOtp(otp);
     if (inputHash !== otpRow.otp_hash) {
-      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      await c.env.DB.prepare('UPDATE cmrc_customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
       return c.json({ success: false, error: 'Incorrect OTP' }, 401);
     }
 
-    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+    await c.env.DB.prepare('UPDATE cmrc_customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
 
     const vendor = await c.env.DB.prepare(
-      "SELECT id, name, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, name, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; name: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor account not found' }, 404);
@@ -1657,7 +1657,7 @@ app.post('/vendor-auth/verify-otp', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors/:id/kyc — Submit KYC documents (vendor JWT required)
+ * POST /cmrc_vendors/:id/kyc — Submit KYC documents (vendor JWT required)
  * Vendor submits their CAC registration, hashed BVN/NIN, and bank details.
  * Status changes from 'none' → 'submitted'; admin review sets 'approved'/'rejected'.
  *
@@ -1675,7 +1675,7 @@ app.post('/vendor-auth/verify-otp', async (c) => {
  *   cac_docs_url    — URL to uploaded CAC certificate (R2/S3)
  *   bank_details    — { bank_code: string, account_number: string, account_name: string }
  */
-app.post('/vendors/:id/kyc', async (c) => {
+app.post('/cmrc_vendors/:id/kyc', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
@@ -1726,7 +1726,7 @@ app.post('/vendors/:id/kyc', async (c) => {
 
   try {
     const existing = await c.env.DB.prepare(
-      "SELECT id, kyc_status FROM vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
+      "SELECT id, kyc_status FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
     ).bind(vendorId, tenantId).first<{ id: string; kyc_status: string }>();
 
     if (!existing) return c.json({ success: false, error: 'Vendor not found' }, 404);
@@ -1744,7 +1744,7 @@ app.post('/vendors/:id/kyc', async (c) => {
 
     const now = Date.now();
     await c.env.DB.prepare(
-      `UPDATE vendors
+      `UPDATE cmrc_vendors
        SET rc_number = COALESCE(?, rc_number),
            bvn_hash = COALESCE(?, bvn_hash),
            nin_hash = COALESCE(?, nin_hash),
@@ -1786,7 +1786,7 @@ app.post('/vendors/:id/kyc', async (c) => {
 
 /**
  * GET /catalog
- * Returns active products from all active vendors in this marketplace.
+ * Returns active cmrc_products from all active cmrc_vendors in this marketplace.
  * Supports cursor pagination (after=<product_id>), per_page (max 24, default 12),
  * search (FTS5 MATCH or LIKE fallback), category, and vendor_id filters.
  *
@@ -1885,8 +1885,8 @@ app.get('/catalog', async (c) => {
         v.slug  AS vendor_slug,
         v.rating_avg, v.rating_count,
         p.created_at
-      FROM products p
-      INNER JOIN vendors v ON v.id = p.vendor_id
+      FROM cmrc_products p
+      INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
       ${searchJoin}
       WHERE ${where}
       ORDER BY p.id ASC
@@ -1955,8 +1955,8 @@ app.get('/catalog', async (c) => {
                   p.price, p.quantity, p.image_url, p.vendor_id,
                   v.name AS vendor_name, v.slug AS vendor_slug,
                   v.rating_avg, v.rating_count, p.created_at
-           FROM products p
-           INNER JOIN vendors v ON v.id = p.vendor_id
+           FROM cmrc_products p
+           INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
            WHERE ${fallbackConds.join(' AND ')}
            ORDER BY p.id ASC LIMIT ?`
         ).bind(...(fallbackBinds as any[])).all<{
@@ -1980,16 +1980,16 @@ app.get('/catalog', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MV-3: PUBLIC ORDER TRACKING — GET /orders/track
+// MV-3: PUBLIC ORDER TRACKING — GET /cmrc_orders/track
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * GET /orders/track?marketplace_order_id=... — T-CVC-02: Redirect to Logistics tracking portal
+ * GET /cmrc_orders/track?marketplace_order_id=... — T-CVC-02: Redirect to Logistics tracking portal
  * Obtains a signed tracking token from Logistics via Service Binding, then redirects
  * the customer to the Logistics tracking portal URL.
  * Falls back to Commerce-native status when Logistics is unavailable.
  */
-app.get('/orders/track', async (c) => {
+app.get('/cmrc_orders/track', async (c) => {
   const tenantId = getTenantId(c);
   const mkpOrderId = c.req.query('marketplace_order_id')?.trim();
 
@@ -2000,7 +2000,7 @@ app.get('/orders/track', async (c) => {
   // Verify order exists and belongs to this tenant before issuing a token
   try {
     const umbrella = await c.env.DB.prepare(
-      `SELECT id FROM marketplace_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+      `SELECT id FROM cmrc_marketplace_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
     ).bind(mkpOrderId, tenantId).first<{ id: string }>();
     if (!umbrella) return c.json({ success: false, error: 'Order not found' }, 404);
   } catch (err) {
@@ -2038,7 +2038,7 @@ app.get('/orders/track', async (c) => {
     const umbrella = await c.env.DB.prepare(
       `SELECT id, payment_status, order_status, vendor_count, total_amount,
               customer_email, created_at, updated_at
-       FROM marketplace_orders
+       FROM cmrc_marketplace_orders
        WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
     ).bind(mkpOrderId, tenantId).first<{
       id: string; payment_status: string; order_status: string;
@@ -2049,7 +2049,7 @@ app.get('/orders/track', async (c) => {
 
     const { results: childOrders } = await c.env.DB.prepare(
       `SELECT id, vendor_id, order_status, payment_status, total_amount
-       FROM orders
+       FROM cmrc_orders
        WHERE marketplace_order_id = ? AND tenant_id = ? AND deleted_at IS NULL
        ORDER BY created_at ASC`
     ).bind(mkpOrderId, tenantId).all<{
@@ -2074,7 +2074,7 @@ app.get('/orders/track', async (c) => {
         customer_email_masked: maskedEmail,
         created_at: umbrella.created_at,
         updated_at: umbrella.updated_at,
-        vendor_orders: childOrders,
+        cmrc_vendor_orders: childOrders,
       },
       note: 'logistics_unavailable',
     });
@@ -2155,7 +2155,7 @@ app.post('/cart', ndprConsentMiddleware, async (c) => {
     if (body.token) {
       // Update existing cart
       const existing = await c.env.DB.prepare(
-        `SELECT id FROM cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?`
+        `SELECT id FROM cmrc_cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?`
       ).bind(body.token, tenantId, now).first<{ id: string }>();
 
       if (!existing) {
@@ -2163,7 +2163,7 @@ app.post('/cart', ndprConsentMiddleware, async (c) => {
       }
 
       await c.env.DB.prepare(
-        `UPDATE cart_sessions
+        `UPDATE cmrc_cart_sessions
          SET items_json = ?, vendor_breakdown_json = ?, expires_at = ?,
              customer_phone = COALESCE(?, customer_phone), updated_at = ?
          WHERE session_token = ? AND tenant_id = ?`
@@ -2194,7 +2194,7 @@ app.post('/cart', ndprConsentMiddleware, async (c) => {
     const cartId = `cs_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO cart_sessions
+      `INSERT INTO cmrc_cart_sessions
          (id, tenant_id, session_token, items_json, vendor_breakdown_json,
           channel, customer_phone, expires_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'marketplace', ?, ?, ?, ?)`
@@ -2238,7 +2238,7 @@ app.get('/cart/:token', async (c) => {
     const cart = await c.env.DB.prepare(
       `SELECT id, session_token, items_json, vendor_breakdown_json,
               customer_phone, expires_at, created_at, updated_at
-       FROM cart_sessions
+       FROM cmrc_cart_sessions
        WHERE session_token = ? AND tenant_id = ? AND channel = 'marketplace'`
     ).bind(token, tenantId).first<{
       id: string;
@@ -2293,7 +2293,7 @@ app.get('/cart/:token', async (c) => {
  * Verifies x-paystack-signature header (HMAC-SHA512 of raw body with PAYSTACK_SECRET).
  * Handles: charge.success → marks order paid + creates settlement if missing.
  *          transfer.success → marks payout_request as paid.
- * Idempotent: logs each event in paystack_webhook_log (unique on event+reference).
+ * Idempotent: logs each event in cmrc_paystack_webhook_log (unique on event+reference).
  */
 app.post('/paystack/webhook', async (c) => {
   const signature = c.req.header('x-paystack-signature');
@@ -2340,7 +2340,7 @@ app.post('/paystack/webhook', async (c) => {
 
   // Idempotency: skip already-processed events
   const existing = await c.env.DB.prepare(
-    `SELECT id, processed FROM paystack_webhook_log WHERE id = ?`
+    `SELECT id, processed FROM cmrc_paystack_webhook_log WHERE id = ?`
   ).bind(logId).first<{ id: string; processed: number }>();
 
   if (existing?.processed) {
@@ -2349,35 +2349,35 @@ app.post('/paystack/webhook', async (c) => {
 
   // Log the event
   await c.env.DB.prepare(
-    `INSERT OR IGNORE INTO paystack_webhook_log
+    `INSERT OR IGNORE INTO cmrc_paystack_webhook_log
        (id, event, reference, tenant_id, raw_json, processed, received_at)
      VALUES (?, ?, ?, ?, ?, 0, ?)`
   ).bind(logId, event, reference, tenantId ?? null, rawBody, now).run();
 
   try {
     if (event === 'charge.success') {
-      // Mark orders paid
+      // Mark cmrc_orders paid
       if (tenantId && reference) {
         await c.env.DB.prepare(
-          `UPDATE orders SET payment_status = 'paid', updated_at = ?
+          `UPDATE cmrc_orders SET payment_status = 'paid', updated_at = ?
            WHERE payment_reference = ? AND tenant_id = ?`
         ).bind(now, reference, tenantId).run();
 
         await c.env.DB.prepare(
-          `UPDATE marketplace_orders SET payment_status = 'paid', updated_at = ?
+          `UPDATE cmrc_marketplace_orders SET payment_status = 'paid', updated_at = ?
            WHERE payment_reference = ? AND tenant_id = ?`
         ).bind(now, reference, tenantId).run();
 
-        // Mark held settlements eligible if hold_until has passed
+        // Mark held cmrc_settlements eligible if hold_until has passed
         await c.env.DB.prepare(
-          `UPDATE settlements SET status = 'eligible', updated_at = ?
+          `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
            WHERE tenant_id = ? AND payment_reference = ? AND status = 'held' AND hold_until <= ?`
         ).bind(now, tenantId, reference, now).run();
       }
       // Notify central-mgmt ledger of paid order (non-fatal)
       if (tenantId && reference) {
         const orderRow = await c.env.DB.prepare(
-          `SELECT id, total_amount FROM orders WHERE payment_reference = ? AND tenant_id = ? LIMIT 1`
+          `SELECT id, total_amount FROM cmrc_orders WHERE payment_reference = ? AND tenant_id = ? LIMIT 1`
         ).bind(reference, tenantId).first<{ id: string; total_amount: number }>();
         if (orderRow && Number.isInteger(orderRow.total_amount) && orderRow.total_amount > 0) {
           await notifyOrderPaid(
@@ -2394,12 +2394,12 @@ app.post('/paystack/webhook', async (c) => {
       const transferCode = data.transfer_code as string | undefined;
       if (transferCode) {
         await c.env.DB.prepare(
-          `UPDATE payout_requests SET status = 'paid', processed_at = ?, updated_at = ?
+          `UPDATE cmrc_payout_requests SET status = 'paid', processed_at = ?, updated_at = ?
            WHERE paystack_transfer_code = ?`
         ).bind(now, now, transferCode).run();
         // Notify central-mgmt ledger of processed payout (non-fatal)
         const payoutRow = await c.env.DB.prepare(
-          `SELECT id, vendor_id, tenant_id, amount_kobo FROM payout_requests WHERE paystack_transfer_code = ? LIMIT 1`
+          `SELECT id, vendor_id, tenant_id, amount_kobo FROM cmrc_payout_requests WHERE paystack_transfer_code = ? LIMIT 1`
         ).bind(transferCode).first<{ id: string; vendor_id: string; tenant_id: string; amount_kobo: number }>();
         if (payoutRow && Number.isInteger(payoutRow.amount_kobo) && payoutRow.amount_kobo > 0) {
           await notifyPayoutProcessed(
@@ -2417,7 +2417,7 @@ app.post('/paystack/webhook', async (c) => {
       if (transferCode) {
         const reason = event === 'transfer.reversed' ? 'Transfer reversed by Paystack' : 'Transfer failed';
         await c.env.DB.prepare(
-          `UPDATE payout_requests SET status = 'failed', failure_reason = ?, processed_at = ?, updated_at = ?
+          `UPDATE cmrc_payout_requests SET status = 'failed', failure_reason = ?, processed_at = ?, updated_at = ?
            WHERE paystack_transfer_code = ?`
         ).bind(reason, now, now, transferCode).run();
       }
@@ -2425,13 +2425,13 @@ app.post('/paystack/webhook', async (c) => {
 
     // Mark event as processed
     await c.env.DB.prepare(
-      `UPDATE paystack_webhook_log SET processed = 1 WHERE id = ?`
+      `UPDATE cmrc_paystack_webhook_log SET processed = 1 WHERE id = ?`
     ).bind(logId).run();
 
     return c.json({ success: true });
   } catch (e) {
     await c.env.DB.prepare(
-      `UPDATE paystack_webhook_log SET error = ? WHERE id = ?`
+      `UPDATE cmrc_paystack_webhook_log SET error = ? WHERE id = ?`
     ).bind(String(e), logId).run();
     console.error('[MV][paystack/webhook] handler error:', e);
     return c.json({ success: false, error: 'Internal server error' }, 500);
@@ -2506,12 +2506,12 @@ app.get('/shipping/estimate', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * GET /vendors/:id/settlements — List settlement records for authenticated vendor.
+ * GET /cmrc_vendors/:id/cmrc_settlements — List settlement records for authenticated vendor.
  * Requires vendor JWT (vendorAuthMiddleware).
  * Returns settled and eligible records plus eligible_total (kobo).
- * Automatically marks held settlements as eligible if hold_until has passed.
+ * Automatically marks held cmrc_settlements as eligible if hold_until has passed.
  */
-app.get('/vendors/:id/settlements', async (c) => {
+app.get('/cmrc_vendors/:id/cmrc_settlements', async (c) => {
   const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.param('id');
@@ -2527,7 +2527,7 @@ app.get('/vendors/:id/settlements', async (c) => {
 
     // Promote held → eligible if hold_until has passed
     await c.env.DB.prepare(
-      `UPDATE settlements SET status = 'eligible', updated_at = ?
+      `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
        WHERE tenant_id = ? AND vendor_id = ? AND status = 'held' AND hold_until <= ?`
     ).bind(now, tenantId, vendorId, now).run();
 
@@ -2535,7 +2535,7 @@ app.get('/vendors/:id/settlements', async (c) => {
       `SELECT id, order_id, marketplace_order_id, amount, commission, commission_rate,
               hold_days, hold_until, status, payout_request_id, payment_reference,
               created_at, updated_at
-       FROM settlements
+       FROM cmrc_settlements
        WHERE tenant_id = ? AND vendor_id = ?
        ORDER BY created_at DESC LIMIT 100`
     ).bind(tenantId, vendorId).all<{
@@ -2574,13 +2574,13 @@ app.get('/vendors/:id/settlements', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors/:id/payout-request — Initiate payout withdrawal.
- * Requires vendor JWT. Vendor must have eligible settlements.
- * Creates payout_request, links settlements to it, transitions them to 'released'.
+ * POST /cmrc_vendors/:id/payout-request — Initiate payout withdrawal.
+ * Requires vendor JWT. Vendor must have eligible cmrc_settlements.
+ * Creates payout_request, links cmrc_settlements to it, transitions them to 'released'.
  * Returns 409 if an active payout request is already pending/processing.
  * Returns 422 if eligible_total === 0.
  */
-app.post('/vendors/:id/payout-request', async (c) => {
+app.post('/cmrc_vendors/:id/payout-request', async (c) => {
   const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.param('id');
@@ -2596,13 +2596,13 @@ app.post('/vendors/:id/payout-request', async (c) => {
   try {
     // Promote held → eligible (must run first so the subsequent SELECT captures them)
     await c.env.DB.prepare(
-      `UPDATE settlements SET status = 'eligible', updated_at = ?
+      `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
        WHERE tenant_id = ? AND vendor_id = ? AND status = 'held' AND hold_until <= ?`
     ).bind(now, tenantId, vendorId, now).run();
 
     // Check for existing pending/processing payout
     const existingPayout = await c.env.DB.prepare(
-      `SELECT id, status FROM payout_requests
+      `SELECT id, status FROM cmrc_payout_requests
        WHERE tenant_id = ? AND vendor_id = ? AND status IN ('pending', 'processing')
        LIMIT 1`
     ).bind(tenantId, vendorId).first<{ id: string; status: string }>();
@@ -2614,30 +2614,30 @@ app.post('/vendors/:id/payout-request', async (c) => {
       }, 409);
     }
 
-    // Fetch eligible settlements and vendor bank snapshot in parallel
+    // Fetch eligible cmrc_settlements and vendor bank snapshot in parallel
     const [eligible, vendorRecord] = await Promise.all([
       c.env.DB.prepare(
-        `SELECT id, amount FROM settlements
+        `SELECT id, amount FROM cmrc_settlements
          WHERE tenant_id = ? AND vendor_id = ? AND status = 'eligible'`
       ).bind(tenantId, vendorId).all<{ id: string; amount: number }>(),
       c.env.DB.prepare(
-        `SELECT bank_details_json FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
+        `SELECT bank_details_json FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`
       ).bind(vendorId, tenantId).first<{ bank_details_json: string | null }>(),
     ]);
 
     const eligibleRows = eligible.results ?? [];
     if (eligibleRows.length === 0) {
-      return c.json({ success: false, error: 'No eligible settlements to pay out. Balance may still be in hold period.' }, 422);
+      return c.json({ success: false, error: 'No eligible cmrc_settlements to pay out. Balance may still be in hold period.' }, 422);
     }
 
     const totalAmount = eligibleRows.reduce((s, r) => s + r.amount, 0);
     const prId = `pr_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
-    // Atomic batch: INSERT payout_request + UPDATE all settlements in a single D1 transaction.
+    // Atomic batch: INSERT payout_request + UPDATE all cmrc_settlements in a single D1 transaction.
     // If any statement fails the entire batch is rolled back, preventing orphaned payout records.
     await c.env.DB.batch([
       c.env.DB.prepare(
-        `INSERT INTO payout_requests
+        `INSERT INTO cmrc_payout_requests
            (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
             status, requested_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
@@ -2647,7 +2647,7 @@ app.post('/vendors/:id/payout-request', async (c) => {
       ),
       ...eligibleRows.map(row =>
         c.env.DB.prepare(
-          `UPDATE settlements
+          `UPDATE cmrc_settlements
            SET status = 'released', payout_request_id = ?, updated_at = ?
            WHERE id = ?`
         ).bind(prId, now, row.id)
@@ -2677,7 +2677,7 @@ app.post('/vendors/:id/payout-request', async (c) => {
 
 /**
  * GET /search
- * Full-text product search across all active vendors in the marketplace.
+ * Full-text product search across all active cmrc_vendors in the marketplace.
  * Uses FTS5 MATCH when the products_fts table is available; falls back to LIKE.
  * Tenant-isolated: all queries are scoped to the x-tenant-id header.
  */
@@ -2728,8 +2728,8 @@ app.get('/search', async (c) => {
         p.price, p.quantity, p.image_url, p.vendor_id,
         v.name AS vendor_name, v.slug AS vendor_slug,
         v.badge AS vendor_badge, v.performanceScore AS vendor_score
-      FROM products p
-      INNER JOIN vendors v ON v.id = p.vendor_id
+      FROM cmrc_products p
+      INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
       ${searchJoin}
       WHERE ${where}
       ORDER BY p.id ASC
@@ -2767,8 +2767,8 @@ app.get('/search', async (c) => {
                   p.price, p.quantity, p.image_url, p.vendor_id,
                   v.name AS vendor_name, v.slug AS vendor_slug,
                   v.badge AS vendor_badge, v.performanceScore AS vendor_score
-           FROM products p
-           INNER JOIN vendors v ON v.id = p.vendor_id
+           FROM cmrc_products p
+           INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
            WHERE ${conditions.join(' AND ')}
            ORDER BY p.id ASC LIMIT ?`,
         ).bind(...(binds as any[])).all<{
@@ -2801,7 +2801,7 @@ app.get('/admin/commission-rules', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenantId, vendorId, category, rateBps, effectiveFrom, effectiveUntil, createdAt
-       FROM commission_rules WHERE tenantId = ? ORDER BY effectiveFrom DESC`,
+       FROM cmrc_commission_rules WHERE tenantId = ? ORDER BY effectiveFrom DESC`,
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
   } catch (err) {
@@ -2832,7 +2832,7 @@ app.post('/admin/commission-rules', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN'])
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO commission_rules (id, tenantId, vendorId, category, rateBps, effectiveFrom, effectiveUntil, createdAt)
+      `INSERT INTO cmrc_commission_rules (id, tenantId, vendorId, category, rateBps, effectiveFrom, effectiveUntil, createdAt)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       id, tenantId,
@@ -2868,13 +2868,13 @@ app.get('/vendor/ledger', async (c) => {
 
   try {
     const countRow = await c.env.DB.prepare(
-      `SELECT COUNT(*) as total FROM vendor_ledger_entries WHERE vendorId = ? AND tenantId = ?`,
+      `SELECT COUNT(*) as total FROM cmrc_vendor_ledger_entries WHERE vendorId = ? AND tenantId = ?`,
     ).bind(vendor.vendorId, tenantId).first<{ total: number }>();
     const total = countRow?.total ?? 0;
 
     const { results: entries } = await c.env.DB.prepare(
       `SELECT id, type, amountKobo, balanceKobo, reference, description, orderId, createdAt
-       FROM vendor_ledger_entries
+       FROM cmrc_vendor_ledger_entries
        WHERE vendorId = ? AND tenantId = ?
        ORDER BY createdAt DESC
        LIMIT ? OFFSET ?`,
@@ -2904,7 +2904,7 @@ app.get('/vendor/balance', async (c) => {
          COALESCE(SUM(CASE WHEN type = 'SALE' THEN amountKobo ELSE 0 END), 0) -
          COALESCE(SUM(CASE WHEN type IN ('COMMISSION', 'PAYOUT', 'REFUND') THEN amountKobo ELSE 0 END), 0)
          AS availableKobo
-       FROM vendor_ledger_entries
+       FROM cmrc_vendor_ledger_entries
        WHERE vendorId = ? AND tenantId = ?`,
     ).bind(vendor.vendorId, tenantId).first<{ availableKobo: number }>();
 
@@ -2938,7 +2938,7 @@ app.post('/vendor/payout-request', async (c) => {
          COALESCE(SUM(CASE WHEN type = 'SALE' THEN amountKobo ELSE 0 END), 0) -
          COALESCE(SUM(CASE WHEN type IN ('COMMISSION', 'PAYOUT', 'REFUND') THEN amountKobo ELSE 0 END), 0)
          AS availableKobo
-       FROM vendor_ledger_entries
+       FROM cmrc_vendor_ledger_entries
        WHERE vendorId = ? AND tenantId = ?`,
     ).bind(vendor.vendorId, tenantId).first<{ availableKobo: number }>();
 
@@ -2955,7 +2955,7 @@ app.post('/vendor/payout-request', async (c) => {
 
     // Fetch vendor bank details
     const vendorRow = await c.env.DB.prepare(
-      `SELECT bank_details_json FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+      `SELECT bank_details_json FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
     ).bind(vendor.vendorId, tenantId).first<{ bank_details_json: string | null }>();
 
     const bankDetails = vendorRow?.bank_details_json
@@ -2984,14 +2984,14 @@ app.post('/vendor/payout-request', async (c) => {
 
     // Write PAYOUT ledger entry
     const lastEntry = await c.env.DB.prepare(
-      `SELECT balanceKobo FROM vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
+      `SELECT balanceKobo FROM cmrc_vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
     ).bind(vendor.vendorId, tenantId).first<{ balanceKobo: number }>();
     const prevBalance = lastEntry?.balanceKobo ?? 0;
     const newBalance = prevBalance - availableKobo;
 
     const payoutEntryId = `vle_payout_${now}_${Math.random().toString(36).slice(2, 9)}`;
     await c.env.DB.prepare(
-      `INSERT INTO vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+      `INSERT INTO cmrc_vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
        VALUES (?, ?, ?, 'PAYOUT', ?, ?, ?, ?, NULL, ?)`,
     ).bind(
       payoutEntryId, tenantId, vendor.vendorId,
@@ -3015,10 +3015,10 @@ app.post('/vendor/payout-request', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /disputes — Customer or vendor opens a dispute
+ * POST /cmrc_disputes — Customer or vendor opens a dispute
  * Auth: customer JWT (role='customer') OR vendor JWT (role='vendor')
  */
-app.post('/disputes', async (c) => {
+app.post('/cmrc_disputes', async (c) => {
   const tenantId = getTenantId(c);
   const body = await c.req.json<{
     orderId: string;
@@ -3047,7 +3047,7 @@ app.post('/disputes', async (c) => {
   try {
     const order = await c.env.DB.prepare(
       `SELECT id, customer_phone, vendor_id, paystack_reference
-       FROM orders WHERE id = ? AND tenant_id = ?`,
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ?`,
     ).bind(body.orderId, tenantId).first<{
       id: string; customer_phone: string | null; vendor_id: string | null; paystack_reference: string | null;
     }>();
@@ -3070,7 +3070,7 @@ app.post('/disputes', async (c) => {
     const disputeId = `dsp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO disputes
+      `INSERT INTO cmrc_disputes
          (id, tenant_id, order_id, reporter_id, reporter_role, category, description,
           evidence_urls_json, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`,
@@ -3099,7 +3099,7 @@ app.post('/disputes', async (c) => {
       }
       if (order.vendor_id) {
         const vendorRow = await c.env.DB.prepare(
-          `SELECT phone FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+          `SELECT phone FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
         ).bind(order.vendor_id, tenantId).first<{ phone: string | null }>();
         if (vendorRow?.phone) {
           await sms.sendOtp(vendorRow.phone, notifyMsg, 'whatsapp').catch(() => {});
@@ -3109,15 +3109,15 @@ app.post('/disputes', async (c) => {
 
     return c.json({ success: true, data: { disputeId, status: 'OPEN' } }, 201);
   } catch (err) {
-    console.error('[MV] disputes error:', err);
+    console.error('[MV] cmrc_disputes error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * GET /admin/disputes — List disputes by status (admin only)
+ * GET /admin/cmrc_disputes — List cmrc_disputes by status (admin only)
  */
-app.get('/admin/disputes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.get('/admin/cmrc_disputes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
   const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
@@ -3129,21 +3129,21 @@ app.get('/admin/disputes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (
     const { results } = await c.env.DB.prepare(
       `SELECT id, order_id, reporter_id, reporter_role, category, description,
               evidence_urls_json, status, resolution, created_at, updated_at
-       FROM disputes
+       FROM cmrc_disputes
        WHERE tenant_id = ? AND status = ?
        ORDER BY created_at DESC LIMIT 100`,
     ).bind(tenantId, status).all();
     return c.json({ success: true, data: results });
   } catch (err) {
-    console.error('[MV] admin/disputes GET error:', err);
+    console.error('[MV] admin/cmrc_disputes GET error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * PATCH /admin/disputes/:id — Update dispute status (admin only)
+ * PATCH /admin/cmrc_disputes/:id — Update dispute status (admin only)
  */
-app.patch('/admin/disputes/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.patch('/admin/cmrc_disputes/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
   const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
@@ -3158,21 +3158,21 @@ app.patch('/admin/disputes/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), a
   }
   try {
     const result = await c.env.DB.prepare(
-      `UPDATE disputes SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+      `UPDATE cmrc_disputes SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
     ).bind(body.status, Date.now(), disputeId, tenantId).run();
     if (result.meta.changes === 0) return c.json({ success: false, error: 'Dispute not found' }, 404);
     return c.json({ success: true, data: { id: disputeId, status: body.status } });
   } catch (err) {
-    console.error('[MV] admin/disputes PATCH error:', err);
+    console.error('[MV] admin/cmrc_disputes PATCH error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * POST /admin/disputes/:id/resolve — Resolve a dispute (admin only)
+ * POST /admin/cmrc_disputes/:id/resolve — Resolve a dispute (admin only)
  * Supports FULL_REFUND, PARTIAL_REFUND, REPLACEMENT
  */
-app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+app.post('/admin/cmrc_disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
   const expectedKey = c.env.ADMIN_API_KEY;
   if (!adminKey || !expectedKey || adminKey !== expectedKey) {
@@ -3191,14 +3191,14 @@ app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMI
 
   try {
     const dispute = await c.env.DB.prepare(
-      `SELECT id, order_id, status FROM disputes WHERE id = ? AND tenant_id = ?`,
+      `SELECT id, order_id, status FROM cmrc_disputes WHERE id = ? AND tenant_id = ?`,
     ).bind(disputeId, tenantId).first<{ id: string; order_id: string; status: string }>();
     if (!dispute) return c.json({ success: false, error: 'Dispute not found' }, 404);
     if (dispute.status === 'RESOLVED') return c.json({ success: false, error: 'Dispute already resolved' }, 409);
 
     const order = await c.env.DB.prepare(
       `SELECT id, customer_phone, vendor_id, paystack_reference, items_json, total_amount
-       FROM orders WHERE id = ? AND tenant_id = ?`,
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ?`,
     ).bind(dispute.order_id, tenantId).first<{
       id: string; customer_phone: string | null; vendor_id: string | null;
       paystack_reference: string | null; items_json: string | null; total_amount: number;
@@ -3227,17 +3227,17 @@ app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMI
     } else if (body.resolution === 'REPLACEMENT') {
       const replacementId = `ord_rep_${now}_${Math.random().toString(36).slice(2, 9)}`;
       await c.env.DB.prepare(
-        `INSERT INTO orders
+        `INSERT INTO cmrc_orders
            (id, tenant_id, vendor_id, customer_phone, items_json, total_amount, payment_status,
             order_status, channel, payment_reference, paystack_reference, created_at, updated_at)
          SELECT ?, tenant_id, vendor_id, customer_phone, items_json, total_amount, 'paid',
                 'confirmed', 'replacement', ?, ?, ?, ?
-         FROM orders WHERE id = ?`,
+         FROM cmrc_orders WHERE id = ?`,
       ).bind(replacementId, `replacement_${dispute.id}`, `replacement_${dispute.id}`, now, now, order.id).run();
     }
 
     await c.env.DB.prepare(
-      `UPDATE disputes SET status = 'RESOLVED', resolution = ?, amount_kobo = ?, resolved_at = ?, updated_at = ?
+      `UPDATE cmrc_disputes SET status = 'RESOLVED', resolution = ?, amount_kobo = ?, resolved_at = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ?`,
     ).bind(body.resolution, body.amountKobo ?? null, now, now, disputeId, tenantId).run();
 
@@ -3265,7 +3265,7 @@ app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMI
       }
       if (order.vendor_id) {
         const vendorRow = await c.env.DB.prepare(
-          `SELECT phone FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+          `SELECT phone FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
         ).bind(order.vendor_id, tenantId).first<{ phone: string | null }>();
         if (vendorRow?.phone) {
           await sms.sendOtp(vendorRow.phone, `Dispute ${disputeId} for order ${dispute.order_id} has been resolved: ${body.resolution}.`, 'whatsapp').catch(() => {});
@@ -3275,7 +3275,7 @@ app.post('/admin/disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMI
 
     return c.json({ success: true, data: { disputeId, status: 'RESOLVED', resolution: body.resolution } });
   } catch (err) {
-    console.error('[MV] admin/disputes/resolve error:', err);
+    console.error('[MV] admin/cmrc_disputes/resolve error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
@@ -3310,7 +3310,7 @@ app.post('/admin/campaigns', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async
   const now = Date.now();
   const id = `cmp_${now}_${Math.random().toString(36).slice(2, 9)}`;
   await c.env.DB.prepare(
-    `INSERT INTO marketplace_campaigns (id, tenantId, name, discountType, discountValue, startDate, endDate, status, createdAt)
+    `INSERT INTO cmrc_marketplace_campaigns (id, tenantId, name, discountType, discountValue, startDate, endDate, status, createdAt)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?)`
   ).bind(id, tenantId, body.name.trim(), body.discountType, body.discountValue, body.startDate, body.endDate, new Date(now).toISOString()).run();
 
@@ -3318,7 +3318,7 @@ app.post('/admin/campaigns', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async
 });
 
 /**
- * POST /campaigns/:id/opt-in — Vendor opts products into a campaign
+ * POST /campaigns/:id/opt-in — Vendor opts cmrc_products into a campaign
  * Body: { productIds?: string[] }
  * Requires vendor JWT
  */
@@ -3332,28 +3332,28 @@ app.post('/campaigns/:id/opt-in', async (c) => {
   const productIds = Array.isArray(body.productIds) ? body.productIds : [];
 
   const campaign = await c.env.DB.prepare(
-    'SELECT id, status FROM marketplace_campaigns WHERE id = ? AND tenantId = ?'
+    'SELECT id, status FROM cmrc_marketplace_campaigns WHERE id = ? AND tenantId = ?'
   ).bind(campaignId, tenantId).first<{ id: string; status: string }>();
   if (!campaign) return c.json({ success: false, error: 'Campaign not found' }, 404);
   if (campaign.status === 'ENDED') return c.json({ success: false, error: 'Campaign has ended' }, 422);
 
   await c.env.DB.prepare(
-    'INSERT OR REPLACE INTO campaign_vendor_opt_ins (campaignId, vendorId, productIds) VALUES (?, ?, ?)'
+    'INSERT OR REPLACE INTO cmrc_campaign_vendor_opt_ins (campaignId, vendorId, productIds) VALUES (?, ?, ?)'
   ).bind(campaignId, vendor.vendorId, productIds.length > 0 ? JSON.stringify(productIds) : null).run();
 
   return c.json({ success: true, data: { campaignId, vendorId: vendor.vendorId, productCount: productIds.length || 'all' } });
 });
 
 /**
- * GET /campaigns/active — List active campaigns with participating vendors
+ * GET /campaigns/active — List active campaigns with participating cmrc_vendors
  */
 app.get('/campaigns/active', async (c) => {
   const tenantId = getTenantId(c);
   const rows = await c.env.DB.prepare(
     `SELECT c.id, c.name, c.discountType, c.discountValue, c.startDate, c.endDate, c.status,
             json_group_array(o.vendorId) as participatingVendors
-     FROM marketplace_campaigns c
-     LEFT JOIN campaign_vendor_opt_ins o ON c.id = o.campaignId
+     FROM cmrc_marketplace_campaigns c
+     LEFT JOIN cmrc_campaign_vendor_opt_ins o ON c.id = o.campaignId
      WHERE c.tenantId = ? AND c.status = 'ACTIVE'
      GROUP BY c.id
      ORDER BY c.startDate DESC`
@@ -3370,19 +3370,19 @@ app.get('/campaigns/active', async (c) => {
 });
 
 /**
- * GET /campaigns/:id/products — Products from opted-in vendors with campaign discount applied
+ * GET /campaigns/:id/cmrc_products — Products from opted-in cmrc_vendors with campaign discount applied
  */
-app.get('/campaigns/:id/products', async (c) => {
+app.get('/campaigns/:id/cmrc_products', async (c) => {
   const tenantId = getTenantId(c);
   const campaignId = c.req.param('id');
 
   const campaign = await c.env.DB.prepare(
-    'SELECT id, name, discountType, discountValue, status FROM marketplace_campaigns WHERE id = ? AND tenantId = ?'
+    'SELECT id, name, discountType, discountValue, status FROM cmrc_marketplace_campaigns WHERE id = ? AND tenantId = ?'
   ).bind(campaignId, tenantId).first<{ id: string; name: string; discountType: string; discountValue: number; status: string }>();
   if (!campaign) return c.json({ success: false, error: 'Campaign not found' }, 404);
 
   const optIns = await c.env.DB.prepare(
-    'SELECT vendorId, productIds FROM campaign_vendor_opt_ins WHERE campaignId = ?'
+    'SELECT vendorId, productIds FROM cmrc_campaign_vendor_opt_ins WHERE campaignId = ?'
   ).bind(campaignId).all<{ vendorId: string; productIds: string | null }>();
 
   const results: Array<{
@@ -3399,11 +3399,11 @@ app.get('/campaigns/:id/products', async (c) => {
       : '';
     const bindings: (string | null)[] = [tenantId, optIn.vendorId, ...(scopeIds ?? [])];
 
-    const products = await c.env.DB.prepare(
-      `SELECT id, name, price FROM products WHERE tenant_id = ? AND vendor_id = ? AND is_active = 1 AND deleted_at IS NULL ${whereClause} LIMIT 50`
+    const cmrc_products = await c.env.DB.prepare(
+      `SELECT id, name, price FROM cmrc_products WHERE tenant_id = ? AND vendor_id = ? AND is_active = 1 AND deleted_at IS NULL ${whereClause} LIMIT 50`
     ).bind(...bindings).all<{ id: string; name: string; price: number }>();
 
-    for (const p of products.results ?? []) {
+    for (const p of cmrc_products.results ?? []) {
       const discountKobo = campaign.discountType === 'PERCENTAGE'
         ? Math.round(p.price * campaign.discountValue / 100)
         : Math.min(campaign.discountValue, p.price);
@@ -3415,7 +3415,7 @@ app.get('/campaigns/:id/products', async (c) => {
     }
   }
 
-  return c.json({ success: true, data: { campaign, products: results } });
+  return c.json({ success: true, data: { campaign, cmrc_products: results } });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3430,7 +3430,7 @@ app.get('/search/suggest', async (c) => {
 
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT DISTINCT name FROM products
+      `SELECT DISTINCT name FROM cmrc_products
        WHERE tenant_id = ? AND name LIKE ? AND deleted_at IS NULL AND is_active = 1
        LIMIT 5`
     ).bind(tenantId, `${q}%`).all<{ name: string }>();
@@ -3441,8 +3441,8 @@ app.get('/search/suggest', async (c) => {
   }
 });
 
-// ── POST /products/:id/attributes — Add/update attribute (SV-E06 / MV) ────────
-app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+// ── POST /cmrc_products/:id/attributes — Add/update attribute (SV-E06 / MV) ────────
+app.post('/cmrc_products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   const body = await c.req.json<{ attributeName: string; attributeValue: string }>();
@@ -3455,7 +3455,7 @@ app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
+      `INSERT INTO cmrc_product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
        VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(tenantId, productId, attributeName)
        DO UPDATE SET attributeValue = excluded.attributeValue`
@@ -3464,12 +3464,12 @@ app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']
     // Re-index FTS5 with attribute values appended to description
     try {
       const { results: attrs } = await c.env.DB.prepare(
-        'SELECT attributeName, attributeValue FROM product_attributes WHERE tenantId = ? AND productId = ?'
+        'SELECT attributeName, attributeValue FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ?'
       ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
 
       const attrText = attrs.map((a) => `${a.attributeName}: ${a.attributeValue}`).join(' ');
       const product = await c.env.DB.prepare(
-        'SELECT rowid, name, description, category, sku FROM products WHERE id = ? AND tenant_id = ?'
+        'SELECT rowid, name, description, category, sku FROM cmrc_products WHERE id = ? AND tenant_id = ?'
       ).bind(productId, tenantId).first<{ rowid: number; name: string; description: string | null; category: string | null; sku: string }>();
 
       if (product) {
@@ -3491,24 +3491,24 @@ app.post('/products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']
 
     return c.json({ success: true, data: { id, productId, attributeName: body.attributeName.trim(), attributeValue: body.attributeValue.trim() } }, 201);
   } catch (err) {
-    console.error('[MV][products/attributes] POST error:', err);
+    console.error('[MV][cmrc_products/attributes] POST error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
-// ── GET /products/:id/attributes — List product attributes ────────────────────
-app.get('/products/:id/attributes', async (c) => {
+// ── GET /cmrc_products/:id/attributes — List product attributes ────────────────────
+app.get('/cmrc_products/:id/attributes', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
 
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT id, attributeName, attributeValue, createdAt FROM product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+      'SELECT id, attributeName, attributeValue, createdAt FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
     ).bind(tenantId, productId).all<{ id: string; attributeName: string; attributeValue: string; createdAt: string }>();
 
     return c.json({ success: true, data: { productId, attributes: results ?? [] } });
   } catch (err) {
-    console.error('[MV][products/attributes] GET error:', err);
+    console.error('[MV][cmrc_products/attributes] GET error:', err);
     return c.json({ success: true, data: { productId, attributes: [] } });
   }
 });
@@ -3535,7 +3535,7 @@ app.patch('/vendor/branding', async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `UPDATE vendors SET branding = json(?) WHERE id = ? AND marketplace_tenant_id = ?`
+      `UPDATE cmrc_vendors SET branding = json(?) WHERE id = ? AND marketplace_tenant_id = ?`
     ).bind(JSON.stringify(branding), vendor.vendorId, tenantId).run();
 
     return c.json({ success: true, data: { vendorId: vendor.vendorId, branding } });
@@ -3562,10 +3562,10 @@ app.get('/vendor/analytics', async (c) => {
       dateRange.push(d.toISOString().slice(0, 10));
     }
 
-    // Revenue trend from vendor_daily_analytics
+    // Revenue trend from cmrc_vendor_daily_analytics
     const { results: dbTrend } = await c.env.DB.prepare(
       `SELECT date, revenueKobo, orderCount, avgOrderValueKobo
-       FROM vendor_daily_analytics
+       FROM cmrc_vendor_daily_analytics
        WHERE vendorId = ? AND tenantId = ?
          AND date >= DATE('now', ?)
        ORDER BY date ASC`
@@ -3582,13 +3582,13 @@ app.get('/vendor/analytics', async (c) => {
     const totalOrders = trend.reduce((s, r) => s + r.orderCount, 0);
     const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
 
-    // Top 5 products by revenue (last N days from order_items join)
+    // Top 5 cmrc_products by revenue (last N days from order_items join)
     const { results: topProducts } = await c.env.DB.prepare(
       `SELECT oi.product_id, oi.product_name AS name,
               SUM(oi.quantity)     AS units_sold,
               SUM(oi.total_price)  AS revenue_kobo
        FROM order_items oi
-       JOIN orders o ON o.id = oi.order_id
+       JOIN cmrc_orders o ON o.id = oi.order_id
        WHERE o.vendor_id = ? AND o.tenant_id = ?
          AND o.payment_status = 'paid'
          AND o.created_at >= ?
@@ -3618,7 +3618,7 @@ app.get('/vendor/analytics', async (c) => {
 });
 
 // ── MV-E18: AI Product Listing Optimisation ──────────────────────────────────
-app.post('/products/ai-suggest', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+app.post('/cmrc_products/ai-suggest', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
   const body = await c.req.json<{ name: string; description?: string; category?: string }>();
   if (!body.name?.trim()) return c.json({ success: false, error: 'name is required' }, 400);
 
@@ -3635,7 +3635,7 @@ app.post('/products/ai-suggest', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_A
       messages: [
         {
           role: 'system',
-          content: 'You are a product listing expert for Nigerian e-commerce. You help vendors write compelling, SEO-friendly product listings for the Nigerian market.',
+          content: 'You are a product listing expert for Nigerian e-commerce. You help cmrc_vendors write compelling, SEO-friendly product listings for the Nigerian market.',
         },
         {
           role: 'user',
@@ -3664,7 +3664,7 @@ app.post('/products/ai-suggest', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_A
 });
 
 // ── MV-E17: Social Commerce CSV Import ───────────────────────────────────────
-app.post('/products/import-csv', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+app.post('/cmrc_products/import-csv', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const vendorToken = c.req.header('Authorization')?.replace('Bearer ', '') ?? '';
   const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? 'unknown';
@@ -3710,7 +3710,7 @@ app.post('/products/import-csv', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_A
 
     try {
       await c.env.DB.prepare(
-        `INSERT INTO products (id, tenant_id, name, description, price, price_kobo, image_url, category, slug, vendor_id, is_active, quantity, created_at, updated_at)
+        `INSERT INTO cmrc_products (id, tenant_id, name, description, price, price_kobo, image_url, category, slug, vendor_id, is_active, quantity, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 100, ?, ?)
          ON CONFLICT (tenant_id, slug) DO UPDATE SET name = excluded.name, description = excluded.description, price = excluded.price`,
       ).bind(productId, tenantId, name, description, priceKobo, priceKobo, imageUrl || null, category || null, slug, vendorId, now, now).run();
@@ -3734,7 +3734,7 @@ app.get('/vendor/referral-code', requireRole(['VENDOR', 'TENANT_ADMIN']), async 
   const tenantId = getTenantId(c);
   const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
   const vendor = await c.env.DB.prepare(
-    `SELECT id, referralCode FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+    `SELECT id, referralCode FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
   ).bind(vendorId, tenantId).first<{ id: string; referralCode: string | null }>();
 
   if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
@@ -3742,7 +3742,7 @@ app.get('/vendor/referral-code', requireRole(['VENDOR', 'TENANT_ADMIN']), async 
   let code = vendor.referralCode;
   if (!code) {
     code = `REF${vendorId.slice(-6).toUpperCase()}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
-    await c.env.DB.prepare(`UPDATE vendors SET referralCode = ? WHERE id = ?`).bind(code, vendorId).run();
+    await c.env.DB.prepare(`UPDATE cmrc_vendors SET referralCode = ? WHERE id = ?`).bind(code, vendorId).run();
   }
   return c.json({ success: true, data: { referralCode: code } });
 });
@@ -3755,7 +3755,7 @@ app.post('/vendor/apply-referral', requireRole(['VENDOR']), async (c) => {
   if (!referralCode?.trim()) return c.json({ success: false, error: 'referralCode required' }, 400);
 
   const referrer = await c.env.DB.prepare(
-    `SELECT id FROM vendors WHERE referralCode = ? AND marketplace_tenant_id = ?`,
+    `SELECT id FROM cmrc_vendors WHERE referralCode = ? AND marketplace_tenant_id = ?`,
   ).bind(referralCode.toUpperCase().trim(), tenantId).first<{ id: string }>();
   if (!referrer) return c.json({ success: false, error: 'Referral code not found' }, 404);
 
@@ -3764,9 +3764,9 @@ app.post('/vendor/apply-referral', requireRole(['VENDOR']), async (c) => {
   const now = new Date().toISOString();
 
   await c.env.DB.batch([
-    c.env.DB.prepare(`UPDATE vendors SET referredBy = ? WHERE id = ? AND marketplace_tenant_id = ?`).bind(referrer.id, vendorId, tenantId),
+    c.env.DB.prepare(`UPDATE cmrc_vendors SET referredBy = ? WHERE id = ? AND marketplace_tenant_id = ?`).bind(referrer.id, vendorId, tenantId),
     c.env.DB.prepare(
-      `INSERT INTO commission_rules (id, tenantId, vendorId, rateBps, effectiveFrom, effectiveUntil)
+      `INSERT INTO cmrc_commission_rules (id, tenantId, vendorId, rateBps, effectiveFrom, effectiveUntil)
        VALUES (?, ?, ?, 900, ?, ?)`,
     ).bind(`cr_ref_${Date.now()}`, tenantId, referrer.id, now, commissionUntil.toISOString()),
   ]);
@@ -3794,7 +3794,7 @@ app.post('/flash-sales', requireRole(['TENANT_ADMIN', 'SUPER_ADMIN']), async (c)
 
   // Fetch the product's original price for validation
   const product = await c.env.DB.prepare(
-    `SELECT id, price_kobo AS priceKobo FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+    `SELECT id, price_kobo AS priceKobo FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
   ).bind(body.productId, tenantId).first<{ id: string; priceKobo: number }>();
   if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
 
@@ -3813,7 +3813,7 @@ app.post('/flash-sales', requireRole(['TENANT_ADMIN', 'SUPER_ADMIN']), async (c)
   const active = startIso <= now && now < endIso ? 1 : 0;
 
   await c.env.DB.prepare(
-    `INSERT INTO flash_sales (id, tenantId, productId, salePriceKobo, originalPriceKobo, startTime, endTime, quantityLimit, quantitySold, active)
+    `INSERT INTO cmrc_flash_sales (id, tenantId, productId, salePriceKobo, originalPriceKobo, startTime, endTime, quantityLimit, quantitySold, active)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
   ).bind(id, tenantId, body.productId, body.salePriceKobo, product.priceKobo, startIso, endIso, body.quantityLimit ?? 9999, active).run();
 
@@ -3826,24 +3826,24 @@ app.get('/flash-sales', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT fs.id, fs.productId, fs.salePriceKobo, fs.originalPriceKobo, fs.quantityLimit,
             fs.quantitySold, fs.startTime, fs.endTime, p.name AS productName
-     FROM flash_sales fs LEFT JOIN products p ON p.id = fs.productId AND p.tenant_id = fs.tenantId
+     FROM cmrc_flash_sales fs LEFT JOIN cmrc_products p ON p.id = fs.productId AND p.tenant_id = fs.tenantId
      WHERE fs.tenantId = ? AND fs.active = 1 ORDER BY fs.endTime ASC`,
   ).bind(tenantId).all<Record<string, unknown>>();
   return c.json({ success: true, data: { flashSales: results ?? [] } });
 });
 
 // ── MV-E20: Bulk Pricing — GET tiers for a product ───────────────────────────
-app.get('/products/:id/price-tiers', async (c) => {
+app.get('/cmrc_products/:id/price-tiers', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   const { results } = await c.env.DB.prepare(
-    `SELECT id, minQty, priceKobo, vendorId FROM product_price_tiers WHERE productId = ? AND tenantId = ? ORDER BY minQty ASC`,
+    `SELECT id, minQty, priceKobo, vendorId FROM cmrc_product_price_tiers WHERE productId = ? AND tenantId = ? ORDER BY minQty ASC`,
   ).bind(productId, tenantId).all<Record<string, unknown>>();
   return c.json({ success: true, data: { tiers: results ?? [] } });
 });
 
-// POST /products/:id/price-tiers — admin/vendor create tier
-app.post('/products/:id/price-tiers', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+// POST /cmrc_products/:id/price-tiers — admin/vendor create tier
+app.post('/cmrc_products/:id/price-tiers', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   const body = await c.req.json<{ minQty: number; priceKobo: number }>();
@@ -3851,17 +3851,17 @@ app.post('/products/:id/price-tiers', requireRole(['VENDOR', 'TENANT_ADMIN', 'SU
   const id = `tier_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? null;
   await c.env.DB.prepare(
-    `INSERT INTO product_price_tiers (id, tenantId, vendorId, productId, minQty, priceKobo) VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cmrc_product_price_tiers (id, tenantId, vendorId, productId, minQty, priceKobo) VALUES (?, ?, ?, ?, ?, ?)`,
   ).bind(id, tenantId, vendorId, productId, body.minQty, body.priceKobo).run();
   return c.json({ success: true, data: { id, minQty: body.minQty, priceKobo: body.priceKobo } }, 201);
 });
 
 // ── SV-E13: Product Availability Scheduling — check product availability ──────
-app.get('/products/:id/availability', async (c) => {
+app.get('/cmrc_products/:id/availability', async (c) => {
   const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   const product = await c.env.DB.prepare(
-    `SELECT id, availableFrom, availableUntil, availableDays FROM products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+    `SELECT id, availableFrom, availableUntil, availableDays FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
   ).bind(productId, tenantId).first<{ id: string; availableFrom: string | null; availableUntil: string | null; availableDays: number | null }>();
   if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
 
@@ -3951,7 +3951,7 @@ app.post('/rma', async (c) => {
     // Verify the order belongs to this customer and is in a returnable state
     const order = await c.env.DB.prepare(
       `SELECT id, customer_email, vendor_id, marketplace_order_id, order_status, total_amount, created_at
-       FROM orders WHERE id = ? AND tenant_id = ?`,
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ?`,
     ).bind(body.orderId, tenantId).first<{
       id: string; customer_email: string | null; vendor_id: string | null;
       marketplace_order_id: string | null; order_status: string | null;
@@ -3979,7 +3979,7 @@ app.post('/rma', async (c) => {
 
     // Prevent duplicate open RMA for the same order+vendor
     const existing = await c.env.DB.prepare(
-      `SELECT id FROM rma_requests
+      `SELECT id FROM cmrc_rma_requests
        WHERE order_id = ? AND vendor_id = ? AND tenant_id = ? AND status NOT IN ('REFUNDED','REJECTED')`,
     ).bind(body.orderId, body.vendorId, tenantId).first<{ id: string }>();
     if (existing) {
@@ -3989,7 +3989,7 @@ app.post('/rma', async (c) => {
     const rmaId = `rma_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO rma_requests
+      `INSERT INTO cmrc_rma_requests
          (id, tenant_id, order_id, marketplace_order_id, vendor_id, customer_email,
           reason, description, evidence_urls_json, status, refund_amount_kobo, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'REQUESTED', ?, ?, ?)`,
@@ -4059,7 +4059,7 @@ app.get('/rma/:id', async (c) => {
               description, evidence_urls_json, status, vendor_note, admin_note, admin_resolution,
               return_label_url, return_tracking_id, refund_amount_kobo, refund_reference,
               created_at, updated_at, resolved_at
-       FROM rma_requests WHERE id = ? AND tenant_id = ?`,
+       FROM cmrc_rma_requests WHERE id = ? AND tenant_id = ?`,
     ).bind(rmaId, tenantId).first<Record<string, unknown>>();
 
     if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
@@ -4117,7 +4117,7 @@ app.post('/rma/:id/vendor-approve', async (c) => {
     const rma = await c.env.DB.prepare(
       `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email, reason,
               status, refund_amount_kobo
-       FROM rma_requests
+       FROM cmrc_rma_requests
        WHERE id = ? AND tenant_id = ?`,
     ).bind(rmaId, tenantId).first<{
       id: string; order_id: string; marketplace_order_id: string | null;
@@ -4135,7 +4135,7 @@ app.post('/rma/:id/vendor-approve', async (c) => {
 
     // ── Step 1: VENDOR_APPROVED ──────────────────────────────────────────────
     await c.env.DB.prepare(
-      `UPDATE rma_requests SET status = 'VENDOR_APPROVED', vendor_note = ?, updated_at = ?
+      `UPDATE cmrc_rma_requests SET status = 'VENDOR_APPROVED', vendor_note = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ?`,
     ).bind(body.note ?? null, now, rmaId, tenantId).run();
 
@@ -4172,7 +4172,7 @@ app.post('/rma/:id/vendor-approve', async (c) => {
           trackingId = result.data.tracking_id ?? null;
           finalStatus = 'LABEL_GENERATED';
           await c.env.DB.prepare(
-            `UPDATE rma_requests SET status = 'LABEL_GENERATED', return_label_url = ?,
+            `UPDATE cmrc_rma_requests SET status = 'LABEL_GENERATED', return_label_url = ?,
                                      return_tracking_id = ?, updated_at = ?
              WHERE id = ? AND tenant_id = ?`,
           ).bind(labelUrl, trackingId, now, rmaId, tenantId).run();
@@ -4216,7 +4216,7 @@ app.post('/rma/:id/vendor-approve', async (c) => {
 });
 
 /**
- * POST /rma/:id/vendor-dispute — Vendor disputes the return (e.g. item not defective)
+ * POST /rma/:id/vendor-dispute — Vendor cmrc_disputes the return (e.g. item not defective)
  * Auth: Bearer JWT, role = 'vendor'
  *
  * Transitions: REQUESTED → VENDOR_DISPUTED → admin arbitration
@@ -4241,7 +4241,7 @@ app.post('/rma/:id/vendor-dispute', async (c) => {
 
   try {
     const rma = await c.env.DB.prepare(
-      `SELECT id, order_id, vendor_id, status FROM rma_requests WHERE id = ? AND tenant_id = ?`,
+      `SELECT id, order_id, vendor_id, status FROM cmrc_rma_requests WHERE id = ? AND tenant_id = ?`,
     ).bind(rmaId, tenantId).first<{ id: string; order_id: string; vendor_id: string; status: string }>();
 
     if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
@@ -4256,7 +4256,7 @@ app.post('/rma/:id/vendor-dispute', async (c) => {
     // The RMA_DISPUTED event (below) signals the dispute path to consumers.
     // VENDOR_DISPUTED is never a persistent DB state — it exists only in the event stream.
     await c.env.DB.prepare(
-      `UPDATE rma_requests SET status = 'ADMIN_REVIEW', vendor_note = ?, updated_at = ?
+      `UPDATE cmrc_rma_requests SET status = 'ADMIN_REVIEW', vendor_note = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ?`,
     ).bind(body.note.trim(), now, rmaId, tenantId).run();
 
@@ -4309,7 +4309,7 @@ app.get('/vendor/rma', async (c) => {
               reason, description, evidence_urls_json, status, vendor_note,
               return_label_url, return_tracking_id, refund_amount_kobo,
               created_at, updated_at
-       FROM rma_requests
+       FROM cmrc_rma_requests
        WHERE tenant_id = ? AND vendor_id = ? AND status = ?
        ORDER BY created_at DESC
        LIMIT ${limit}`,
@@ -4345,7 +4345,7 @@ app.get('/admin/rma', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) =>
                       reason, description, evidence_urls_json, status, vendor_note,
                       admin_note, admin_resolution, return_label_url, return_tracking_id,
                       refund_amount_kobo, refund_reference, created_at, updated_at, resolved_at
-               FROM rma_requests
+               FROM cmrc_rma_requests
                WHERE tenant_id = ? AND status = ?`;
     const binds: unknown[] = [tenantId, status];
     if (vendorId) { sql += ' AND vendor_id = ?'; binds.push(vendorId); }
@@ -4399,8 +4399,8 @@ app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
     const rma = await c.env.DB.prepare(
       `SELECT r.id, r.order_id, r.vendor_id, r.customer_email, r.status, r.refund_amount_kobo,
               o.paystack_reference, o.payment_reference
-       FROM rma_requests r
-       LEFT JOIN orders o ON r.order_id = o.id
+       FROM cmrc_rma_requests r
+       LEFT JOIN cmrc_orders o ON r.order_id = o.id
        WHERE r.id = ? AND r.tenant_id = ?`,
     ).bind(rmaId, tenantId).first<{
       id: string; order_id: string; vendor_id: string; customer_email: string;
@@ -4430,7 +4430,7 @@ app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
       }
 
       await c.env.DB.prepare(
-        `UPDATE rma_requests
+        `UPDATE cmrc_rma_requests
          SET status = 'REFUNDED', admin_note = ?, admin_resolution = 'APPROVE_RETURN',
              refund_amount_kobo = ?, refund_reference = ?, resolved_at = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ?`,
@@ -4469,7 +4469,7 @@ app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
     } else {
       // REJECT_RETURN
       await c.env.DB.prepare(
-        `UPDATE rma_requests
+        `UPDATE cmrc_rma_requests
          SET status = 'REJECTED', admin_note = ?, admin_resolution = 'REJECT_RETURN',
              resolved_at = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ?`,

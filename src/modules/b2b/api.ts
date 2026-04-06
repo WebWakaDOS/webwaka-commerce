@@ -8,10 +8,10 @@
  *   GET  /account           — Current account info (authenticated)
  *   PATCH /account/approve/:id — Admin approve/reject (TENANT_ADMIN)
  *   GET  /catalog           — Segment-priced product catalog (authenticated)
- *   POST /orders            — Place B2B wholesale order (authenticated)
- *   GET  /orders            — List own orders (authenticated)
- *   GET  /orders/:id        — Single order detail (authenticated)
- *   PATCH /orders/:id/cancel — Cancel a DRAFT or PENDING order (authenticated)
+ *   POST /cmrc_orders            — Place B2B wholesale order (authenticated)
+ *   GET  /cmrc_orders            — List own cmrc_orders (authenticated)
+ *   GET  /cmrc_orders/:id        — Single order detail (authenticated)
+ *   PATCH /cmrc_orders/:id/cancel — Cancel a DRAFT or PENDING order (authenticated)
  *
  * Auth: Bearer JWT. B2B buyers carry role='B2B' + b2b_account_id claim.
  */
@@ -217,7 +217,7 @@ b2bRouter.get('/catalog', async (c) => {
     const params: (string | number)[] = [tenantId];
     let query = `SELECT id, name, description, price AS base_price_kobo, price_tiers,
                         quantity, category, image_url, sku, moq
-                 FROM products
+                 FROM cmrc_products
                  WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL`;
     if (after) { query += ' AND id > ?'; params.push(after); }
     if (category) { query += ' AND category = ?'; params.push(category); }
@@ -236,7 +236,7 @@ b2bRouter.get('/catalog', async (c) => {
     const raw = hasMore ? results.slice(0, perPage) : results;
 
     const segment: CustomerSegment = 'B2B';
-    const products = raw.map((p) => {
+    const cmrc_products = raw.map((p) => {
       const tiers = parsePriceTiers(p.price_tiers);
       const effectivePrice = resolvePrice(
         { id: p.id, name: p.name, base_price_kobo: p.base_price_kobo, price_tiers: tiers },
@@ -254,7 +254,7 @@ b2bRouter.get('/catalog', async (c) => {
     return c.json({
       success: true,
       data: {
-        products,
+        cmrc_products,
         has_more: hasMore,
         next_cursor: hasMore ? raw[raw.length - 1]?.id ?? null : null,
       },
@@ -266,9 +266,9 @@ b2bRouter.get('/catalog', async (c) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/b2b/orders — Place a wholesale order
+// POST /api/b2b/cmrc_orders — Place a wholesale order
 // ─────────────────────────────────────────────────────────────────────────────
-b2bRouter.post('/orders', async (c) => {
+b2bRouter.post('/cmrc_orders', async (c) => {
   const tenantId = getTenantId(c)!;
   const jwtSecret = await getJwtSecret(c.env);
   const b2b = await resolveB2BAccount(c as never, jwtSecret);
@@ -295,7 +295,7 @@ b2bRouter.post('/orders', async (c) => {
       return c.json({ success: false, error: 'B2B account not approved' }, 403);
     }
 
-    // Fetch products + MOQ rules
+    // Fetch cmrc_products + MOQ rules
     interface DbProduct {
       id: string; name: string; sku: string; price: number;
       price_tiers: string | null; quantity: number; moq: number | null;
@@ -303,7 +303,7 @@ b2bRouter.post('/orders', async (c) => {
     const dbProducts: Array<DbProduct | null> = await Promise.all(
       body.items.map((i) =>
         c.env.DB.prepare(
-          'SELECT id, name, sku, price, price_tiers, quantity, moq FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1'
+          'SELECT id, name, sku, price, price_tiers, quantity, moq FROM cmrc_products WHERE id = ? AND tenant_id = ? AND is_active = 1'
         ).bind(i.product_id, tenantId).first<DbProduct>()
       )
     );
@@ -382,7 +382,7 @@ b2bRouter.post('/orders', async (c) => {
     // Deduct inventory
     for (const item of orderItems) {
       await c.env.DB.prepare(
-        `UPDATE products SET quantity = quantity - ?, updated_at = ?
+        `UPDATE cmrc_products SET quantity = quantity - ?, updated_at = ?
          WHERE id = ? AND tenant_id = ?`
       ).bind(item.quantity, Date.now(), item.productId, tenantId).run();
     }
@@ -403,9 +403,9 @@ b2bRouter.post('/orders', async (c) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/b2b/orders — List orders
+// GET /api/b2b/cmrc_orders — List cmrc_orders
 // ─────────────────────────────────────────────────────────────────────────────
-b2bRouter.get('/orders', async (c) => {
+b2bRouter.get('/cmrc_orders', async (c) => {
   const tenantId = getTenantId(c)!;
   const jwtSecret = await getJwtSecret(c.env);
   const b2b = await resolveB2BAccount(c as never, jwtSecret);
@@ -421,15 +421,15 @@ b2bRouter.get('/orders', async (c) => {
     ).bind(tenantId, b2b.accountId).all();
     return c.json({ success: true, data: results });
   } catch (err) {
-    console.error('[B2B] list orders error:', err);
+    console.error('[B2B] list cmrc_orders error:', err);
     return c.json({ success: false, error: 'Service unavailable' }, 503);
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/b2b/orders/:id — Single order detail
+// GET /api/b2b/cmrc_orders/:id — Single order detail
 // ─────────────────────────────────────────────────────────────────────────────
-b2bRouter.get('/orders/:id', async (c) => {
+b2bRouter.get('/cmrc_orders/:id', async (c) => {
   const tenantId = getTenantId(c)!;
   const jwtSecret = await getJwtSecret(c.env);
   const b2b = await resolveB2BAccount(c as never, jwtSecret);
@@ -450,9 +450,9 @@ b2bRouter.get('/orders/:id', async (c) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/b2b/orders/:id/cancel — Cancel order
+// PATCH /api/b2b/cmrc_orders/:id/cancel — Cancel order
 // ─────────────────────────────────────────────────────────────────────────────
-b2bRouter.patch('/orders/:id/cancel', async (c) => {
+b2bRouter.patch('/cmrc_orders/:id/cancel', async (c) => {
   const tenantId = getTenantId(c)!;
   const jwtSecret = await getJwtSecret(c.env);
   const b2b = await resolveB2BAccount(c as never, jwtSecret);
