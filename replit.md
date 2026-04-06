@@ -81,7 +81,28 @@ See `.env.example` for reference:
 | COM-2 SV Phase 3 | Variants, FTS5 search, virtual scroll, category pills | ✅ Complete | #12 |
 | COM-2 SV Phase 4 | Customer OTP auth, wishlists, order history, abandoned-cart cron | ✅ Complete | #13 |
 
-**Test count:** 801 passing (Vitest) — after COM-3 MV overhaul + Production Hardening
+**Test count:** 1,059 passing across 22 test files (Vitest) — all files pass, zero failures
+
+## WEBwAKA-COMMERCE Taskbook QA (WC-001 through WC-006) — April 2026
+
+All six taskbook tasks are fully implemented and verified:
+
+| Task | Feature | Status |
+|------|---------|--------|
+| WC-001 | Multi-Vendor Marketplace (4537-line API, commission splitting, KYC, vendor payout) | ✅ Complete — 381 tests |
+| WC-002 | Retail Inventory (multi-warehouse routing, haversine, stock reservation, sync service) | ✅ Complete — 30 tests |
+| WC-003 | Logistics Integration (delivery.booking.confirmed + delivery.status_changed handlers) | ✅ Complete — event handlers registered |
+| WC-004 | Enhanced Pricing Engine (tiered + dynamic pricing, flash sales, gift cards, coupons) | ✅ Complete — 34 tests |
+| WC-005 | B2B Commerce (MOQ, credit terms, purchase orders, B2B pricing tiers) | ✅ Complete — 33 tests |
+| WC-006 | Advanced POS (split payments, sessions, Z-reports, loyalty, offline queue) | ✅ Complete — 117 + 42 + 18 tests |
+
+### QA Fix: local webwaka-core source files created
+- **`packages/webwaka-core/src/kyc.ts`**: `SmileIdentityProvider` class + `createKycProvider` factory.
+  BVN/NIN verification via Smile Identity API (sandbox/production URLs), CAC via Prembly.
+  ResultCode '1012' = verified. Graceful error handling — never throws. (16 new tests)
+- **`packages/webwaka-core/src/sms/termii.ts`**: `sendTermiiSms` helper.
+  Dev-mode bypass for empty apiKey, default channel='dnd', default sender='WebWaka'.
+  POSTs to Termii API, never throws. (11 new tests)
 
 ## Notes
 - The `@webwaka/core` package is a local file dependency (`../webwaka-core`) used only in worker/backend files, not the frontend React app
