@@ -7,6 +7,9 @@
  */
 import { Hono } from 'hono';
 import { getTenantId, requireRole, updateWithVersionLock, createTaxEngine, checkRateLimit as kvCheckRateLimit, hashPin, verifyPin, createSmsProvider, CommerceEvents } from '@webwaka/core';
+
+// Extend CommerceEvents locally for events not yet in @webwaka/core
+const ORDER_PACKED = 'order.packed' as const;
 import { checkRateLimit, _createRateLimitStore, generatePayRef } from '../../utils';
 import type { RateLimitStore } from '../../utils';
 import type { Env } from '../../worker';
@@ -2120,7 +2123,7 @@ app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TEN
   const packedEvt = {
     id: `evt_pkd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     tenantId: tenantId!,
-    type: CommerceEvents.ORDER_READY_DELIVERY,
+    type: ORDER_PACKED,
     sourceModule: 'pos',
     timestamp: Date.now(),
     payload: {
@@ -2165,7 +2168,7 @@ app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TEN
       orderId,
       fulfillment_status: 'packed',
       fulfillment_packed_at: now,
-      events_emitted: [CommerceEvents.ORDER_READY_DELIVERY, CommerceEvents.ORDER_READY_DELIVERY],
+      events_emitted: [ORDER_PACKED, CommerceEvents.ORDER_READY_DELIVERY],
     },
   });
 });

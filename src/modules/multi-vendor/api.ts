@@ -141,9 +141,9 @@ async function authenticateVendor(
   const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || claims.role !== 'vendor') return null;
   return {
-    vendorId: String(claims.sub),
-    tenantId: String(claims.tenantId),
-    phone: String(claims.email ?? ''),
+    vendorId: String((claims as any).vendor_id ?? claims.sub),
+    tenantId: String((claims as any).tenantId ?? (claims as any).tenant ?? ''),
+    phone: String((claims as any).phone ?? claims.email ?? ''),
   };
 }
 

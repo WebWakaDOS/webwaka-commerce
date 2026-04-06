@@ -65,6 +65,25 @@ export async function verifyJwt(
   }
 }
 
+/** Alias: signJWT (PascalCase) mirrors real @webwaka/core export. */
+export const signJWT = signJwt;
+
+/** Alias: verifyJWT (PascalCase) mirrors real @webwaka/core export.
+ *  Normalises legacy `tenant` claim → `tenantId` so both old and new tokens work. */
+export async function verifyJWT(
+  token: string,
+  secret: string,
+): Promise<Record<string, unknown> | null> {
+  const claims = await verifyJwt(token, secret);
+  if (!claims) return null;
+  // Normalise: if payload uses `tenant` (legacy) map it to `tenantId`
+  if (claims['tenant'] && !claims['tenantId']) {
+    claims['tenantId'] = claims['tenant'];
+  }
+  // Normalise: if payload uses `vendor_id` also expose it on the object (type-safe via cast in caller)
+  return claims;
+}
+
 // ── Termii SMS stub ───────────────────────────────────────────────────────────
 
 export interface TermiiSendSmsOptions {
@@ -229,6 +248,21 @@ export interface RateLimitResult {
 
 export async function checkRateLimit(_opts: RateLimitOptions): Promise<RateLimitResult> {
   return { allowed: true, remaining: 999, resetAt: Date.now() + 60_000 };
+}
+
+// ── AI Client stub ────────────────────────────────────────────────────────────
+
+export interface IAiClient {
+  complete: (prompt: string, model?: string) => Promise<string>;
+  embed: (text: string) => Promise<number[]>;
+}
+
+/** Mock createAiClient — returns a client that returns stub responses. */
+export function createAiClient(_apiKey?: string): IAiClient {
+  return {
+    complete: async (_prompt: string) => 'mock-ai-response',
+    embed: async (_text: string) => [0.1, 0.2, 0.3],
+  };
 }
 
 // ── KYC provider stub ─────────────────────────────────────────────────────────
