@@ -93,7 +93,7 @@ export async function vendorAuthMiddleware(c: Context, next: Next): Promise<Resp
 
   // FIX: tenantId sourced exclusively from JWT claims — never from headers
   // This prevents cross-tenant data injection attacks (Invariant: Build Once Use Infinitely)
-  c.set('vendorId', String(claims.vendor_id));
-  c.set('vendorTenantId', String(claims.tenant));
+  c.set('vendorId', String(claims.sub));
+  c.set('vendorTenantId', String(claims.tenantId));
   await next();
 }

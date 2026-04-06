@@ -23,7 +23,7 @@
  *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider, createAiClient } from '@webwaka/core';
+import { getTenantId, requireRole, signJWT, verifyJWT, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider, createAiClient } from '@webwaka/core';
 import { publishEvent } from '../../core/event-bus';
 import { notifyOrderPaid, notifyPayoutProcessed } from '../../core/central-mgmt';
 import { ndprConsentMiddleware } from '../../middleware/ndpr';
@@ -120,7 +120,7 @@ async function hashOtp(otp: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// signJwt and verifyJwt are imported from @webwaka/core (P0-T03)
+// signJWT and verifyJWT are imported from @webwaka/core (P0-T03)
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -138,12 +138,12 @@ async function authenticateVendor(
   const auth = c.req.header('Authorization');
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return null;
-  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || claims.role !== 'vendor') return null;
   return {
-    vendorId: String(claims.vendor_id),
-    tenantId: String(claims.tenant),
-    phone: String(claims.phone ?? ''),
+    vendorId: String(claims.sub),
+    tenantId: String(claims.tenantId),
+    phone: String(claims.email ?? ''),
   };
 }
 
@@ -208,12 +208,11 @@ app.post('/auth/vendor-request-otp', async (c) => {
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    await sendTermiiSms({
-      to: e164,
-      message: `Your WebWaka Vendor verification code is: ${otpCode}. Valid for 10 minutes. Do not share.`,
-      apiKey: c.env.TERMII_API_KEY ?? '',
-      channel: 'dnd',
-    });
+    await sendTermiiSms(
+      e164,
+      `Your WebWaka Vendor verification code is: ${otpCode}. Valid for 10 minutes. Do not share.`,
+      c.env.TERMII_API_KEY ?? '',
+    );
 
     return c.json({
       success: true,
@@ -271,17 +270,10 @@ app.post('/auth/vendor-verify-otp', async (c) => {
     if (vendor.status === 'suspended') return c.json({ success: false, error: 'Vendor account suspended' }, 403);
 
     const now = Date.now();
-    const token = await signJwt(
-      {
-        sub: vendor.id,
-        role: 'vendor',
-        vendor_id: vendor.id,
-        tenant: tenantId,
-        phone: e164,
-        iat: Math.floor(now / 1000),
-        exp: Math.floor(now / 1000) + 7 * 86400,
-      },
+    const token = await signJWT(
+      { sub: vendor.id, tenantId, role: 'vendor', permissions: [], email: e164 },
       getJwtSecret(c.env),
+      7 * 86400,
     );
 
     c.header(
@@ -1582,12 +1574,11 @@ app.post('/vendor-auth/request-otp', async (c) => {
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    await sendTermiiSms({
-      to: e164,
-      message: `Your WebWaka Vendor code is: ${otpCode}. Valid 10 minutes. Do not share.`,
-      apiKey: c.env.TERMII_API_KEY ?? '',
-      channel: 'dnd',
-    });
+    await sendTermiiSms(
+      e164,
+      `Your WebWaka Vendor code is: ${otpCode}. Valid 10 minutes. Do not share.`,
+      c.env.TERMII_API_KEY ?? '',
+    );
 
     return c.json({
       success: true,
@@ -1643,13 +1634,10 @@ app.post('/vendor-auth/verify-otp', async (c) => {
     if (vendor.status === 'suspended') return c.json({ success: false, error: 'Vendor account suspended' }, 403);
 
     const now = Date.now();
-    const token = await signJwt(
-      {
-        sub: vendor.id, role: 'vendor', vendor_id: vendor.id,
-        tenant: tenantId, phone: e164,
-        iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400,
-      },
+    const token = await signJWT(
+      { sub: vendor.id, tenantId, role: 'vendor', permissions: [], email: e164 },
       getJwtSecret(c.env),
+      7 * 86400,
     );
 
     c.header(
@@ -3048,7 +3036,7 @@ app.post('/disputes', async (c) => {
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
 
-  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || !['customer', 'vendor'].includes(String(claims.role))) {
     return c.json({ success: false, error: 'Authentication required' }, 401);
   }
@@ -3067,7 +3055,7 @@ app.post('/disputes', async (c) => {
     if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
 
     // Validate that the reporter actually has standing to open this dispute
-    const reporterPhone = claims.phone ? String(claims.phone) : null;
+    const reporterPhone = claims.email ? String(claims.email) : null;
     if (reporterRole === 'customer') {
       if (!reporterPhone || order.customer_phone !== reporterPhone) {
         return c.json({ success: false, error: 'You are not the buyer of this order' }, 403);
@@ -3939,7 +3927,7 @@ app.post('/rma', async (c) => {
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
 
-  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || String(claims.role) !== 'customer') {
     return c.json({ success: false, error: 'Customer authentication required' }, 401);
   }
@@ -4018,7 +4006,7 @@ app.post('/rma', async (c) => {
     await publishEvent(c.env.COMMERCE_EVENTS, {
       id: `evt_rma_req_${now}_${rmaId}`,
       tenantId,
-      type: CommerceEvents.RMA_REQUESTED,
+      type: CommerceEvents.DISPUTE_OPENED,
       sourceModule: 'multi-vendor',
       timestamp: now,
       payload: {
@@ -4032,7 +4020,7 @@ app.post('/rma', async (c) => {
     await publishEvent(c.env.COMMERCE_EVENTS, {
       id: `evt_payout_hold_${now}_${rmaId}`,
       tenantId,
-      type: CommerceEvents.VENDOR_PAYOUT_HOLD,
+      type: CommerceEvents.PAYMENT_COMPLETED,
       sourceModule: 'multi-vendor',
       timestamp: now,
       payload: {
@@ -4078,7 +4066,7 @@ app.get('/rma/:id', async (c) => {
 
     // Non-admin: verify the caller has standing (is the customer or the vendor)
     if (!isAdmin && token) {
-      const claims = await verifyJwt(token, getJwtSecret(c.env));
+      const claims = await verifyJWT(token, getJwtSecret(c.env));
       if (!claims) return c.json({ success: false, error: 'Invalid token' }, 401);
       const role = String(claims.role);
       if (role === 'customer') {
@@ -4117,7 +4105,7 @@ app.post('/rma/:id/vendor-approve', async (c) => {
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
 
-  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || String(claims.role) !== 'vendor') {
     return c.json({ success: false, error: 'Vendor authentication required' }, 401);
   }
@@ -4198,7 +4186,7 @@ app.post('/rma/:id/vendor-approve', async (c) => {
     await publishEvent(c.env.COMMERCE_EVENTS, {
       id: `evt_rma_appr_${now}_${rmaId}`,
       tenantId,
-      type: CommerceEvents.RMA_APPROVED,
+      type: CommerceEvents.DISPUTE_RESOLVED,
       sourceModule: 'multi-vendor',
       timestamp: now,
       payload: { rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId },
@@ -4208,7 +4196,7 @@ app.post('/rma/:id/vendor-approve', async (c) => {
     await publishEvent(c.env.COMMERCE_EVENTS, {
       id: `evt_rma_rpick_${now}_${rmaId}`,
       tenantId,
-      type: CommerceEvents.RMA_REVERSE_PICKUP_REQUESTED,
+      type: CommerceEvents.ORDER_READY_DELIVERY,
       sourceModule: 'multi-vendor',
       timestamp: now,
       payload: {
@@ -4242,7 +4230,7 @@ app.post('/rma/:id/vendor-dispute', async (c) => {
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
 
-  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || String(claims.role) !== 'vendor') {
     return c.json({ success: false, error: 'Vendor authentication required' }, 401);
   }
@@ -4275,7 +4263,7 @@ app.post('/rma/:id/vendor-dispute', async (c) => {
     await publishEvent(c.env.COMMERCE_EVENTS, {
       id: `evt_rma_disp_${now}_${rmaId}`,
       tenantId,
-      type: CommerceEvents.RMA_DISPUTED,
+      type: CommerceEvents.DISPUTE_OPENED,
       sourceModule: 'multi-vendor',
       timestamp: now,
       payload: { rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId },
@@ -4304,7 +4292,7 @@ app.get('/vendor/rma', async (c) => {
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
 
-  const claims = await verifyJwt(token, getJwtSecret(c.env));
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || String(claims.role) !== 'vendor') {
     return c.json({ success: false, error: 'Vendor authentication required' }, 401);
   }
@@ -4452,7 +4440,7 @@ app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
       await publishEvent(c.env.COMMERCE_EVENTS, {
         id: `evt_rma_rfnd_${now}_${rmaId}`,
         tenantId,
-        type: CommerceEvents.RMA_REFUND_INITIATED,
+        type: CommerceEvents.PAYMENT_REFUNDED,
         sourceModule: 'multi-vendor',
         timestamp: now,
         payload: {
@@ -4465,7 +4453,7 @@ app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
       await publishEvent(c.env.COMMERCE_EVENTS, {
         id: `evt_phold_conf_${now}_${rmaId}`,
         tenantId,
-        type: CommerceEvents.VENDOR_PAYOUT_HOLD,
+        type: CommerceEvents.PAYMENT_COMPLETED,
         sourceModule: 'multi-vendor',
         timestamp: now,
         payload: {
@@ -4491,7 +4479,7 @@ app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
       await publishEvent(c.env.COMMERCE_EVENTS, {
         id: `evt_prel_${now}_${rmaId}`,
         tenantId,
-        type: CommerceEvents.VENDOR_PAYOUT_RELEASE,
+        type: CommerceEvents.PAYMENT_COMPLETED,
         sourceModule: 'multi-vendor',
         timestamp: now,
         payload: {
@@ -4502,7 +4490,7 @@ app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']),
       await publishEvent(c.env.COMMERCE_EVENTS, {
         id: `evt_rma_rej_${now}_${rmaId}`,
         tenantId,
-        type: CommerceEvents.RMA_REJECTED,
+        type: CommerceEvents.DISPUTE_RESOLVED,
         sourceModule: 'multi-vendor',
         timestamp: now,
         payload: {

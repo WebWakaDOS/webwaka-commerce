@@ -14,7 +14,70 @@
 import type { Env } from '../../../worker';
 import type { WebWakaEvent } from '../index';
 import { registerHandler, clearHandlers, publishEvent } from '../index';
-import { CommerceEvents, createSmsProvider, createKycProvider } from '@webwaka/core';
+import { CommerceEvents, createSmsProvider } from '@webwaka/core';
+import type { IKycProvider, KycVerificationResult } from '@webwaka/core';
+
+
+// ─── Local KYC Provider Factory (createKycProvider not exported from @webwaka/core) ───
+// Implements IKycProvider by calling Smile Identity (BVN) and Prembly (CAC) REST APIs.
+function createKycProvider(
+  partnerId: string,
+  smileApiKey: string,
+  premblyApiKey: string,
+  premblyAppId: string,
+): IKycProvider {
+  return {
+    async verifyBvn(bvnHash: string, firstName: string, lastName: string, dob: string): Promise<KycVerificationResult> {
+      try {
+        const res = await fetch('https://api.smileidentity.com/v1/id_verification', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            partner_id: partnerId,
+            api_key: smileApiKey,
+            id_type: 'BVN',
+            id_number: bvnHash,
+            first_name: firstName,
+            last_name: lastName,
+            dob,
+          }),
+        });
+        const data = await res.json() as { ResultCode?: string; ResultText?: string };
+        const verified = data.ResultCode === '1012' || data.ResultCode === '1020';
+        return { verified, reason: data.ResultText ?? undefined, provider: 'smile_identity' };
+      } catch (err) {
+        throw new Error(`Smile Identity BVN error: ${String(err)}`);
+      }
+    },
+    async verifyNin(ninHash: string, firstName: string, lastName: string): Promise<KycVerificationResult> {
+      try {
+        const res = await fetch('https://api.smileidentity.com/v1/id_verification', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ partner_id: partnerId, api_key: smileApiKey, id_type: 'NIN', id_number: ninHash, first_name: firstName, last_name: lastName }),
+        });
+        const data = await res.json() as { ResultCode?: string; ResultText?: string };
+        const verified = data.ResultCode === '1012' || data.ResultCode === '1020';
+        return { verified, reason: data.ResultText ?? undefined, provider: 'smile_identity' };
+      } catch (err) {
+        throw new Error(`Smile Identity NIN error: ${String(err)}`);
+      }
+    },
+    async verifyCac(rcNumber: string, businessName: string): Promise<KycVerificationResult> {
+      try {
+        const res = await fetch(`https://api.prembly.com/identitypass/verification/cac/advance?rc_number=${encodeURIComponent(rcNumber)}`, {
+          method: 'GET',
+          headers: { 'x-api-key': premblyApiKey, 'app-id': premblyAppId, 'accept': 'application/json' },
+        });
+        const data = await res.json() as { status?: boolean; data?: { company_name?: string } };
+        const verified = data.status === true && !!data.data?.company_name;
+        return { verified, reason: verified ? undefined : 'CAC verification failed', provider: 'prembly' };
+      } catch (err) {
+        throw new Error(`Prembly CAC error: ${String(err)}`);
+      }
+    },
+  };
+}
 
 // ─── Handler: inventory.updated → invalidate catalog KV + back-in-stock alerts ─
 

@@ -13,7 +13,7 @@
  */
 import { Hono } from 'hono';
 import {
-  getTenantId, requireRole, signJwt, verifyJwt, sendTermiiSms,
+  getTenantId, requireRole, signJWT, verifyJWT, sendTermiiSms,
   createPaymentProvider, createSmsProvider, updateWithVersionLock, CommerceEvents,
   createTaxEngine, checkRateLimit as kvCheckRateLimit,
 } from '@webwaka/core';
@@ -698,7 +698,7 @@ app.post('/checkout', ndprConsentMiddleware, async (c) => {
           await publishEvent(c.env.COMMERCE_EVENTS, {
             id: `evt_fla_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             tenantId: tenantId!,
-            type: CommerceEvents.ORDER_FULFILLMENT_ASSIGNED,
+            type: CommerceEvents.ORDER_READY_DELIVERY,
             sourceModule: 'single-vendor',
             timestamp: Date.now(),
             payload: {
@@ -979,9 +979,10 @@ app.post('/auth/login', async (c) => {
           customer = { id: cid, loyalty_points: 0 };
         }
 
-        const token = await signJwt(
-          { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
+        const token = await signJWT(
+          { sub: customer.id, tenantId, role: 'customer', permissions: [], email: e164 },
           getJwtSecret(c.env),
+          7 * 86400,
         );
         c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
         return c.json({ success: true, data: { token, customer_id: customer.id, phone: e164, trusted_device: true } });
@@ -1054,12 +1055,11 @@ app.post('/auth/request-otp', async (c) => {
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    await sendTermiiSms({
-      to: e164,
-      message: `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
-      apiKey: c.env.TERMII_API_KEY ?? '',
-      channel: 'dnd',
-    });
+    await sendTermiiSms(
+      e164,
+      `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
+      c.env.TERMII_API_KEY ?? '',
+    );
 
     return c.json({ success: true, data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 } });
   } catch (err) {
@@ -1120,9 +1120,10 @@ app.post('/auth/verify-otp', async (c) => {
           customer = { id: cid, loyalty_points: 0 };
         }
 
-        const token = await signJwt(
-          { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
+        const token = await signJWT(
+          { sub: customer.id, tenantId, role: 'customer', permissions: [], email: e164 },
           getJwtSecret(c.env),
+          7 * 86400,
         );
 
         // Store trusted device in KV (30-day TTL)
@@ -1180,9 +1181,10 @@ app.post('/auth/verify-otp', async (c) => {
       customer = { id: customerId, loyalty_points: 0 };
     }
 
-    const token = await signJwt(
-      { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
-      getJwtSecret(c.env)
+    const token = await signJWT(
+      { sub: customer.id, tenantId, role: 'customer', permissions: [], email: e164 },
+      getJwtSecret(c.env),
+      7 * 86400,
     );
 
     c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
@@ -1886,7 +1888,7 @@ async function hashOtp(otp: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// signJwt and verifyJwt imported from @webwaka/core (P0-T03)
+// signJWT and verifyJWT imported from @webwaka/core (P0-T03)
 
 /** Extract and verify customer from Authorization Bearer or sv_auth cookie */
 async function authenticateCustomer(c: { req: { header: (h: string) => string | undefined }; env: { JWT_SECRET?: string } }): Promise<{ customerId: string; phone: string } | null> {
@@ -1903,9 +1905,9 @@ async function authenticateCustomer(c: { req: { header: (h: string) => string | 
   }
 
   if (!token) return null;
-  const claims = await verifyJwt(token, getJwtSecret(c.env));
-  if (!claims || claims.tenant !== tenantId) return null;
-  return { customerId: String(claims.sub), phone: String(claims.phone) };
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
+  if (!claims || claims.tenantId !== tenantId) return null;
+  return { customerId: String(claims.sub), phone: String(claims.email ?? '') };
 }
 
 // ── POST /paystack/webhook — SV HMAC-SHA512 payment event handler ─────────────

@@ -16,7 +16,7 @@
  * Auth: Bearer JWT. B2B buyers carry role='B2B' + b2b_account_id claim.
  */
 import { Hono } from 'hono';
-import { getTenantId, requireRole, verifyJwt } from '@webwaka/core';
+import { getTenantId, requireRole, verifyJWT } from '@webwaka/core';
 import type { Env } from '../../worker';
 import { getJwtSecret } from '../../utils/jwt-secret';
 import {
@@ -52,11 +52,12 @@ async function resolveB2BAccount(
   if (!auth.startsWith('Bearer ')) return null;
   const token = auth.slice(7);
   try {
-    const payload = await verifyJwt(token, jwtSecret);
+    const payload = await verifyJWT(token, jwtSecret);
     if (!payload || payload.role !== 'B2B') return null;
+    const extra = payload as typeof payload & { b2b_account_id?: string; company_name?: string };
     return {
-      accountId: payload.b2b_account_id as string,
-      companyName: payload.company_name as string ?? '',
+      accountId: extra.b2b_account_id ?? String(payload.sub),
+      companyName: extra.company_name ?? '',
     };
   } catch {
     return null;

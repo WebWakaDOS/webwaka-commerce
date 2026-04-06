@@ -41,6 +41,8 @@ export interface Env {
   JWT_SECRET: string;
   ALLOWED_ORIGINS?: string;             // Comma-separated origin allowlist (P0-T08)
   OPENROUTER_API_KEY?: string;          // OpenRouter AI API key (P5-T03)
+  AI_PLATFORM_URL?: string;             // AI Platform URL (alias for OpenRouter base URL)
+  AI_PLATFORM_TOKEN?: string;           // AI Platform token (alias for OPENROUTER_API_KEY)
   CF_IMAGES_ACCOUNT_HASH?: string;
   KYCSALT?: string;                     // KYC BVN/NIN hashing salt (P3-T03)
   ADMIN_API_KEY?: string;               // Internal admin API key for admin endpoints

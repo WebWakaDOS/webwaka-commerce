@@ -128,6 +128,7 @@ export interface ForecastOptions {
   safetyStockDays?: number; // Buffer stock (days of inventory kept as safety margin)
   aiPlatformUrl?: string;
   aiPlatformToken?: string;
+  openRouterApiKey?: string; // Alias for aiPlatformToken (legacy callers)
   withNarrative?: boolean;
 }
 
@@ -145,9 +146,11 @@ export async function forecastProduct(
     leadTimeDays = 7,
     safetyStockDays = 3,
     aiPlatformUrl,
-    aiPlatformToken,
+    aiPlatformToken: _aiPlatformToken,
+    openRouterApiKey,
     withNarrative = false,
   } = options;
+  const aiPlatformToken = _aiPlatformToken ?? openRouterApiKey;
 
   const dailySales = await fetchDailySales(db, tenantId, product.id, lookbackDays);
 
@@ -188,10 +191,9 @@ export async function forecastProduct(
   };
 
   // Optional AI narrative
-  if (withNarrative && openRouterApiKey && urgency !== 'OK') {
+  if (withNarrative && aiPlatformToken && urgency !== 'OK') {
     try {
-      forecast.narrative = await generateForecastNarrative(aiPlatformUrl,
-    aiPlatformToken, forecast);
+      forecast.narrative = await generateForecastNarrativeViaAIPlatform({ AI_PLATFORM_URL: aiPlatformUrl, AI_PLATFORM_TOKEN: aiPlatformToken }, forecast);
     } catch { /* AI enrichment is non-fatal */ }
   }
 

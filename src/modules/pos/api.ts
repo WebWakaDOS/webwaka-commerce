@@ -2120,7 +2120,7 @@ app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TEN
   const packedEvt = {
     id: `evt_pkd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     tenantId: tenantId!,
-    type: CommerceEvents.ORDER_PACKED,
+    type: CommerceEvents.ORDER_READY_DELIVERY,
     sourceModule: 'pos',
     timestamp: Date.now(),
     payload: {
@@ -2165,7 +2165,7 @@ app.patch('/fulfillment-queue/:orderId/packed', requireRole(['SUPER_ADMIN', 'TEN
       orderId,
       fulfillment_status: 'packed',
       fulfillment_packed_at: now,
-      events_emitted: [CommerceEvents.ORDER_PACKED, CommerceEvents.ORDER_READY_DELIVERY],
+      events_emitted: [CommerceEvents.ORDER_READY_DELIVERY, CommerceEvents.ORDER_READY_DELIVERY],
     },
   });
 });
