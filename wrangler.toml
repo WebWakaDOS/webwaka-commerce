@@ -46,3 +46,27 @@ service = "webwaka-logistics-api-prod"
 # Production secrets (set via: wrangler secret put <NAME> --env production)
 # PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET,
 # ALLOWED_ORIGINS, OPENROUTER_API_KEY, KYCSALT, INTER_SERVICE_SECRET
+
+# ─── Staging Environment ───────────────────────────────────────────────────────
+[env.staging]
+name = "webwaka-commerce-api-staging"
+workers_dev = true
+
+[env.staging.triggers]
+crons = []
+
+kv_namespaces = [
+  { binding = "TENANT_CONFIG",  id = "018ac3a580104b8b8868712919be71bd" },
+  { binding = "EVENTS",         id = "ee8c49024b2d43a98c54962dba43f15b" },
+  { binding = "SESSIONS_KV",    id = "bde8befc71da40c5a5979ee35830022a" },
+  { binding = "CATALOG_CACHE",  id = "1c68508a4bdd4ce794b2de6de61d99ec" }
+]
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "webwaka-staging-db"
+database_id   = "d7278ca0-2408-40d5-a08b-d8456601f667"
+migrations_dir = "migrations"
+
+# Staging secrets (set via: wrangler secret put <NAME> --env staging)
+# JWT_SECRET, PAYSTACK_SECRET (test key), TERMII_API_KEY

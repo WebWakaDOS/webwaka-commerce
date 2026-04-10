@@ -120,7 +120,16 @@ moduleRegistry.register({
  */
 export function createTenantResolverMiddleware(kv: KVNamespace): MiddlewareHandler {
   return async (c, next) => {
-    const tenantId = getTenantId(c);
+    // For JWT-authenticated routes, getTenantId() reads from verified JWT claims.
+    // For public routes (no JWT), fall back to x-tenant-id header as a best-effort
+    // tenant hint. Public route handlers must NOT use tenantConfig for write operations.
+    let tenantId: string | undefined;
+    try {
+      tenantId = getTenantId(c);
+    } catch {
+      // Public route — JWT context absent; fall back to header
+      tenantId = c.req.header('x-tenant-id') ?? c.req.header('X-Tenant-ID') ?? undefined;
+    }
     if (!tenantId) {
       return c.json({ success: false, error: 'Missing tenant identifier' }, 400);
     }

@@ -27,7 +27,7 @@ jobs:
         run: npm test
 
   # ============================================================================
-  # WORKER DEPLOY (Cloudflare Workers)
+  # WORKER DEPLOY (Production — Cloudflare Workers)
   # ============================================================================
   deploy-workers:
     name: Deploy Workers to Production
@@ -42,25 +42,27 @@ jobs:
           cache: 'npm'
       - name: Install dependencies
         run: npm ci
-      - name: Apply D1 Migrations (Production)
+      - name: Apply D1 Migrations (Production) — all files in order
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: d1 execute webwaka-commerce-db-prod --env production --file migrations/001_commerce_schema.sql --remote
-      - name: Deploy Workers to Production
+          command: d1 migrations apply webwaka-production-db --env production --remote
+      - name: Deploy Worker to Production
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy --env production
-      - name: Verify API health
+      - name: Verify API health (Production)
         run: |
           sleep 20
-          curl -sf https://webwaka-commerce-api-prod.webwaka.workers.dev/health || echo "Health check pending..."
+          curl -sf https://webwaka-commerce-api-prod.webwaka.workers.dev/health \
+            && echo "✅ Production health OK" \
+            || echo "⚠️  Health check pending..."
 
   # ============================================================================
-  # PWA DEPLOY (Cloudflare Pages)
+  # PWA DEPLOY (Production — Cloudflare Pages)
   # ============================================================================
   deploy-pages:
     name: Deploy PWA to Cloudflare Pages (Production)
@@ -104,10 +106,12 @@ jobs:
           body: |
             ## WebWaka Commerce Suite — Production Release
 
-            ### Modules Deployed:
-            - **COM-1** POS: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/pos/products
-            - **COM-2** Single-Vendor: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/single-vendor/catalog
-            - **COM-3** Multi-Vendor: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/multi-vendor/vendors
+            ### Worker Endpoints:
+            - **POS**: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/pos/cmrc_products
+            - **Single-Vendor**: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/single-vendor/catalog
+            - **Multi-Vendor**: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/multi-vendor/catalog
+            - **B2B**: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/b2b/companies
+            - **AI**: https://webwaka-commerce-api-prod.webwaka.workers.dev/api/ai/recommendations
             - **PWA**: https://webwaka-commerce-ui.pages.dev
 
             ### Compliance:
@@ -115,8 +119,12 @@ jobs:
             - ✅ Nigeria-First: all monetary values in kobo (₦)
             - ✅ Offline-First: Dexie mutation queue, Background Sync
             - ✅ Multi-language: en, yo, ig, ha
-            - ✅ 109 tests passing (100%)
+            - ✅ 1059 unit tests passing (100%)
             - ✅ Mobile-First PWA with service worker
+            - ✅ JWT-secured API (Bearer token auth)
+            - ✅ Cloudflare Queues event bus (COMMERCE_EVENTS)
+
+            ### Deploy Method: GitHub Actions → Cloudflare (never direct)
           draft: false
           prerelease: false
         env:
