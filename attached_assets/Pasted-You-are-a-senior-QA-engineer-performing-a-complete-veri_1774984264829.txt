@@ -1,0 +1,83 @@
+You are a senior QA engineer performing a complete verification of Phase P10 (Trust, Conversion & Payment Features) in the webwaka-commerce repository.
+
+This phase covers payment flows, customer-facing trust signals, and dispute resolution. Verify all financial logic with precision.
+
+## Step 1 — Read Everything First
+Read completely:
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/admin/ui.tsx
+- src/core/event-bus/handlers/index.ts
+- src/worker.ts
+- migrations/0007_reviews_schedule.sql and migrations/0008_vendor_scores.sql
+
+## Step 2 — Verify Abandoned Cart Recovery (P10-T01)
+- [ ] In src/worker.ts scheduled handler: identifies abandoned carts (lastActivity > 60 min, nudgedAt IS NULL, status != COMPLETED)
+- [ ] For each: CommerceEvents.CART_ABANDONED published with customerPhone, items array, cartId
+- [ ] Second nudge: identifies carts nudged > 24 hours ago still not converted
+- [ ] Second nudge: generates or retrieves a promo code for the tenant
+- [ ] Second nudge: published with { promoCode, isSecondNudge: true }
+- [ ] handleCartAbandoned in handlers/index.ts is implemented (not a stub)
+- [ ] First nudge message includes product names and cart resume link
+- [ ] Second nudge message includes promo code and cart link
+- [ ] After sending: nudgedAt is updated in D1 to prevent duplicate nudges
+- [ ] EDGE CASE: customer has no phone number in cart_sessions → nudge skipped gracefully, not errored
+
+## Step 3 — Verify Customer Reviews (P10-T02)
+- [ ] POST /api/single-vendor/reviews: authentication required (customer JWT)
+- [ ] Validates: order belongs to customer; order status is 'DELIVERED'; no duplicate review for same orderId+productId
+- [ ] rating validated: integer 1-5; rejects 0 and 6+
+- [ ] Inserted with status 'PENDING' (not immediately public)
+- [ ] GET /api/single-vendor/products/:id/reviews: only returns status='APPROVED' reviews
+- [ ] Aggregate rating (AVG) and count (COUNT) included in response
+- [ ] Review moderation UI in src/modules/admin/ui.tsx: pending reviews listed with Approve/Reject buttons
+- [ ] PATCH /api/admin/reviews/:id: changes status to 'APPROVED' or 'REJECTED'
+- [ ] review_invites table exists in migration 0007
+- [ ] In handleDeliveryStatusUpdated: when status = 'DELIVERED', a row is inserted into review_invites with sendAt = 3 days from now
+- [ ] Scheduled cron in worker.ts processes review_invites WHERE sendAt <= NOW() AND sent = 0: sends WhatsApp invitation and marks sent = 1
+- [ ] EDGE CASE: customer attempts to review a product from an order not yet DELIVERED → HTTP 422
+
+## Step 4 — Verify Dispute Resolution (P10-T03)
+- [ ] POST /api/multi-vendor/disputes: requires authentication (buyer or vendor JWT)
+- [ ] Validates orderId exists and belongs to tenant
+- [ ] Validates reporter is either the buyer of the order OR a vendor with items in the order
+- [ ] CommerceEvents.DISPUTE_OPENED published after insert
+- [ ] Both buyer and vendor notified via WhatsApp on dispute open
+- [ ] In admin UI: dispute queue with Open/Under Review/Resolved tabs
+- [ ] Dispute detail view shows: order info, reporter type, description, evidence URLs as clickable images
+- [ ] PATCH /api/admin/disputes/:id (status to UNDER_REVIEW): exists
+- [ ] POST /api/admin/disputes/:id/resolve: handles FULL_REFUND, PARTIAL_REFUND, REPLACEMENT
+- [ ] FULL_REFUND: initiateRefund(order.paystackRef) — full amount
+- [ ] PARTIAL_REFUND: initiateRefund(order.paystackRef, amountKobo) — partial amount
+- [ ] REPLACEMENT: creates a new order record duplicating the original
+- [ ] After resolution: CommerceEvents.DISPUTE_RESOLVED published
+- [ ] Both parties notified via WhatsApp with resolution details
+- [ ] EDGE CASE: attempting to resolve an already-resolved dispute returns HTTP 409
+
+## Step 5 — Verify Vendor Performance Scoring (P10-T04)
+- [ ] migration 0008_vendor_scores.sql adds: performanceScore, badge, scoreUpdatedAt to vendors table
+- [ ] Weekly cron in src/worker.ts: calculates scores for all active vendors
+- [ ] Score formula uses: fulfillmentRate (40%), avgRating (20%), (1 - disputeRate) (30%), activity bonus (10%)
+- [ ] Score is clamped to 0-100 range
+- [ ] Badge thresholds: TOP_SELLER ≥ 90, VERIFIED ≥ 75, TRUSTED ≥ 60, none below 60
+- [ ] Vendors with score < 40: receive WhatsApp improvement message AND are flagged for review
+- [ ] Vendor badge is displayed on vendor store page in MV UI
+- [ ] Badge is displayed on search results alongside vendor name
+- [ ] EDGE CASE: vendor with zero orders in 30 days has 0% fulfillment rate — score reflects this correctly without divide-by-zero errors
+
+## Step 6 — Financial Accuracy Check
+For the dispute refund flows:
+- [ ] No refund is initiated before the dispute is RESOLVED (no early refunds)
+- [ ] Partial refund amount cannot exceed the original order total — verify this is validated server-side
+- [ ] Replacement order does not charge the customer again — it is created without a payment step
+
+## Step 7 — TypeScript and Tests
+Run: npx tsc --noEmit — fix all errors.
+Run: npm test — fix all failures.
+
+## Step 8 — Fix All Issues
+Fix every issue found.
+
+## Step 9 — Completion Confirmation
+"P10 QA COMPLETE — Abandoned cart double-nudge with promo code, review submission with moderation and delayed invitation, dispute resolution with FULL/PARTIAL/REPLACEMENT options and WhatsApp notifications, vendor performance scoring with correct formula and badge assignment. All financial edge cases validated. TypeScript clean. Tests passing."
+```

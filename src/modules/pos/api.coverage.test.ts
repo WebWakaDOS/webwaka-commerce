@@ -11,7 +11,7 @@ const mockDb = {
   bind: vi.fn().mockReturnThis(),
   all: vi.fn().mockResolvedValue({ results: [] }),
   first: vi.fn().mockResolvedValue(null),
-  run: vi.fn().mockResolvedValue({ success: true }),
+  run: vi.fn().mockResolvedValue({ success: true, meta: { changes: 1 } }),
   batch: vi.fn().mockResolvedValue([]),
 };
 
@@ -27,7 +27,7 @@ function req(method: string, path: string, body?: unknown, tenant = 'tnt_cov') {
 }
 
 const stockBatch = (qty: number, id = 'prod_1') => [
-  { results: [{ id, quantity: qty, name: 'Item' }], meta: { changes: 0 } },
+  { results: [{ id, quantity: qty, name: 'Item', version: 1 }], meta: { changes: 0 } },
 ];
 const deductBatch = (n = 1) => [
   ...Array(n).fill({ results: [], meta: { changes: 1 } }),
@@ -41,7 +41,7 @@ beforeEach(() => {
   mockDb.bind.mockReturnThis();
   mockDb.all.mockResolvedValue({ results: [] });
   mockDb.first.mockResolvedValue(null);
-  mockDb.run.mockResolvedValue({ success: true });
+  mockDb.run.mockResolvedValue({ success: true, meta: { changes: 1 } });
   mockDb.batch
     .mockResolvedValueOnce(stockBatch(100))
     .mockResolvedValueOnce(deductBatch(1));
@@ -51,16 +51,14 @@ beforeEach(() => {
 describe('Inventory Concurrency — Race Conditions', () => {
   it('detects race on 2nd item only in a 2-item cart', async () => {
     mockDb.batch.mockReset();
-    mockDb.batch
-      .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 10, name: 'A' }], meta: { changes: 0 } },
-        { results: [{ id: 'prod_2', quantity: 10, name: 'B' }], meta: { changes: 0 } },
-      ])
-      .mockResolvedValueOnce([
-        { results: [], meta: { changes: 1 } }, // prod_1 deducts OK
-        { results: [], meta: { changes: 0 } }, // prod_2 raced — 0 rows affected
-        { results: [], meta: { changes: 1 } }, // INSERT order
-      ]);
+    mockDb.batch.mockResolvedValueOnce([
+      { results: [{ id: 'prod_1', quantity: 10, name: 'A', version: 1 }], meta: { changes: 0 } },
+      { results: [{ id: 'prod_2', quantity: 10, name: 'B', version: 1 }], meta: { changes: 0 } },
+    ]);
+    // prod_1 lock succeeds, prod_2 lock conflicts (another terminal won)
+    mockDb.run
+      .mockResolvedValueOnce({ success: true, meta: { changes: 1 } })
+      .mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
 
     const res = await posRouter.fetch(req('POST', '/checkout', {
       items: [
@@ -78,14 +76,10 @@ describe('Inventory Concurrency — Race Conditions', () => {
     mockDb.batch.mockReset();
     mockDb.batch
       .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 10, name: 'A' }], meta: { changes: 0 } },
-        { results: [{ id: 'prod_2', quantity: 10, name: 'B' }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_1', quantity: 10, name: 'A', version: 1 }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_2', quantity: 10, name: 'B', version: 1 }], meta: { changes: 0 } },
       ])
-      .mockResolvedValueOnce([
-        { results: [], meta: { changes: 1 } }, // prod_1
-        { results: [], meta: { changes: 1 } }, // prod_2
-        { results: [], meta: { changes: 1 } }, // INSERT order
-      ]);
+      .mockResolvedValueOnce([{ results: [], meta: { changes: 1 } }]);
 
     const res = await posRouter.fetch(req('POST', '/checkout', {
       items: [
@@ -99,14 +93,11 @@ describe('Inventory Concurrency — Race Conditions', () => {
 
   it('reports STOCK_RACE even when 1st product races (not only last)', async () => {
     mockDb.batch.mockReset();
-    mockDb.batch
-      .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 5, name: 'Pepper' }], meta: { changes: 0 } },
-      ])
-      .mockResolvedValueOnce([
-        { results: [], meta: { changes: 0 } }, // 1st product races
-        { results: [], meta: { changes: 1 } }, // INSERT order
-      ]);
+    mockDb.batch.mockResolvedValueOnce([
+      { results: [{ id: 'prod_1', quantity: 5, name: 'Pepper', version: 1 }], meta: { changes: 0 } },
+    ]);
+    // 1st product lock conflicts immediately
+    mockDb.run.mockResolvedValueOnce({ success: true, meta: { changes: 0 } });
 
     const res = await posRouter.fetch(req('POST', '/checkout', {
       items: [{ product_id: 'prod_1', quantity: 5, price: 1000, name: 'Pepper' }],
@@ -150,7 +141,7 @@ describe('Inventory Concurrency — Race Conditions', () => {
     mockDb.batch.mockReset();
     mockDb.batch
       .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 7, name: 'Exact' }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_1', quantity: 7, name: 'Exact', version: 1 }], meta: { changes: 0 } },
       ])
       .mockResolvedValueOnce(deductBatch(1));
     const res = await posRouter.fetch(req('POST', '/checkout', {
@@ -164,7 +155,7 @@ describe('Inventory Concurrency — Race Conditions', () => {
     mockDb.batch.mockReset();
     mockDb.batch
       .mockResolvedValueOnce([
-        { results: [{ id: 'prod_1', quantity: 8, name: 'Near' }], meta: { changes: 0 } },
+        { results: [{ id: 'prod_1', quantity: 8, name: 'Near', version: 1 }], meta: { changes: 0 } },
       ])
       .mockResolvedValueOnce(deductBatch(1));
     const res = await posRouter.fetch(req('POST', '/checkout', {
@@ -323,7 +314,7 @@ describe('Payment Splits — Edge Cases', () => {
 
 // ─── Session Z-Report Edge Cases ───────────────────────────────────────────────
 describe('Session Z-Report — Edge Cases', () => {
-  it('Z-report with zero orders returns all-zeros gracefully', async () => {
+  it('Z-report with zero cmrc_orders returns all-zeros gracefully', async () => {
     mockDb.first
       .mockResolvedValueOnce({ id: 'sess_zero', cashier_id: 'c1', initial_float_kobo: 100000, status: 'open', opened_at: 0 })
       .mockResolvedValueOnce({ order_count: 0, total_sales_kobo: 0, cash_sales_kobo: 0 });
@@ -408,7 +399,7 @@ describe('Void Order — Additional Coverage', () => {
   it('void restores to fulfilled state would fail — void is one-way', async () => {
     // Once voided, subsequent void is idempotent (returns 200 with voided=true)
     mockDb.first.mockResolvedValue({ id: 'ord_1', order_status: 'voided', total_amount: 10000 });
-    const res = await posRouter.fetch(req('POST', '/orders/ord_1/void', { reason: 'Re-void attempt' }), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_1/void', { reason: 'Re-void attempt' }), mockEnv as any);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.data.voided).toBe(true);
@@ -416,7 +407,7 @@ describe('Void Order — Additional Coverage', () => {
 
   it('void stores trimmed reason (no leading/trailing whitespace)', async () => {
     mockDb.first.mockResolvedValue({ id: 'ord_2', order_status: 'fulfilled', total_amount: 50000 });
-    const res = await posRouter.fetch(req('POST', '/orders/ord_2/void', { reason: '  Wrong item   ' }), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_2/void', { reason: '  Wrong item   ' }), mockEnv as any);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.data.reason).toBe('Wrong item');
@@ -425,7 +416,7 @@ describe('Void Order — Additional Coverage', () => {
   it('void DB failure returns 500', async () => {
     mockDb.first.mockResolvedValue({ id: 'ord_3', order_status: 'fulfilled', total_amount: 50000 });
     mockDb.run.mockRejectedValue(new Error('D1 write failed'));
-    const res = await posRouter.fetch(req('POST', '/orders/ord_3/void', { reason: 'Error test' }), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_3/void', { reason: 'Error test' }), mockEnv as any);
     expect(res.status).toBe(500);
     const data = await res.json() as any;
     expect(data.error).toBe('Transaction failed');
@@ -436,7 +427,7 @@ describe('Void Order — Additional Coverage', () => {
 describe('Low-stock Endpoint — Additional Coverage', () => {
   it('threshold clamped to 0 when negative value provided', async () => {
     mockDb.all.mockResolvedValue({ results: [] });
-    const res = await posRouter.fetch(req('GET', '/products/low-stock?threshold=-5'), mockEnv as any);
+    const res = await posRouter.fetch(req('GET', '/cmrc_products/low-stock?threshold=-5'), mockEnv as any);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.threshold).toBe(0);
@@ -446,26 +437,26 @@ describe('Low-stock Endpoint — Additional Coverage', () => {
     mockDb.all.mockResolvedValue({
       results: [{ id: 'p1', name: 'Item', quantity: 2, barcode: '619000001001', low_stock_threshold: 5 }],
     });
-    const res = await posRouter.fetch(req('GET', '/products/low-stock'), mockEnv as any);
+    const res = await posRouter.fetch(req('GET', '/cmrc_products/low-stock'), mockEnv as any);
     const data = await res.json() as any;
     expect(data.data[0].barcode).toBe('619000001001');
   });
 
-  it('threshold=0 returns only out-of-stock products (quantity === 0)', async () => {
+  it('threshold=0 returns only out-of-stock cmrc_products (quantity === 0)', async () => {
     mockDb.all.mockResolvedValue({
       results: [{ id: 'p1', name: 'OOS', quantity: 0 }],
     });
-    const res = await posRouter.fetch(req('GET', '/products/low-stock?threshold=0'), mockEnv as any);
+    const res = await posRouter.fetch(req('GET', '/cmrc_products/low-stock?threshold=0'), mockEnv as any);
     const data = await res.json() as any;
     expect(data.threshold).toBe(0);
     expect(data.count).toBe(1);
   });
 
-  it('very high threshold returns all active products', async () => {
+  it('very high threshold returns all active cmrc_products', async () => {
     mockDb.all.mockResolvedValue({
       results: Array(50).fill({ id: 'p1', name: 'X', quantity: 100 }),
     });
-    const res = await posRouter.fetch(req('GET', '/products/low-stock?threshold=9999'), mockEnv as any);
+    const res = await posRouter.fetch(req('GET', '/cmrc_products/low-stock?threshold=9999'), mockEnv as any);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.count).toBe(50);
@@ -483,7 +474,7 @@ describe('Receipt Endpoint — Additional Coverage', () => {
 
   it('receipt for voided order still returns 201 (receipt always issued)', async () => {
     mockDb.first.mockResolvedValue(orderRow({ order_status: 'voided', total_amount: 50000 }));
-    const res = await posRouter.fetch(req('POST', '/orders/ord_x/receipt'), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_x/receipt'), mockEnv as any);
     expect(res.status).toBe(201);
     const data = await res.json() as any;
     expect(data.data.order_status).toBe('voided');
@@ -491,7 +482,7 @@ describe('Receipt Endpoint — Additional Coverage', () => {
 
   it('receipt whatsapp_url is URL-encoded (no raw ₦ in query param)', async () => {
     mockDb.first.mockResolvedValue(orderRow({ total_amount: 99900 }));
-    const res = await posRouter.fetch(req('POST', '/orders/ord_x/receipt'), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_x/receipt'), mockEnv as any);
     const data = await res.json() as any;
     const url = data.data.whatsapp_url;
     // URL should be encoded — raw ₦ should not appear unencoded
@@ -501,7 +492,7 @@ describe('Receipt Endpoint — Additional Coverage', () => {
 
   it('receipt order_date is valid ISO 8601 string', async () => {
     mockDb.first.mockResolvedValue(orderRow({ created_at: 1700000000000 }));
-    const res = await posRouter.fetch(req('POST', '/orders/ord_x/receipt'), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_x/receipt'), mockEnv as any);
     const data = await res.json() as any;
     expect(() => new Date(data.data.order_date)).not.toThrow();
     expect(new Date(data.data.order_date).getTime()).toBe(1700000000000);
@@ -509,7 +500,7 @@ describe('Receipt Endpoint — Additional Coverage', () => {
 
   it('receipt includes print_url field', async () => {
     mockDb.first.mockResolvedValue(orderRow());
-    const res = await posRouter.fetch(req('POST', '/orders/ord_x/receipt'), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_x/receipt'), mockEnv as any);
     const data = await res.json() as any;
     expect(data.data.print_url).toBeDefined();
     expect(data.data.print_url).toContain('ord_x');
@@ -517,7 +508,7 @@ describe('Receipt Endpoint — Additional Coverage', () => {
 
   it('receipt tenant_id matches request header', async () => {
     mockDb.first.mockResolvedValue(orderRow());
-    const res = await posRouter.fetch(req('POST', '/orders/ord_x/receipt', undefined, 'tnt_abuja'), mockEnv as any);
+    const res = await posRouter.fetch(req('POST', '/cmrc_orders/ord_x/receipt', undefined, 'tnt_abuja'), mockEnv as any);
     const data = await res.json() as any;
     expect(data.data.tenant_id).toBe('tnt_abuja');
   });

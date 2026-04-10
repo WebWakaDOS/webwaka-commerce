@@ -1,5 +1,6 @@
 import { SyncManager } from '../../core/sync/client';
 import { eventBus } from '../../core/event-bus';
+import { createTaxEngine } from '@webwaka/core';
 import { InventoryItem } from '../../core/db/schema';
 
 export interface CartItem extends InventoryItem {
@@ -19,6 +20,7 @@ export interface Order {
 export class POSCore {
   private syncManager: SyncManager;
   private tenantId: string;
+  readonly taxEngine = createTaxEngine({ vatRate: 0.075, vatRegistered: true, exemptCategories: [] });
 
   constructor(tenantId: string, syncApiUrl: string) {
     this.tenantId = tenantId;

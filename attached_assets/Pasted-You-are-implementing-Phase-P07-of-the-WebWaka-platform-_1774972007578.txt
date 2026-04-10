@@ -1,0 +1,150 @@
+You are implementing Phase P07 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase implements the core merchant operations that are the highest-priority merchant value features: returns, offline customer cache, stock take, receipt reprint, cashier reporting, commission engine, and vendor ledger.
+
+Read the following files fully before starting:
+- src/modules/pos/api.ts
+- src/modules/pos/ui.tsx
+- src/modules/pos/useBackgroundSync.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/multi-vendor/ui.tsx
+- src/modules/admin/ui.tsx
+- src/core/offline/db.ts
+- src/core/db/schema.ts
+
+## Tasks:
+
+### TASK 1 — Partial Returns and Store Credit API (POS-E04)
+Create migration 0006_returns.sql:
+CREATE TABLE IF NOT EXISTS order_returns (id TEXT PRIMARY KEY, tenantId TEXT NOT NULL, originalOrderId TEXT NOT NULL, returnedItems TEXT NOT NULL, returnMethod TEXT NOT NULL CHECK(returnMethod IN ('CASH','STORE_CREDIT','EXCHANGE')), creditAmountKobo INTEGER, processedBy TEXT, status TEXT NOT NULL DEFAULT 'PENDING', createdAt TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS stock_adjustment_log (id TEXT PRIMARY KEY, tenantId TEXT NOT NULL, productId TEXT NOT NULL, previousQty INTEGER, newQty INTEGER, delta INTEGER, reason TEXT, sessionId TEXT, createdAt TEXT NOT NULL);
+Apply migration.
+
+In src/modules/pos/api.ts add POST /api/pos/orders/:id/return:
+1. Read requireRole: STAFF (both staff and admin can process returns)
+2. Validate body: { items: [{productId, quantity, reason}], returnMethod }
+3. Fetch original order. Validate: tenantId matches, order is DELIVERED or COMPLETED, each item.productId was in the order, return quantity <= original quantity
+4. D1 batch transaction:
+a. For each returned item: UPDATE products SET quantity = quantity + ? WHERE id = ? AND tenantId = ?
+b. If returnMethod = 'STORE_CREDIT': UPDATE customers SET creditBalanceKobo = creditBalanceKobo + ? WHERE id = ? AND tenantId = ?
+c. INSERT into order_returns
+5. Publish CommerceEvents.INVENTORY_UPDATED for each returned product
+6. Return { success: true, creditAmountKobo, returnId }
+
+### TASK 2 — Offline Customer Cache (POS-E05)
+In src/modules/pos/api.ts add GET /api/pos/customers/top:
+Query: SELECT id, tenantId, name, phone, creditBalanceKobo, loyaltyPoints FROM customers WHERE tenantId = ? ORDER BY lastPurchaseAt DESC LIMIT 200
+(Add loyaltyPoints column to customers via migration 0006 if missing)
+
+In src/modules/pos/useBackgroundSync.ts add syncCustomerCache(tenantId):
+- Fetch /api/pos/customers/top
+- Upsert into Dexie 'customers' table: db.table('customers').bulkPut(result.customers)
+- Call this after every successful mutation flush
+
+In src/modules/pos/ui.tsx, in the customer lookup/search function:
+If offline or if Dexie returns results: use Dexie query first:
+db.table('customers').where('phone').startsWith(searchQuery).or('name').startsWith(searchQuery).limit(10).toArray()
+Fall back to network fetch if Dexie is empty.
+
+### TASK 3 — Stock Take Interface (POS-E06)
+In src/modules/pos/api.ts add POST /api/pos/stock-adjustments:
+Body: { sessionId, adjustments: [{productId, countedQuantity, reason: 'DAMAGE'|'THEFT'|'SUPPLIER_SHORT'|'CORRECTION'}] }
+requireRole: ADMIN
+For each adjustment:
+1. Read currentQty from D1
+2. Compute delta = countedQuantity - currentQty
+3. UPDATE products SET quantity = countedQuantity, updatedAt = NOW() WHERE id = ? AND tenantId = ?
+4. INSERT into stock_adjustment_log with previousQty, newQty, delta, reason, sessionId
+5. Publish CommerceEvents.STOCK_ADJUSTED
+6. Publish CommerceEvents.INVENTORY_UPDATED
+Return { adjusted: adjustments.length, log: stockAdjustmentRows }
+
+In src/modules/pos/ui.tsx add a StockTake modal (admin only, wrapped in RequireRole role="ADMIN"):
+- Fetch all products for the tenant
+- Render a table with columns: Product Name, SKU, System Quantity, Counted Quantity (editable input), Reason (dropdown)
+- "Preview Changes" button shows a diff of system vs counted
+- "Submit Stock Take" calls POST /api/pos/stock-adjustments
+
+### TASK 4 — Offline Receipt Reprint (POS-E07)
+In src/modules/pos/ui.tsx add a "Recent Orders" tab (admin only) to the bottom navigation.
+
+Content of this tab:
+- Query Dexie 'posReceipts' or 'orders' table (whichever stores completed orders) for the last 50 entries ordered by createdAt DESC for the current tenantId
+- Render each as a row: order number, total amount, items count, date/time
+- Per row actions:
+a. "Print" button: call window.print() with the receipt HTML injected into a print-only div
+b. "WhatsApp" button: generate a WhatsApp share link: https://wa.me/?text=Receipt+for+Order+{orderId}:+{itemsSummary}+Total:+{totalFormatted}
+
+### TASK 5 — Cashier-Level Sales Reporting (POS-E11)
+In src/modules/pos/api.ts, in the PATCH /api/pos/sessions/:id/close handler:
+After the existing session summary computation, add:
+const cashierBreakdown = await env.DB.prepare(`
+SELECT cashierId,
+COUNT(*) as orderCount,
+SUM(totalKobo) as revenueKobo,
+SUM(CASE WHEN paymentMethod = 'CASH' THEN totalKobo ELSE 0 END) as cashKobo,
+SUM(CASE WHEN paymentMethod != 'CASH' THEN totalKobo ELSE 0 END) as digitalKobo
+FROM orders WHERE sessionId = ? AND tenantId = ?
+GROUP BY cashierId
+`).bind(sessionId, tenantId).all();
+
+Add cashierBreakdown to the Z-report response.
+If cashierId column does not exist on orders: add to migration 0006_returns.sql:
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS cashierId TEXT;
+And ensure POST /api/pos/sessions/:id/checkout sets cashierId from the authenticated user's JWT claim.
+
+### TASK 6 — Commission Engine (MV-E02)
+In src/modules/multi-vendor/api.ts:
+Add a helper function resolveCommissionRate(db, tenantId, vendorId, category): Promise<number>:
+1. Try: SELECT rateBps FROM commission_rules WHERE tenantId = ? AND vendorId = ? AND (effectiveUntil IS NULL OR effectiveUntil > ?) ORDER BY effectiveFrom DESC LIMIT 1
+2. If found: return rateBps
+3. Try: SELECT rateBps FROM commission_rules WHERE tenantId = ? AND category = ? AND vendorId IS NULL AND (effectiveUntil IS NULL OR effectiveUntil > ?) ORDER BY effectiveFrom DESC LIMIT 1
+4. If found: return rateBps
+5. Default: return 1000 (10.00%)
+
+Replace all hardcoded commission calculations (e.g. commission = 0.1 or commission = 0.10) with:
+const rateBps = await resolveCommissionRate(db, tenantId, vendorId, itemCategory);
+const commissionKobo = Math.round(itemAmountKobo * rateBps / 10000);
+
+In src/modules/admin/ui.tsx add a Commission Management section (marketplace admin only):
+- Table listing all commission_rules for the tenant
+- Form to add a new rule: vendor (optional), category (optional), rate (%), effective dates
+- Edit/delete actions per row
+
+### TASK 7 — Vendor Ledger and Payout Dashboard (MV-E04)
+In src/modules/multi-vendor/api.ts:
+
+Add GET /api/multi-vendor/vendor/ledger?page=&limit= (requireRole: VENDOR):
+- Query vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC with pagination
+- Return { entries: [...], total, page }
+
+Add GET /api/multi-vendor/vendor/balance (requireRole: VENDOR):
+- SELECT SUM(CASE WHEN type IN ('SALE') THEN amountKobo ELSE 0 END) - SUM(CASE WHEN type IN ('COMMISSION','PAYOUT','REFUND') THEN amountKobo ELSE 0 END) as availableKobo FROM vendor_ledger_entries WHERE vendorId = ? AND tenantId = ?
+- Return { availableKobo, pendingClearanceKobo }
+
+Add POST /api/multi-vendor/vendor/payout-request (requireRole: VENDOR):
+- Validate: availableKobo >= 500000 (minimum ₦5,000)
+- Fetch vendor's bankAccountRecipientCode from vendors table
+- Call createPaymentProvider(env.PAYSTACK_SECRET_KEY).initiateTransfer(recipientCode, availableKobo, payoutReference)
+- INSERT into vendor_ledger_entries: type PAYOUT, amountKobo = availableKobo
+- Return { success, transferCode }
+
+Write vendor ledger events:
+After every successful vendor order payment, INSERT into vendor_ledger_entries:
+- SALE entry: amountKobo = orderTotal - commissionKobo, type = 'SALE'
+- COMMISSION entry: amountKobo = commissionKobo, type = 'COMMISSION'
+Compute balanceKobo as running total (SELECT balanceKobo FROM vendor_ledger_entries WHERE vendorId = ? ORDER BY createdAt DESC LIMIT 1, then add/subtract).
+
+In src/modules/multi-vendor/ui.tsx add Vendor Ledger page (vendor-only):
+- Balance summary cards: Available Balance, Pending Clearance
+- "Request Payout" button (disabled below minimum; shows minimum amount if blocked)
+- Paginated ledger table: type, amount, description, date
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Apply migration: wrangler d1 execute webwaka-commerce-db --file=migrations/0006_returns.sql --env staging
+4. Manual test: process a partial return for an existing order; verify inventory increases
+5. Manual test: close a POS session; verify cashierBreakdown is in Z-report
+6. Manual test: vendor requests payout; verify vendor_ledger_entries shows PAYOUT entry
+```

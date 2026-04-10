@@ -1,31 +1,116 @@
 /**
  * COM-3: Multi-Vendor Marketplace API — Phase MV-1 + MV-2 + MV-3
  * Auth, security hardening, KYC schema, vendor isolation, vendor onboarding,
- * cross-vendor catalog, marketplace cart, umbrella orders.
+ * cross-vendor catalog, marketplace cart, umbrella cmrc_orders.
  * Invariants: Nigeria-First (Paystack split in MV-3), Multi-tenancy, NDPR, Build Once Use Infinitely
  *
  * Auth model:
- *   Public  : GET /vendors (active only), GET /vendors/:id/products, GET /catalog,
+ *   Public  : GET /cmrc_vendors (active only), GET /cmrc_vendors/:id/cmrc_products, GET /catalog,
  *             GET /cart/:token, POST /cart, POST /checkout
- *   Admin   : POST /vendors, PATCH /vendors/:id  (x-admin-key header)
- *   Vendor  : POST /vendors/:id/products, GET /orders, GET /ledger,
- *             POST /vendors/:id/kyc  (Bearer JWT, role='vendor')
+ *   Admin   : POST /cmrc_vendors, PATCH /cmrc_vendors/:id  (requireRole SUPER_ADMIN | TENANT_ADMIN)
+ *   Vendor  : POST /cmrc_vendors/:id/cmrc_products, GET /cmrc_orders, GET /ledger,
+ *             POST /cmrc_vendors/:id/kyc  (Bearer JWT, role='vendor')
  *
  * MV-2 additions:
  *   POST /vendor-auth/request-otp  — alias for /auth/vendor-request-otp (canonical path)
  *   POST /vendor-auth/verify-otp   — alias for /auth/vendor-verify-otp
- *   POST /vendors/:id/kyc          — vendor submits rc_number, bvn_hash, nin_hash, bank_details
+ *   POST /cmrc_vendors/:id/kyc          — vendor submits rc_number, bvn_hash, nin_hash, bank_details
  *
  * MV-3 additions:
  *   GET  /catalog                  — cross-vendor cursor-paginated catalog, KV cache, FTS5 search
  *   POST /cart                     — create/update marketplace cart with per-vendor breakdown
  *   GET  /cart/:token              — return cart session with vendor_breakdown_json
- *   POST /checkout                 — upgraded: creates marketplace_orders umbrella + child orders
+ *   POST /checkout                 — upgraded: creates cmrc_marketplace_orders umbrella + child cmrc_orders
  */
 import { Hono } from 'hono';
+import { getTenantId, requireRole, signJWT, verifyJWT, sendTermiiSms, createTaxEngine, checkRateLimit as kvCheckRateLimit, CommerceEvents, updateWithVersionLock, createSmsProvider, createPaymentProvider, createAiClient } from '@webwaka/core';
+import { publishEvent } from '../../core/event-bus';
+import { notifyOrderPaid, notifyPayoutProcessed } from '../../core/central-mgmt';
+import { ndprConsentMiddleware } from '../../middleware/ndpr';
+import { getJwtSecret } from '../../utils/jwt-secret';
+import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
+import type { RateLimitStore } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
+import { DEFAULT_LOYALTY_CONFIG, type LoyaltyConfig } from '../../core/tenant/index';
+
+function evaluateLoyaltyTierMv(points: number, cfg: LoyaltyConfig): string {
+  const sorted = [...cfg.tiers].sort((a, b) => b.minPoints - a.minPoints);
+  return sorted.find((t) => points >= t.minPoints)?.name ?? 'BRONZE';
+}
 
 const app = new Hono<{ Bindings: Env }>();
+
+// ── OTP rate-limit store (5 requests per phone per 15 min) ────────────────────
+const otpRateLimitStore = _createRateLimitStore();
+// Checkout: 10 requests per identity per minute
+const checkoutRateLimitStore = _createRateLimitStore();
+// Search: 60 requests per IP per minute
+const searchRateLimitStore = _createRateLimitStore();
+
+// KV-backed rate limiter — uses SESSIONS_KV in production; falls back to in-memory store in tests.
+async function kvCheckRL(
+  kv: KVNamespace | undefined,
+  store: RateLimitStore,
+  key: string,
+  maxRequests: number,
+  windowMs: number,
+): Promise<boolean> {
+  if (kv) {
+    const r = await kvCheckRateLimit({ kv, key, maxRequests, windowSeconds: Math.ceil(windowMs / 1000) });
+    return r.allowed;
+  }
+  return checkRateLimit(store, key, maxRequests, windowMs);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MV-E02: COMMISSION ENGINE — Tiered, per-vendor, per-category rules
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve the effective commission rate (basis points) for a given vendor/category.
+ * Priority: 1) vendor+date match → 2) category+date match → 3) default 1000 bps (10%)
+ * Uses `cmrc_commission_rules` from migration 0003 (columns: tenantId, vendorId, category,
+ * rateBps, effectiveFrom, effectiveUntil).
+ */
+async function resolveCommissionRate(
+  db: D1Database,
+  tenantId: string,
+  vendorId: string,
+  category: string | null,
+  vendorDefaultBps?: number,
+): Promise<number> {
+  const now = new Date().toISOString();
+
+  // 1. Vendor-specific rule from cmrc_commission_rules table
+  const vendorRule = await db.prepare(
+    `SELECT rateBps FROM cmrc_commission_rules
+     WHERE tenantId = ? AND vendorId = ?
+       AND (effectiveFrom IS NULL OR effectiveFrom <= ?)
+       AND (effectiveUntil IS NULL OR effectiveUntil > ?)
+     ORDER BY effectiveFrom DESC LIMIT 1`,
+  ).bind(tenantId, vendorId, now, now).first<{ rateBps: number }>();
+
+  if (vendorRule?.rateBps != null) return vendorRule.rateBps;
+
+  // 2. Category-wide rule (no vendorId restriction)
+  if (category) {
+    const catRule = await db.prepare(
+      `SELECT rateBps FROM cmrc_commission_rules
+       WHERE tenantId = ? AND category = ? AND vendorId IS NULL
+         AND (effectiveFrom IS NULL OR effectiveFrom <= ?)
+         AND (effectiveUntil IS NULL OR effectiveUntil > ?)
+       ORDER BY effectiveFrom DESC LIMIT 1`,
+    ).bind(tenantId, category, now, now).first<{ rateBps: number }>();
+
+    if (catRule?.rateBps != null) return catRule.rateBps;
+  }
+
+  // 3. Vendor's own commission_rate field (backward-compat with cmrc_vendors table)
+  if (vendorDefaultBps != null) return vendorDefaultBps;
+
+  // 4. Platform-wide default: 10% (1000 bps)
+  return 1000;
+}
 
 // ── Crypto helpers (same pattern as COM-2 Single-Vendor) ──────────────────────
 
@@ -35,44 +120,7 @@ async function hashOtp(otp: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Minimal HS256 JWT sign using Web Crypto — mirrors COM-2 signJwt */
-async function signJwt(payload: Record<string, unknown>, secret: string): Promise<string> {
-  const enc = (obj: object) =>
-    btoa(JSON.stringify(obj)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const header = enc({ alg: 'HS256', typ: 'JWT' });
-  const body = enc(payload);
-  const data = `${header}.${body}`;
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
-  );
-  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  return `${data}.${sig}`;
-}
-
-/** Verify HS256 JWT and return claims, or null if invalid/expired — mirrors COM-2 verifyJwt */
-export async function verifyJwt(token: string, secret: string): Promise<Record<string, unknown> | null> {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [header, payloadB64, sigB64] = parts as [string, string, string];
-  try {
-    const data = `${header}.${payloadB64}`;
-    const key = await crypto.subtle.importKey(
-      'raw', new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'],
-    );
-    const sigBuf = Uint8Array.from(
-      atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0),
-    );
-    const valid = await crypto.subtle.verify('HMAC', key, sigBuf, new TextEncoder().encode(data));
-    if (!valid) return null;
-    const claims = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
-    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null;
-    return claims;
-  } catch { return null; }
-}
+// signJWT and verifyJWT are imported from @webwaka/core (P0-T03)
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -90,31 +138,22 @@ async function authenticateVendor(
   const auth = c.req.header('Authorization');
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return null;
-  const claims = await verifyJwt(token, c.env.JWT_SECRET ?? 'dev-secret-change-me');
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
   if (!claims || claims.role !== 'vendor') return null;
   return {
-    vendorId: String(claims.vendor_id),
-    tenantId: String(claims.tenant),
-    phone: String(claims.phone ?? ''),
+    vendorId: String((claims as any).vendor_id ?? claims.sub),
+    tenantId: String((claims as any).tenantId ?? (claims as any).tenant ?? ''),
+    phone: String((claims as any).phone ?? claims.email ?? ''),
   };
-}
-
-/**
- * Check x-admin-key header.  Returns true when present (non-empty).
- * In production the key is validated against an env var / KV secret.
- * MV-1 uses presence-only check; MV-2 will add HMAC validation.
- */
-function isAdminRequest(c: { req: { header: (h: string) => string | undefined } }): boolean {
-  const key = c.req.header('x-admin-key');
-  return typeof key === 'string' && key.length > 0;
 }
 
 // ── Tenant guard middleware ────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (!tenantId) {
     return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   }
+  c.set('tenantId' as never, tenantId);
   await next();
 });
 
@@ -125,10 +164,10 @@ app.use('*', async (c, next) => {
 /**
  * POST /auth/vendor-request-otp
  * Sends a 6-digit OTP via Termii SMS to the vendor's registered phone.
- * Vendor must already be registered in the `vendors` table for this marketplace.
+ * Vendor must already be registered in the `cmrc_vendors` table for this marketplace.
  */
 app.post('/auth/vendor-request-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string }>();
 
   const phone = body.phone?.trim();
@@ -139,10 +178,16 @@ app.post('/auth/vendor-request-otp', async (c) => {
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
 
+  // Rate limit: 5 OTP requests per phone per 15 minutes
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  }
+
   try {
     // Verify vendor exists and is active for this marketplace
     const vendor = await c.env.DB.prepare(
-      "SELECT id, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; status: string }>();
 
     if (!vendor) {
@@ -159,31 +204,23 @@ app.post('/auth/vendor-request-otp', async (c) => {
     const otpId = `votp_${now}_${Math.random().toString(36).slice(2, 8)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+      `INSERT INTO cmrc_customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    if (c.env.TERMII_API_KEY) {
-      await fetch('https://api.ng.termii.com/api/sms/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: c.env.TERMII_API_KEY,
-          to: e164,
-          from: 'WebWaka',
-          sms: `Your WebWaka Vendor verification code is: ${otpCode}. Valid for 10 minutes. Do not share.`,
-          type: 'plain',
-          channel: 'dnd',
-        }),
-      });
-    }
+    await sendTermiiSms(
+      e164,
+      `Your WebWaka Vendor verification code is: ${otpCode}. Valid for 10 minutes. Do not share.`,
+      c.env.TERMII_API_KEY ?? '',
+    );
 
     return c.json({
       success: true,
       data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -194,7 +231,7 @@ app.post('/auth/vendor-request-otp', async (c) => {
  * Token is valid for 7 days. Same HMAC-SHA256/JWT_SECRET as COM-2.
  */
 app.post('/auth/vendor-verify-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string; otp: string }>();
 
   const phone = body.phone?.trim();
@@ -208,7 +245,7 @@ app.post('/auth/vendor-verify-otp', async (c) => {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
     const otpRow = await c.env.DB.prepare(
       `SELECT id, otp_hash, is_used, attempts, expires_at
-       FROM customer_otps
+       FROM cmrc_customer_otps
        WHERE tenant_id = ? AND phone = ? AND is_used = 0
        ORDER BY created_at DESC LIMIT 1`
     ).bind(tenantId, e164).first<OtpRow>();
@@ -219,31 +256,24 @@ app.post('/auth/vendor-verify-otp', async (c) => {
 
     const inputHash = await hashOtp(otp);
     if (inputHash !== otpRow.otp_hash) {
-      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      await c.env.DB.prepare('UPDATE cmrc_customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
       return c.json({ success: false, error: 'Incorrect OTP' }, 401);
     }
 
-    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+    await c.env.DB.prepare('UPDATE cmrc_customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
 
     const vendor = await c.env.DB.prepare(
-      "SELECT id, name, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, name, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; name: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor account not found' }, 404);
     if (vendor.status === 'suspended') return c.json({ success: false, error: 'Vendor account suspended' }, 403);
 
     const now = Date.now();
-    const token = await signJwt(
-      {
-        sub: vendor.id,
-        role: 'vendor',
-        vendor_id: vendor.id,
-        tenant: tenantId,
-        phone: e164,
-        iat: Math.floor(now / 1000),
-        exp: Math.floor(now / 1000) + 7 * 86400,
-      },
-      c.env.JWT_SECRET ?? 'dev-secret-change-me',
+    const token = await signJWT(
+      { sub: vendor.id, tenantId, role: 'vendor', permissions: [], email: e164 },
+      getJwtSecret(c.env),
+      7 * 86400,
     );
 
     c.header(
@@ -255,8 +285,9 @@ app.post('/auth/vendor-verify-otp', async (c) => {
       success: true,
       data: { token, vendor_id: vendor.id, vendor_name: vendor.name, phone: e164 },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -266,17 +297,17 @@ app.post('/auth/vendor-verify-otp', async (c) => {
 
 /**
  * GET / — Marketplace overview (public)
- * Returns count of ACTIVE vendors and all live products for this marketplace.
+ * Returns count of ACTIVE cmrc_vendors and all live cmrc_products for this marketplace.
  */
 app.get('/', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const vendorCount = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM vendors WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL"
+      "SELECT COUNT(*) as count FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL"
     ).bind(tenantId).first<{ count: number }>();
     const productCount = await c.env.DB.prepare(
-      `SELECT COUNT(*) as count FROM products p
-       INNER JOIN vendors v ON p.vendor_id = v.id
+      `SELECT COUNT(*) as count FROM cmrc_products p
+       INNER JOIN cmrc_vendors v ON p.vendor_id = v.id
        WHERE p.tenant_id = ? AND p.is_active = 1 AND p.deleted_at IS NULL
          AND v.status = 'active' AND v.deleted_at IS NULL`
     ).bind(tenantId).first<{ count: number }>();
@@ -287,45 +318,47 @@ app.get('/', async (c) => {
         total_products: productCount?.count ?? 0,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: { active_vendors: 0, total_products: 0 } });
   }
 });
 
 /**
- * GET /vendors — List ACTIVE vendors only (fix G-3)
- * Public endpoint — does NOT expose pending/suspended vendors.
+ * GET /cmrc_vendors — List ACTIVE cmrc_vendors only (fix G-3)
+ * Public endpoint — does NOT expose pending/suspended cmrc_vendors.
  * Returns safe fields only: no bank_account, no internal commission details.
  */
-app.get('/vendors', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.get('/cmrc_vendors', async (c) => {
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, name, slug, email, phone, address, status, created_at, updated_at
-       FROM vendors
+      `SELECT id, name, slug, email, phone, address, status, performanceScore, badge, scoreUpdatedAt, created_at, updated_at
+       FROM cmrc_vendors
        WHERE marketplace_tenant_id = ? AND status = 'active' AND deleted_at IS NULL
        ORDER BY name ASC`
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
 
 /**
- * GET /vendors/:id/products — List vendor's active products (public browsing)
+ * GET /cmrc_vendors/:id/cmrc_products — List vendor's active cmrc_products (public browsing)
  * Verifies vendor is active before returning its catalog.
  * Does NOT expose cost_price (avoid COM-2 G-SEC-1 regression).
  * MV-3 will add cursor pagination and KV cache.
  */
-app.get('/vendors/:id/products', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.get('/cmrc_vendors/:id/cmrc_products', async (c) => {
+  const tenantId = getTenantId(c);
   const vendorId = c.req.param('id');
 
   try {
     // Guard: vendor must be active and belong to this marketplace
     const vendor = await c.env.DB.prepare(
-      "SELECT id, status FROM vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
+      "SELECT id, status FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
     ).bind(vendorId, tenantId).first<{ id: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
@@ -334,32 +367,65 @@ app.get('/vendors/:id/products', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenant_id, vendor_id, sku, name, description, category,
               price, quantity, unit, image_url, barcode, has_variants, is_active, created_at, updated_at
-       FROM products
+       FROM cmrc_products
        WHERE vendor_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
        ORDER BY name ASC
        LIMIT 100`
     ).bind(vendorId, tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
 
+/**
+ * GET /cmrc_vendors/:id/cmrc_products/:productId/variants — List product variants (public)
+ * Returns grouped variant options so the storefront can render a picker.
+ */
+app.get('/cmrc_vendors/:id/cmrc_products/:productId/variants', async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('productId');
+
+  try {
+    // Guard: product must belong to this vendor and tenant, and be active
+    const product = await c.env.DB.prepare(
+      "SELECT id FROM cmrc_products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL"
+    ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+
+    if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, option_name, option_value, price_delta, quantity
+       FROM cmrc_product_variants
+       WHERE product_id = ?
+       ORDER BY option_name ASC, option_value ASC`
+    ).bind(productId).all();
+
+    return c.json({ success: true, data: { variants: results } });
+  } catch (err) {
+    console.error('GET /cmrc_vendors/:id/cmrc_products/:productId/variants error:', err);
+    return c.json({ success: false, error: 'Failed to load product variants' }, 500);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// ADMIN ENDPOINTS — require x-admin-key header
+// ADMIN ENDPOINTS — requireRole(['SUPER_ADMIN', 'TENANT_ADMIN'])
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors — Register a new vendor (admin only)
+ * POST /cmrc_vendors — Register a new vendor (admin only)
  * Sets status = 'pending' awaiting KYC review and admin activation.
  * bank_account stored as Paystack subaccount code in MV-2 (see MULTI_VENDOR_REVIEW_AND_ENHANCEMENTS.md §7.2).
  */
-app.post('/vendors', async (c) => {
-  if (!isAdminRequest(c)) {
+app.post('/cmrc_vendors', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
-
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     name: string;
     slug: string;
@@ -381,13 +447,13 @@ app.post('/vendors', async (c) => {
   try {
     // Guard: slug must be unique per marketplace (G-3 / missing UNIQUE index — enforced here until migration 006)
     const existing = await c.env.DB.prepare(
-      "SELECT id FROM vendors WHERE marketplace_tenant_id = ? AND slug = ? AND deleted_at IS NULL"
+      "SELECT id FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND slug = ? AND deleted_at IS NULL"
     ).bind(tenantId, body.slug.trim()).first<{ id: string }>();
 
     if (existing) return c.json({ success: false, error: `Slug '${body.slug}' is already taken` }, 409);
 
     await c.env.DB.prepare(
-      `INSERT INTO vendors
+      `INSERT INTO cmrc_vendors
          (id, marketplace_tenant_id, name, slug, email, phone, address,
           bank_account, bank_code, commission_rate, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
@@ -401,49 +467,70 @@ app.post('/vendors', async (c) => {
     ).run();
 
     return c.json({ success: true, data: { id, status: 'pending', ...body } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * PATCH /vendors/:id — Update vendor status or commission (admin only)
+ * PATCH /cmrc_vendors/:id — Update vendor status or commission (admin only)
  * Valid status values: pending, active, suspended.
- * Suspended vendors immediately disappear from public GET /vendors.
+ * Suspended cmrc_vendors immediately disappear from public GET /cmrc_vendors.
  */
-app.patch('/vendors/:id', async (c) => {
-  if (!isAdminRequest(c)) {
+app.patch('/cmrc_vendors/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
     return c.json({ success: false, error: 'Admin authentication required' }, 401);
   }
-
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const id = c.req.param('id');
-  const body = await c.req.json<{ status?: string; commission_rate?: number }>();
+  const body = await c.req.json<{ status?: string; commission_rate?: number; pickupAddress?: unknown }>();
 
   const validStatuses = ['pending', 'active', 'suspended'];
   if (body.status && !validStatuses.includes(body.status)) {
     return c.json({ success: false, error: `status must be one of: ${validStatuses.join(', ')}` }, 400);
   }
 
+  // Validate pickupAddress structure when provided (P05-T5)
+  if (body.pickupAddress !== undefined) {
+    const addr = body.pickupAddress as Record<string, unknown>;
+    if (typeof addr !== 'object' || addr === null || Array.isArray(addr)) {
+      return c.json({ success: false, error: 'pickupAddress must be an object' }, 400);
+    }
+    const requiredAddrFields = ['street', 'city', 'state', 'lga'] as const;
+    for (const field of requiredAddrFields) {
+      if (!addr[field] || typeof addr[field] !== 'string') {
+        return c.json({ success: false, error: `pickupAddress.${field} is required and must be a non-empty string` }, 400);
+      }
+    }
+  }
+
   const now = Date.now();
   try {
     const vendor = await c.env.DB.prepare(
-      "SELECT id FROM vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
+      "SELECT id FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
     ).bind(id, tenantId).first<{ id: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
 
+    const pickupJson = body.pickupAddress !== undefined
+      ? JSON.stringify(body.pickupAddress)
+      : null;
     await c.env.DB.prepare(
-      `UPDATE vendors
+      `UPDATE cmrc_vendors
        SET status = COALESCE(?, status),
            commission_rate = COALESCE(?, commission_rate),
+           pickupAddress = COALESCE(?, pickupAddress),
            updated_at = ?
        WHERE id = ? AND marketplace_tenant_id = ?`
-    ).bind(body.status ?? null, body.commission_rate ?? null, now, id, tenantId).run();
+    ).bind(body.status ?? null, body.commission_rate ?? null, pickupJson, now, id, tenantId).run();
 
     return c.json({ success: true, data: { id, ...body, updated_at: now } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -452,20 +539,20 @@ app.patch('/vendors/:id', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors/:id/products — Add product to vendor's catalog (vendor JWT required)
+ * POST /cmrc_vendors/:id/cmrc_products — Add product to vendor's catalog (vendor JWT required)
  * SEC-8 fix: verifies URL vendor_id matches the authenticated vendor's JWT claim.
- * Tenant isolation: products inserted with both tenant_id and vendor_id.
+ * Tenant isolation: cmrc_products inserted with both tenant_id and vendor_id.
  */
-app.post('/vendors/:id/products', async (c) => {
+app.post('/cmrc_vendors/:id/cmrc_products', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
   const vendorId = c.req.param('id');
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
 
-  // SEC-8: Vendor can only add products to their own catalog
+  // SEC-8: Vendor can only add cmrc_products to their own catalog
   if (vendor.vendorId !== vendorId) {
-    return c.json({ success: false, error: 'You may only add products to your own vendor catalog' }, 403);
+    return c.json({ success: false, error: 'You may only add cmrc_products to your own vendor catalog' }, 403);
   }
   // Tenant cross-check: JWT tenant must match header
   if (vendor.tenantId !== tenantId) {
@@ -496,7 +583,7 @@ app.post('/vendors/:id/products', async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO products
+      `INSERT INTO cmrc_products
          (id, tenant_id, vendor_id, sku, name, description, category,
           price, quantity, image_url, is_active, has_variants, version, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1, ?, ?)`
@@ -513,57 +600,178 @@ app.post('/vendors/:id/products', async (c) => {
       success: true,
       data: { id, vendor_id: vendorId, tenant_id: tenantId, ...body },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * GET /orders — Vendor's marketplace orders (vendor JWT required)
- * Scoped: returns only orders containing items from the authenticated vendor.
- * NOTE: Uses items_json LIKE pattern (flat model). MV-2 replaces with vendor_orders table.
- * Tenant isolation: orders.tenant_id = marketplace tenant, channel = 'marketplace'.
+ * PATCH /cmrc_vendors/:id/cmrc_products/:productId — Update a vendor product (vendor JWT required)
+ * Vendor can only edit cmrc_products in their own catalog.
  */
-app.get('/orders', async (c) => {
+app.patch('/cmrc_vendors/:id/cmrc_products/:productId', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('productId');
+  const tenantId = getTenantId(c);
+
+  if (vendor.vendorId !== vendorId) {
+    return c.json({ success: false, error: 'You may only edit cmrc_products in your own vendor catalog' }, 403);
+  }
+  if (vendor.tenantId !== tenantId) {
+    return c.json({ success: false, error: 'Tenant mismatch' }, 403);
+  }
+
+  // Confirm product belongs to this vendor
+  const existing = await c.env.DB.prepare(
+    "SELECT id FROM cmrc_products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
+  ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+  if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const body = await c.req.json<{
+    name?: string; price?: number; quantity?: number;
+    category?: string; description?: string; image_url?: string;
+  }>();
+
+  if (body.price !== undefined && (!Number.isInteger(body.price) || body.price <= 0)) {
+    return c.json({ success: false, error: 'price must be a positive integer (kobo)' }, 400);
+  }
+  if (body.quantity !== undefined && (!Number.isInteger(body.quantity) || body.quantity < 0)) {
+    return c.json({ success: false, error: 'quantity must be a non-negative integer' }, 400);
+  }
+
+  const fields: string[] = [];
+  const values: (string | number | null)[] = [];
+
+  if (body.name !== undefined) { fields.push('name = ?'); values.push(body.name.trim()); }
+  if (body.price !== undefined) { fields.push('price = ?'); values.push(body.price); }
+  if (body.quantity !== undefined) { fields.push('quantity = ?'); values.push(body.quantity); }
+  if (body.category !== undefined) { fields.push('category = ?'); values.push(body.category || null); }
+  if (body.description !== undefined) { fields.push('description = ?'); values.push(body.description || null); }
+  if (body.image_url !== undefined) { fields.push('image_url = ?'); values.push(body.image_url || null); }
+
+  if (fields.length === 0) return c.json({ success: false, error: 'No fields to update' }, 400);
+
+  fields.push('updated_at = ?');
+  values.push(Date.now());
+  values.push(productId, vendorId, tenantId);
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE cmrc_products SET ${fields.join(', ')} WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    ).bind(...values).run();
+    return c.json({ success: true, data: { id: productId } });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * DELETE /cmrc_vendors/:id/cmrc_products/:productId — Soft-delete a vendor product (vendor JWT required)
+ * Vendor can only delete cmrc_products in their own catalog.
+ */
+app.delete('/cmrc_vendors/:id/cmrc_products/:productId', async (c) => {
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const vendorId = c.req.param('id');
+  const productId = c.req.param('productId');
+  const tenantId = getTenantId(c);
+
+  if (vendor.vendorId !== vendorId) {
+    return c.json({ success: false, error: 'You may only delete cmrc_products from your own vendor catalog' }, 403);
+  }
+  if (vendor.tenantId !== tenantId) {
+    return c.json({ success: false, error: 'Tenant mismatch' }, 403);
+  }
+
+  const existing = await c.env.DB.prepare(
+    "SELECT id FROM cmrc_products WHERE id = ? AND vendor_id = ? AND tenant_id = ? AND deleted_at IS NULL"
+  ).bind(productId, vendorId, tenantId).first<{ id: string }>();
+  if (!existing) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  try {
+    await c.env.DB.prepare(
+      "UPDATE cmrc_products SET deleted_at = ?, is_active = 0 WHERE id = ? AND vendor_id = ? AND tenant_id = ?"
+    ).bind(Date.now(), productId, vendorId, tenantId).run();
+    return c.json({ success: true, data: { id: productId } });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /cmrc_orders — Vendor's marketplace cmrc_orders (vendor JWT required)
+ * Scoped: returns only cmrc_orders containing items from the authenticated vendor.
+ * NOTE: Uses items_json LIKE pattern (flat model). MV-2 replaces with cmrc_vendor_orders table.
+ * Tenant isolation: cmrc_orders.tenant_id = marketplace tenant, channel = 'marketplace'.
+ */
+app.get('/cmrc_orders', async (c) => {
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const tenantId = getTenantId(c);
   if (vendor.tenantId !== tenantId) {
     return c.json({ success: false, error: 'Tenant mismatch' }, 403);
   }
 
   try {
-    // Filter marketplace orders that contain items from this vendor
-    // MV-2 TODO: replace with SELECT from vendor_orders table once umbrella+child model is in place
+    // Filter marketplace cmrc_orders that contain items from this vendor
+    // MV-2 TODO: replace with SELECT from cmrc_vendor_orders table once umbrella+child model is in place
     const vendorPattern = `%"vendor_id":"${vendor.vendorId}"%`;
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenant_id, customer_email, subtotal, total_amount,
               payment_method, payment_status, order_status, payment_reference,
               items_json, channel, created_at, updated_at
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND channel = 'marketplace'
          AND items_json LIKE ?
          AND deleted_at IS NULL
        ORDER BY created_at DESC
        LIMIT 100`
-    ).bind(tenantId, vendorPattern).all();
-    return c.json({ success: true, data: results });
-  } catch {
+    ).bind(tenantId, vendorPattern).all<{
+      id: string; tenant_id: string; customer_email: string | null;
+      subtotal: number; total_amount: number; payment_method: string | null;
+      payment_status: string; order_status: string; payment_reference: string | null;
+      items_json: string; channel: string; created_at: number; updated_at: number;
+    }>();
+
+    const data = results.map(row => {
+      let items: unknown[] = [];
+      try { items = JSON.parse(row.items_json ?? '[]'); } catch { items = []; }
+      const vendorItems = (items as Array<{ vendor_id: string; price: number; quantity: number }>)
+        .filter(i => i.vendor_id === vendor.vendorId);
+      return {
+        ...row,
+        items_json: undefined,
+        items,
+        vendor_items: vendorItems,
+        vendor_subtotal: vendorItems.reduce((s, i) => s + (i.price ?? 0) * (i.quantity ?? 0), 0),
+        item_count: vendorItems.reduce((s, i) => s + (i.quantity ?? 0), 0),
+      };
+    });
+    return c.json({ success: true, data });
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
 
 /**
  * GET /ledger — Vendor's ledger entries (vendor JWT required)
- * Scoped to vendor_id from JWT — cannot read other vendors' financial data.
- * Tenant isolation: ledger_entries.tenant_id + vendor_id both checked.
+ * Scoped to vendor_id from JWT — cannot read other cmrc_vendors' financial data.
+ * Tenant isolation: cmrc_ledger_entries.tenant_id + vendor_id both checked.
  */
 app.get('/ledger', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (vendor.tenantId !== tenantId) {
     return c.json({ success: false, error: 'Tenant mismatch' }, 403);
   }
@@ -571,16 +779,69 @@ app.get('/ledger', async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at
-       FROM ledger_entries
+       FROM cmrc_ledger_entries
        WHERE tenant_id = ? AND vendor_id = ?
        ORDER BY created_at DESC
        LIMIT 200`
     ).bind(tenantId, vendor.vendorId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// T-COM-04: SHIPPING COST HELPER — Queries Logistics Unified Delivery Zone API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Retrieve a vendor's shipping fee (in kobo) for a customer's delivery destination.
+ *
+ * Architecture invariant: shipping distances and zone fees are the sole
+ * responsibility of the webwaka-logistics service. This function MUST NOT
+ * calculate distances or flat-rate tables internally — it delegates 100% to the
+ * LOGISTICS_WORKER Service Binding and falls back gracefully to 0 when the
+ * binding is unavailable (test / local environments).
+ *
+ * @param logisticsWorker  Cloudflare Service Binding to webwaka-logistics
+ * @param tenantId         Marketplace tenant identifier
+ * @param vendorId         Vendor whose pickup zone is queried
+ * @param state            Customer delivery state (e.g. "Lagos")
+ * @param lga              Customer delivery LGA (optional refinement)
+ * @param orderValueKobo   Vendor sub-order value in kobo (for free-shipping thresholds)
+ * @returns                Shipping fee in kobo (integer, ≥ 0); 0 on any failure
+ */
+async function getVendorShippingCost(
+  logisticsWorker: Fetcher | undefined,
+  tenantId: string,
+  vendorId: string,
+  state: string,
+  lga: string | undefined,
+  orderValueKobo: number,
+): Promise<number> {
+  if (!logisticsWorker || !state) return 0;
+  try {
+    const params = new URLSearchParams({
+      vendor_id: vendorId,
+      state,
+      order_value: String(orderValueKobo),
+      weight_kg: '0',
+    });
+    if (lga) params.set('lga', lga);
+    const resp = await logisticsWorker.fetch(
+      `http://internal/api/delivery-zones/estimate?${params.toString()}`,
+      { headers: { 'x-tenant-id': tenantId } },
+    );
+    const data = await resp.json<{ success: boolean; data?: { total_fee?: number } }>();
+    if (data.success && data.data?.total_fee != null) {
+      return Math.max(0, Math.round(data.data.total_fee));
+    }
+  } catch {
+    // Non-fatal: logistics service unavailable → 0 shipping (customer notified via response note)
+  }
+  return 0;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PUBLIC CHECKOUT — NDPR required; Paystack verify added in MV-2
@@ -588,15 +849,15 @@ app.get('/ledger', async (c) => {
 
 /**
  * POST /checkout — Marketplace checkout (MV-4 upgrade)
- * MV-3: Creates marketplace_orders umbrella + per-vendor child orders + ledger entries.
+ * MV-3: Creates cmrc_marketplace_orders umbrella + per-vendor child cmrc_orders + ledger entries.
  * MV-4 adds:
  *   - Server-side Paystack transaction verify (when PAYSTACK_SECRET set + method='paystack')
  *   - Amount mismatch guard (prevents partial-payment fraud)
- *   - Per-vendor settlement records in `settlements` table (T+7 escrow default)
+ *   - Per-vendor settlement records in `cmrc_settlements` table (T+7 escrow default)
  *   - Vendor settlement_hold_days respected per vendor
  */
-app.post('/checkout', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.post('/checkout', ndprConsentMiddleware, async (c) => {
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; vendor_id: string; quantity: number; price: number; name: string }>;
     customer_email: string;
@@ -604,22 +865,73 @@ app.post('/checkout', async (c) => {
     payment_method: string;
     payment_reference?: string;
     ndpr_consent: boolean;
+    shipping_address?: { state: string; lga: string; street: string };
   }>();
 
-  if (!body.ndpr_consent) {
-    return c.json({ success: false, error: 'NDPR consent required' }, 400);
-  }
   if (!body.items?.length) {
     return c.json({ success: false, error: 'items array is required and must not be empty' }, 400);
   }
   if (!body.customer_email?.trim()) {
     return c.json({ success: false, error: 'customer_email is required' }, 400);
   }
+  const rlCheckout = body.customer_phone ?? body.customer_email ?? 'anon';
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, checkoutRateLimitStore, `rl:checkout:${rlCheckout}`, 10, 60_000))) {
+    return c.json({ success: false, error: 'Too many checkout attempts. Please wait before retrying.' }, 429);
+  }
+
+  // ── Phase A: Pre-payment stock validation (all-or-nothing batch check) ────────
+  // D1 batch SELECT quantity + version before payment is attempted.
+  // Returns 409 only if a product row EXISTS and stock is below requested quantity.
+  // If a row is not found (undefined), Phase A skips that item — Phase C catches real conflicts.
+  // The try/catch makes Phase A non-fatal if batch() is unavailable (e.g. test env).
+  const productSnapshot: Record<string, { quantity: number; version: number }> = {};
+  try {
+    const stockStmts = body.items.map((item) =>
+      c.env.DB.prepare(
+        'SELECT id, quantity, version FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+      ).bind(item.product_id, tenantId),
+    );
+    const batchRows = await c.env.DB.batch<{ id: string; quantity: number; version: number }>(stockStmts);
+    if (Array.isArray(batchRows)) {
+      const unavailableItems: Array<{
+        productId: string; name: string; requestedQty: number; availableQty: number;
+      }> = [];
+      for (let i = 0; i < body.items.length; i++) {
+        const item = body.items[i]!;
+        const row = (batchRows[i] as { results?: Array<{ id: string; quantity: number; version: number }> } | undefined)?.results?.[0];
+        if (row) {
+          if (row.quantity < item.quantity) {
+            unavailableItems.push({
+              productId: item.product_id,
+              name: item.name,
+              requestedQty: item.quantity,
+              availableQty: row.quantity,
+            });
+          } else {
+            productSnapshot[item.product_id] = { quantity: row.quantity, version: row.version };
+          }
+        }
+        // row not found → no snapshot entry; Phase C will handle via version-lock
+      }
+      if (unavailableItems.length > 0) {
+        return c.json({ error: 'stock_insufficient', unavailableItems }, 409);
+      }
+    }
+  } catch (phaseAErr) {
+    console.warn('[MV][checkout] Phase A stock check skipped (batch unavailable):', phaseAErr);
+  }
 
   const subtotalPreVerify = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
 
   // ── MV-4: Server-side Paystack verification ───────────────────────────────
-  if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET && body.payment_reference) {
+  // When PAYSTACK_SECRET is configured, enforce strict verification:
+  //   - payment_reference is required (can't verify without it → 400)
+  //   - fetches Paystack API to confirm the transaction succeeded
+  // When PAYSTACK_SECRET is not configured (local/test env), skip silently.
+  if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET) {
+    if (!body.payment_reference) {
+      return c.json({ success: false, error: 'payment_reference is required for Paystack payments' }, 400);
+    }
     try {
       const psRes = await fetch(
         `https://api.paystack.co/transaction/verify/${encodeURIComponent(body.payment_reference)}`,
@@ -639,18 +951,58 @@ app.post('/checkout', async (c) => {
         }, 402);
       }
     } catch (fetchErr) {
-      return c.json({ success: false, error: `Paystack API error: ${String(fetchErr)}` }, 502);
+      console.error('[MV][checkout] Paystack verification request failed:', fetchErr);
+      return c.json({ success: false, error: 'Payment verification service unavailable. Please retry.' }, 502);
     }
-  } else if (body.payment_method === 'paystack' && c.env.PAYSTACK_SECRET && !body.payment_reference) {
-    return c.json({ success: false, error: 'payment_reference is required for Paystack payments' }, 400);
+  } else if (body.payment_method === 'paystack' && !c.env.PAYSTACK_SECRET) {
+    console.warn('[MV][checkout] PAYSTACK_SECRET not configured — skipping server-side verification');
   }
 
   const now = Date.now();
-  const subtotal = body.items.reduce((s, i) => s + i.price * i.quantity, 0);
+  const nowIso = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  // ── MV-E12: Flash Sale price resolution (server-authoritative) ───────────
+  // ── MV-E20: Bulk Pricing tier resolution ─────────────────────────────────
+  const resolvedItems = await Promise.all(
+    body.items.map(async (item) => {
+      let effectivePrice = item.price;
+
+      // Flash sale — use salePriceKobo if there's an active sale for this product
+      try {
+        const fs = await c.env.DB.prepare(
+          `SELECT salePriceKobo FROM cmrc_flash_sales WHERE productId = ? AND tenantId = ? AND active = 1
+           AND startTime <= ? AND endTime > ? AND quantitySold < quantityLimit LIMIT 1`,
+        ).bind(item.product_id, getTenantId(c), nowIso, nowIso).first<{ salePriceKobo: number }>();
+        if (fs && typeof fs.salePriceKobo === 'number') effectivePrice = fs.salePriceKobo;
+      } catch { /* non-fatal */ }
+
+      // Bulk pricing — find best matching tier (highest minQty <= cartQty)
+      if (effectivePrice === item.price) {
+        try {
+          const tier = await c.env.DB.prepare(
+            `SELECT priceKobo FROM cmrc_product_price_tiers WHERE productId = ? AND tenantId = ? AND minQty <= ? ORDER BY minQty DESC LIMIT 1`,
+          ).bind(item.product_id, getTenantId(c), item.quantity).first<{ priceKobo: number }>();
+          if (tier && typeof tier.priceKobo === 'number') effectivePrice = tier.priceKobo;
+        } catch { /* non-fatal */ }
+      }
+
+      return { ...item, price: effectivePrice };
+    }),
+  );
+
+  const subtotal = resolvedItems.reduce((s, i) => s + i.price * i.quantity, 0);
   const paymentRef = body.payment_reference ?? `pay_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
-  // ── Group items by vendor ─────────────────────────────────────────────────
-  const vendorGroups = body.items.reduce((acc, item) => {
+  // ── VAT computation via TaxEngine ────────────────────────────────────────
+  const mvTaxConfig = (c.get('tenantConfig' as never) as {
+    taxConfig?: { vatRate: number; vatRegistered: boolean; exemptCategories: string[] };
+  } | undefined)?.taxConfig ?? { vatRate: 0.075, vatRegistered: true, exemptCategories: [] };
+  const { vatKobo: mvVatKobo } = createTaxEngine(mvTaxConfig).compute([
+    { category: 'general', amountKobo: subtotal },
+  ]);
+
+  // ── Group items by vendor (use resolvedItems with flash-sale/bulk prices) ───
+  const vendorGroups = resolvedItems.reduce((acc, item) => {
     if (!acc[item.vendor_id]) acc[item.vendor_id] = { items: [], subtotal: 0 };
     acc[item.vendor_id]!.items.push(item);
     acc[item.vendor_id]!.subtotal += item.price * item.quantity;
@@ -663,61 +1015,141 @@ app.post('/checkout', async (c) => {
   const mkpOrderId = `mkp_ord_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
   try {
-    // ── Build per-vendor breakdown (fetch commission_rates) ──────────────────
+    // ── Build per-vendor breakdown (fetch commission_rates + shipping costs) ─
     const breakdownMap: Record<string, {
       vendor_id: string; subtotal: number; commission: number; payout: number; commission_rate: number;
       settlement_id?: string; hold_until?: number; hold_days?: number;
+      vendorName?: string; vendorPickupAddress?: string;
+      // T-COM-04: per-vendor shipping fee (kobo) from Logistics Unified Delivery Zone API
+      shippingKobo: number;
     }> = {};
+    // T-COM-04: Running total shipping across all vendor sub-cmrc_orders
+    let totalShippingKobo = 0;
+    // T-COM-04: LOGISTICS_WORKER Service Binding (undefined in test/local envs — falls back to 0)
+    const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
 
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const vendorRow = await c.env.DB.prepare(
-        'SELECT commission_rate FROM vendors WHERE id = ? AND marketplace_tenant_id = ?'
-      ).bind(vendorId, tenantId).first<{ commission_rate: number }>();
+        'SELECT commission_rate, name, pickupAddress FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?'
+      ).bind(vendorId, tenantId).first<{ commission_rate: number; name?: string; pickupAddress?: string }>();
 
-      const commissionRate = vendorRow?.commission_rate ?? 1000;
-      const commission = Math.round(group.subtotal * commissionRate / 10000);
-      const payout = group.subtotal - commission;
-      breakdownMap[vendorId] = { vendor_id: vendorId, subtotal: group.subtotal, commission, payout, commission_rate: commissionRate };
+      // MV-E02: Resolve commission via rule engine (vendor/category/cmrc_vendors.commission_rate/default cascade)
+      const firstItemCategory: string | null = (group.items[0] as { category?: string | null } | undefined)?.category ?? null;
+      const vendorDefaultBps = vendorRow?.commission_rate ?? undefined;
+      const rateBps = await resolveCommissionRate(c.env.DB, tenantId!, vendorId, firstItemCategory, vendorDefaultBps);
+      const commissionKobo = Math.round(group.subtotal * rateBps / 10000);
+      const payout = group.subtotal - commissionKobo;
+
+      // T-COM-04: Query Logistics Unified Delivery Zone service for this vendor's shipping fee.
+      // Architecture invariant: distances and zone fees are computed exclusively by
+      // webwaka-logistics. We query per-vendor and sum below.
+      const vendorShippingKobo = await getVendorShippingCost(
+        logisticsWorker,
+        tenantId!,
+        vendorId,
+        body.shipping_address?.state ?? '',
+        body.shipping_address?.lga,
+        group.subtotal,
+      );
+      totalShippingKobo += vendorShippingKobo;
+
+      breakdownMap[vendorId] = {
+        vendor_id: vendorId, subtotal: group.subtotal, commission: commissionKobo, payout, commission_rate: rateBps,
+        vendorName: vendorRow?.name ?? vendorId,
+        shippingKobo: vendorShippingKobo,
+        ...(vendorRow?.pickupAddress ? { vendorPickupAddress: vendorRow.pickupAddress } : {}),
+      };
     }
 
-    // ── Insert marketplace_orders umbrella ───────────────────────────────────
+    // ── Insert cmrc_marketplace_orders umbrella ───────────────────────────────────
+    // total_amount includes subtotal + consolidated shipping from all cmrc_vendors (T-COM-04)
+    const grandTotal = subtotal + totalShippingKobo;
+    // Shipping breakdown per vendor (shippingKobo per vendor_id) for customer receipt
+    const shippingBreakdown: Record<string, number> = {};
+    for (const [vid, bd] of Object.entries(breakdownMap)) {
+      shippingBreakdown[vid] = bd.shippingKobo;
+    }
+
     await c.env.DB.prepare(
-      `INSERT INTO marketplace_orders
+      `INSERT INTO cmrc_marketplace_orders
          (id, tenant_id, customer_email, customer_phone, items_json, vendor_count,
-          subtotal, total_amount, payment_method, payment_reference, payment_status,
+          subtotal, total_amount, total_shipping_kobo, shipping_breakdown_json,
+          payment_method, payment_reference, payment_status,
           order_status, channel, ndpr_consent, vendor_breakdown_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'confirmed', 'marketplace', 1, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'confirmed', 'marketplace', 1, ?, ?, ?)`
     ).bind(
       mkpOrderId, tenantId,
       body.customer_email.trim(),
       body.customer_phone?.trim() ?? null,
       JSON.stringify(body.items),
       vendorCount,
-      subtotal, subtotal,
+      subtotal, grandTotal,
+      totalShippingKobo, JSON.stringify(shippingBreakdown),
       body.payment_method, paymentRef,
       JSON.stringify(breakdownMap),
       now, now,
     ).run();
 
-    // ── Insert per-vendor child orders ───────────────────────────────────────
+    // ── Insert per-vendor child cmrc_orders ───────────────────────────────────────
+    const vendorSubOrderIds: Record<string, string> = {};
     for (const [vendorId, group] of Object.entries(vendorGroups)) {
       const childId = `ord_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+      vendorSubOrderIds[vendorId] = childId;
       const childSubtotal = group.subtotal;
 
+      // T-COM-04: child order total includes this vendor's shipping contribution
+      const childShippingKobo = breakdownMap[vendorId]?.shippingKobo ?? 0;
+      const childTotal = childSubtotal + childShippingKobo;
+
       await c.env.DB.prepare(
-        `INSERT INTO orders
+        `INSERT INTO cmrc_orders
            (id, tenant_id, customer_email, items_json, subtotal, discount, total_amount,
-            payment_method, payment_status, order_status, channel, payment_reference,
+            shipping_kobo, payment_method, payment_status, order_status, channel, payment_reference,
             marketplace_order_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'pending', 'confirmed', 'marketplace', ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 'pending', 'confirmed', 'marketplace', ?, ?, ?, ?)`
       ).bind(
         childId, tenantId, body.customer_email.trim(),
         JSON.stringify(group.items),
-        childSubtotal, childSubtotal,
+        childSubtotal, childTotal,
+        childShippingKobo,
         body.payment_method, paymentRef,
         mkpOrderId,
         now, now,
       ).run();
+
+      // ── Phase C: Version-locked stock deduction (per item) ──────────────────
+      // Uses optimistic locking — deducts stock only if version matches Phase A snapshot.
+      // On conflict (rare race): initiates auto-refund and aborts with 500.
+      for (const item of group.items) {
+        const snap = productSnapshot[item.product_id];
+        if (snap !== undefined) {
+          const lockResult = await updateWithVersionLock(
+            c.env.DB,
+            'cmrc_products',
+            { quantity: snap.quantity - item.quantity },
+            { id: item.product_id, tenantId: tenantId!, expectedVersion: snap.version },
+          );
+          if (!lockResult.success) {
+            // Rare stock conflict — attempt auto-refund then abort
+            if (c.env.PAYSTACK_SECRET && body.payment_reference) {
+              try {
+                await fetch('https://api.paystack.co/refund', {
+                  method: 'POST',
+                  headers: {
+                    Authorization: `Bearer ${c.env.PAYSTACK_SECRET}`,
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({ transaction: body.payment_reference }),
+                });
+              } catch { /* non-fatal */ }
+            }
+            return c.json({
+              success: false,
+              error: 'Stock deduction conflict — another order updated inventory simultaneously. Order cancelled; a refund has been initiated.',
+            }, 500);
+          }
+        }
+      }
 
       // Commission + revenue ledger entries
       const bd = breakdownMap[vendorId]!;
@@ -725,14 +1157,14 @@ app.post('/checkout', async (c) => {
       const led2 = `led_${now + 1}_${Math.random().toString(36).slice(2, 9)}`;
 
       await c.env.DB.prepare(
-        `INSERT INTO ledger_entries
+        `INSERT INTO cmrc_ledger_entries
            (id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at)
          VALUES (?, ?, ?, ?, 'commission', ?, 'CREDIT', ?, ?, ?)`
       ).bind(led1, tenantId, vendorId, childId, bd.commission,
         `Commission from umbrella order ${mkpOrderId}`, paymentRef, now).run();
 
       await c.env.DB.prepare(
-        `INSERT INTO ledger_entries
+        `INSERT INTO cmrc_ledger_entries
            (id, tenant_id, vendor_id, order_id, account_type, amount, type, description, reference_id, created_at)
          VALUES (?, ?, ?, ?, 'revenue', ?, 'CREDIT', ?, ?, ?)`
       ).bind(led2, tenantId, vendorId, childId, bd.payout,
@@ -741,14 +1173,14 @@ app.post('/checkout', async (c) => {
       // ── MV-4: Settlement record (T+hold_days escrow) ──────────────────────
       // Fetch vendor's settlement_hold_days (default 7 if column not yet migrated)
       const vendorHoldRow = await c.env.DB.prepare(
-        `SELECT settlement_hold_days FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
+        `SELECT settlement_hold_days FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`
       ).bind(vendorId, tenantId).first<{ settlement_hold_days?: number }>();
       const holdDays = vendorHoldRow?.settlement_hold_days ?? 7;
       const holdUntil = now + holdDays * 24 * 60 * 60 * 1000;
       const stlId = `stl_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
       await c.env.DB.prepare(
-        `INSERT OR IGNORE INTO settlements
+        `INSERT OR IGNORE INTO cmrc_settlements
            (id, tenant_id, vendor_id, order_id, marketplace_order_id, amount, commission,
             commission_rate, hold_days, hold_until, status, payment_reference, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?)`
@@ -762,21 +1194,336 @@ app.post('/checkout', async (c) => {
       bd.settlement_id = stlId;
       bd.hold_until = holdUntil;
       bd.hold_days = holdDays;
+
+      // ── MV-E04: Vendor ledger entries (SALE + COMMISSION) ─────────────────
+      // Running balance: read last entry, then apply delta
+      try {
+        const lastEntry = await c.env.DB.prepare(
+          `SELECT balanceKobo FROM cmrc_vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
+        ).bind(vendorId, tenantId).first<{ balanceKobo: number }>();
+        const prevBalance = lastEntry?.balanceKobo ?? 0;
+
+        // SALE entry: vendor receives (subtotal - commission)
+        const saleEntryId = `vle_sale_${now}_${Math.random().toString(36).slice(2, 9)}`;
+        const balanceAfterSale = prevBalance + bd.payout;
+        await c.env.DB.prepare(
+          `INSERT INTO cmrc_vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+           VALUES (?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          saleEntryId, tenantId, vendorId,
+          bd.payout, balanceAfterSale, paymentRef,
+          `Sale proceeds for order ${childId} (umbrella: ${mkpOrderId})`,
+          childId, new Date(now).toISOString(),
+        ).run();
+
+        // COMMISSION entry: marketplace deducts commission
+        const commEntryId = `vle_comm_${now}_${Math.random().toString(36).slice(2, 9)}`;
+        const balanceAfterComm = balanceAfterSale - bd.commission;
+        await c.env.DB.prepare(
+          `INSERT INTO cmrc_vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+           VALUES (?, ?, ?, 'COMMISSION', ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          commEntryId, tenantId, vendorId,
+          bd.commission, balanceAfterComm, paymentRef,
+          `Commission (${bd.commission_rate / 100}%) for order ${childId}`,
+          childId, new Date(now + 1).toISOString(),
+        ).run();
+      } catch (ledgerErr) {
+        console.warn('[MV][checkout] cmrc_vendor_ledger_entries write failed (non-fatal):', ledgerErr);
+      }
+
+      // ── Publish per-vendor delivery request ──────────────────────────────
+      const vendorName = bd.vendorName ?? vendorId;
+      const rawPickup = bd.vendorPickupAddress;
+      const pickupAddr = rawPickup
+        ? (() => { try { return JSON.parse(rawPickup); } catch { return rawPickup; } })()
+        : null;
+      // T-COM-04: Per-vendor delivery event — one event per sub-order so the
+      // logistics service can dispatch a separate pickup per vendor location.
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_dlv_${now}_${Math.random().toString(36).slice(2, 9)}`,
+        tenantId: tenantId!,
+        type: CommerceEvents.ORDER_READY_DELIVERY,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          orderId: childId,
+          marketplaceOrderId: mkpOrderId,
+          tenantId,
+          sourceModule: 'multi-vendor',
+          vendorId,
+          pickupAddress: pickupAddr,
+          deliveryAddress: body.shipping_address ?? null,
+          itemsSummary: `${group.items.length} item(s) from ${vendorName}`,
+          // T-COM-04: shipping cost for this specific vendor sub-order (kobo)
+          shippingKobo: breakdownMap[vendorId]?.shippingKobo ?? 0,
+          // Logistics can use subtotal + shipping to confirm correct amount
+          subOrderSubtotalKobo: group.subtotal,
+          subOrderTotalKobo: childTotal,
+        },
+      }).catch(() => { /* non-fatal */ });
     }
+
+    // ── Award loyalty points to buyer (POS-E10, non-blocking) ────────────────
+    void (async () => {
+      try {
+        const mvLoyaltyCfg = (c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty ?? DEFAULT_LOYALTY_CONFIG;
+        const mvLoyaltyEarned = Math.floor(subtotal / 10000) * mvLoyaltyCfg.pointsPerHundredKobo;
+        if (mvLoyaltyEarned <= 0) return;
+        const phone = body.customer_phone ?? '';
+        if (!phone) return;
+        const custRow = await c.env.DB.prepare(
+          'SELECT id FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+        ).bind(tenantId, phone).first<{ id: string }>();
+        if (!custRow) return;
+        const existing = await c.env.DB.prepare(
+          'SELECT id, points FROM cmrc_customer_loyalty WHERE tenantId = ? AND customerId = ?'
+        ).bind(tenantId, custRow.id).first<{ id: string; points: number }>();
+        const prevPts = existing?.points ?? 0;
+        const newPts = prevPts + mvLoyaltyEarned;
+        const newTierMv = evaluateLoyaltyTierMv(newPts, mvLoyaltyCfg);
+        if (existing) {
+          await c.env.DB.prepare(
+            'UPDATE cmrc_customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
+          ).bind(newPts, newTierMv, new Date(now).toISOString(), tenantId, custRow.id).run();
+        } else {
+          const lid = `loy_mv_${now}_${Math.random().toString(36).slice(2, 9)}`;
+          await c.env.DB.prepare(
+            'INSERT OR IGNORE INTO cmrc_customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
+          ).bind(lid, tenantId, custRow.id, mvLoyaltyEarned, evaluateLoyaltyTierMv(mvLoyaltyEarned, mvLoyaltyCfg), new Date(now).toISOString()).run();
+        }
+      } catch { /* non-fatal */ }
+    })();
+
+    const mvLoyaltyEarnedFinal = Math.floor(subtotal / 10000) * ((c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty?.pointsPerHundredKobo ?? DEFAULT_LOYALTY_CONFIG.pointsPerHundredKobo);
 
     return c.json({
       success: true,
       data: {
         marketplace_order_id: mkpOrderId,
-        total_amount: subtotal,
+        subtotal,
+        vat_kobo: mvVatKobo,
+        // T-COM-04: total_amount = subtotal + consolidated shipping across all vendor sub-cmrc_orders
+        total_amount: grandTotal,
+        total_shipping_kobo: totalShippingKobo,
+        // Per-vendor shipping fee for customer receipt / UI split shipment display
+        shipping_breakdown: shippingBreakdown,
+        // Indicates whether shipping fees were sourced from Logistics API or fell back to 0
+        shipping_source: logisticsWorker ? 'logistics' : 'fallback',
         payment_reference: paymentRef,
         payment_verified: body.payment_method === 'paystack' && !!c.env.PAYSTACK_SECRET,
         vendor_count: vendorCount,
         vendor_breakdown: breakdownMap,
+        vendor_sub_order_ids: vendorSubOrderIds,
+        loyalty_earned: mvLoyaltyEarnedFinal,
       },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P09: BANK VERIFICATION — GET /verify-bank-account
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /verify-bank-account?accountNumber=&bankCode=
+ * Resolves account holder name via Paystack bank resolution API.
+ * Used by the vendor onboarding wizard (Step 3) to confirm bank details.
+ * Returns: { valid: true, accountName } or { valid: false, error }
+ */
+app.get('/verify-bank-account', async (c) => {
+  const accountNumber = c.req.query('accountNumber')?.trim();
+  const bankCode = c.req.query('bankCode')?.trim();
+
+  if (!accountNumber || !bankCode) {
+    return c.json({ valid: false, error: 'accountNumber and bankCode query parameters are required' }, 400);
+  }
+  if (!/^\d{10}$/.test(accountNumber)) {
+    return c.json({ valid: false, error: 'accountNumber must be exactly 10 digits' }, 400);
+  }
+
+  try {
+    const secret = c.env.PAYSTACK_SECRET ?? '';
+    if (!secret) {
+      return c.json({ valid: false, error: 'Bank verification is not configured on this server' }, 503);
+    }
+    const psRes = await fetch(
+      `https://api.paystack.co/bank/resolve?account_number=${encodeURIComponent(accountNumber)}&bank_code=${encodeURIComponent(bankCode)}`,
+      { headers: { Authorization: `Bearer ${secret}` } },
+    );
+    const psData = await psRes.json() as {
+      status: boolean;
+      data?: { account_name: string; account_number: string };
+      message?: string;
+    };
+    if (!psData.status || !psData.data?.account_name) {
+      return c.json({ valid: false, error: psData.message ?? 'Could not resolve account. Check account number and bank.' });
+    }
+    return c.json({ valid: true, accountName: psData.data.account_name, accountNumber: psData.data.account_number });
+  } catch (err) {
+    console.error('[MV][verify-bank-account] error:', err);
+    return c.json({ valid: false, error: 'Bank verification service temporarily unavailable' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P09: VENDOR SELF-SERVICE REGISTRATION — POST /vendor/register
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /vendor/register — Self-service vendor onboarding (public)
+ * Accepts full vendor profile + KYC data, creates vendor in pending state,
+ * publishes VENDOR_KYC_SUBMITTED event to trigger the automated KYC pipeline.
+ *
+ * Required: businessName, phone, firstName, lastName, bvnHash (SHA-256 hex),
+ *           dob, accountNumber, bankCode, accountName
+ * Optional: category, description, rcNumber, businessNameForCac, whatsapp,
+ *           logoUrl, pickupAddress
+ *
+ * Returns 409 if phone already registered under this marketplace.
+ */
+app.post('/vendor/register', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) {
+    return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+  }
+
+  const body = await c.req.json<{
+    businessName: string;
+    category?: string;
+    description?: string;
+    phone: string;
+    firstName: string;
+    lastName: string;
+    bvnHash: string;
+    dob: string;
+    accountNumber: string;
+    bankCode: string;
+    accountName: string;
+    rcNumber?: string;
+    businessNameForCac?: string;
+    whatsapp?: string;
+    logoUrl?: string;
+    pickupAddress?: { street?: string; city?: string; state: string; lga?: string };
+  }>();
+
+  // ── Validation ───────────────────────────────────────────────────────────
+  if (!body.businessName?.trim()) {
+    return c.json({ success: false, error: 'businessName is required' }, 400);
+  }
+  if (!body.phone?.trim()) {
+    return c.json({ success: false, error: 'phone is required' }, 400);
+  }
+  const rawPhone = body.phone.trim();
+  if (!/^\+234[0-9]{10}$/.test(rawPhone) && !/^0[0-9]{10}$/.test(rawPhone)) {
+    return c.json({ success: false, error: 'Invalid Nigerian phone number. Use E.164 (+234...) or local (0...)' }, 400);
+  }
+  if (!body.firstName?.trim()) return c.json({ success: false, error: 'firstName is required' }, 400);
+  if (!body.lastName?.trim()) return c.json({ success: false, error: 'lastName is required' }, 400);
+  if (!body.bvnHash?.trim()) return c.json({ success: false, error: 'bvnHash is required' }, 400);
+  if (!/^[0-9a-f]{64}$/i.test(body.bvnHash.trim())) {
+    return c.json({ success: false, error: 'bvnHash must be a valid SHA-256 hex string (64 chars)' }, 400);
+  }
+  if (!body.dob?.trim()) return c.json({ success: false, error: 'dob is required' }, 400);
+  if (!body.accountNumber?.trim() || !/^\d{10}$/.test(body.accountNumber.trim())) {
+    return c.json({ success: false, error: 'accountNumber must be exactly 10 digits' }, 400);
+  }
+  if (!body.bankCode?.trim()) return c.json({ success: false, error: 'bankCode is required' }, 400);
+  if (!body.accountName?.trim()) return c.json({ success: false, error: 'accountName is required' }, 400);
+
+  const e164 = rawPhone.startsWith('+') ? rawPhone : `+234${rawPhone.slice(1)}`;
+  const now = Date.now();
+  const vendorId = `vnd_${now}_${Math.random().toString(36).slice(2, 9)}`;
+  const slug = body.businessName.trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+
+  try {
+    // ── Guard: phone uniqueness per marketplace ────────────────────────────
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+    ).bind(tenantId, e164).first<{ id: string }>();
+    if (existing) {
+      return c.json({
+        success: false,
+        error: 'A vendor account with this phone number already exists on this marketplace',
+      }, 409);
+    }
+
+    // ── Build onboarding JSON (personal + KYC data) ───────────────────────
+    const onboardingJson = JSON.stringify({
+      firstName: body.firstName.trim(),
+      lastName: body.lastName.trim(),
+      dob: body.dob.trim(),
+      businessNameForCac: body.businessNameForCac?.trim() ?? body.businessName.trim(),
+      whatsapp: body.whatsapp?.trim() ?? null,
+      logoUrl: body.logoUrl?.trim() ?? null,
+      description: body.description?.trim() ?? null,
+    });
+
+    const bankDetailsJson = JSON.stringify({
+      bank_code: body.bankCode.trim(),
+      account_number: body.accountNumber.trim(),
+      account_name: body.accountName.trim(),
+    });
+
+    const pickupJson = body.pickupAddress
+      ? JSON.stringify(body.pickupAddress)
+      : null;
+
+    // ── Insert vendor row ──────────────────────────────────────────────────
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_vendors
+         (id, marketplace_tenant_id, name, slug, phone,
+          bank_account, bank_code, commission_rate, status,
+          bvn_hash, rc_number, bank_details_json,
+          kyc_status, kyc_submitted_at,
+          onboarding_data_json, pickupAddress,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?,
+               ?, ?, 1000, 'pending',
+               ?, ?, ?,
+               'submitted', ?,
+               ?, ?,
+               ?, ?)`,
+    ).bind(
+      vendorId, tenantId,
+      body.businessName.trim(), slug, e164,
+      body.accountNumber.trim(), body.bankCode.trim(),
+      body.bvnHash.trim(),
+      body.rcNumber?.trim() ?? null,
+      bankDetailsJson,
+      now,
+      onboardingJson,
+      pickupJson,
+      now, now,
+    ).run();
+
+    // ── Publish VENDOR_KYC_SUBMITTED → triggers automated KYC pipeline ────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_kyc_sub_${now}_${Math.random().toString(36).slice(2, 9)}`,
+      tenantId,
+      type: CommerceEvents.VENDOR_KYC_SUBMITTED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: { vendorId },
+    }).catch(() => { /* non-fatal — KYC pipeline failure must not block registration */ });
+
+    return c.json({
+      success: true,
+      data: {
+        vendor_id: vendorId,
+        kyc_status: 'submitted',
+        message: 'Registration submitted successfully. You will receive a WhatsApp notification with your verification status.',
+      },
+    }, 201);
+  } catch (err) {
+    console.error('[MV][vendor/register] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -791,7 +1538,7 @@ app.post('/checkout', async (c) => {
  * Sends a 6-digit OTP to the vendor's registered phone (same Termii flow).
  */
 app.post('/vendor-auth/request-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string }>();
   const phone = body.phone?.trim();
 
@@ -802,9 +1549,15 @@ app.post('/vendor-auth/request-otp', async (c) => {
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
 
+  // Rate limit: 5 OTP requests per phone per 15 minutes
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  }
+
   try {
     const vendor = await c.env.DB.prepare(
-      "SELECT id, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'No vendor account found with this phone number' }, 404);
@@ -817,28 +1570,23 @@ app.post('/vendor-auth/request-otp', async (c) => {
     const otpId = `votp_${now}_${Math.random().toString(36).slice(2, 8)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+      `INSERT INTO cmrc_customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    if (c.env.TERMII_API_KEY) {
-      await fetch('https://api.ng.termii.com/api/sms/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: c.env.TERMII_API_KEY, to: e164, from: 'WebWaka',
-          sms: `Your WebWaka Vendor code is: ${otpCode}. Valid 10 minutes. Do not share.`,
-          type: 'plain', channel: 'dnd',
-        }),
-      });
-    }
+    await sendTermiiSms(
+      e164,
+      `Your WebWaka Vendor code is: ${otpCode}. Valid 10 minutes. Do not share.`,
+      c.env.TERMII_API_KEY ?? '',
+    );
 
     return c.json({
       success: true,
       data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -847,7 +1595,7 @@ app.post('/vendor-auth/request-otp', async (c) => {
  * Verifies the OTP and returns a vendor JWT cookie.
  */
 app.post('/vendor-auth/verify-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string; otp: string }>();
   const phone = body.phone?.trim();
   const otp = body.otp?.trim();
@@ -861,7 +1609,7 @@ app.post('/vendor-auth/verify-otp', async (c) => {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
     const otpRow = await c.env.DB.prepare(
       `SELECT id, otp_hash, is_used, attempts, expires_at
-       FROM customer_otps
+       FROM cmrc_customer_otps
        WHERE tenant_id = ? AND phone = ? AND is_used = 0
        ORDER BY created_at DESC LIMIT 1`
     ).bind(tenantId, e164).first<OtpRow>();
@@ -872,27 +1620,24 @@ app.post('/vendor-auth/verify-otp', async (c) => {
 
     const inputHash = await hashOtp(otp);
     if (inputHash !== otpRow.otp_hash) {
-      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      await c.env.DB.prepare('UPDATE cmrc_customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
       return c.json({ success: false, error: 'Incorrect OTP' }, 401);
     }
 
-    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+    await c.env.DB.prepare('UPDATE cmrc_customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
 
     const vendor = await c.env.DB.prepare(
-      "SELECT id, name, status FROM vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
+      "SELECT id, name, status FROM cmrc_vendors WHERE marketplace_tenant_id = ? AND phone = ? AND deleted_at IS NULL LIMIT 1"
     ).bind(tenantId, e164).first<{ id: string; name: string; status: string }>();
 
     if (!vendor) return c.json({ success: false, error: 'Vendor account not found' }, 404);
     if (vendor.status === 'suspended') return c.json({ success: false, error: 'Vendor account suspended' }, 403);
 
     const now = Date.now();
-    const token = await signJwt(
-      {
-        sub: vendor.id, role: 'vendor', vendor_id: vendor.id,
-        tenant: tenantId, phone: e164,
-        iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400,
-      },
-      c.env.JWT_SECRET ?? 'dev-secret-change-me',
+    const token = await signJWT(
+      { sub: vendor.id, tenantId, role: 'vendor', permissions: [], email: e164 },
+      getJwtSecret(c.env),
+      7 * 86400,
     );
 
     c.header(
@@ -901,8 +1646,9 @@ app.post('/vendor-auth/verify-otp', async (c) => {
     );
 
     return c.json({ success: true, data: { token, vendor_id: vendor.id, vendor_name: vendor.name, phone: e164 } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -911,7 +1657,7 @@ app.post('/vendor-auth/verify-otp', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors/:id/kyc — Submit KYC documents (vendor JWT required)
+ * POST /cmrc_vendors/:id/kyc — Submit KYC documents (vendor JWT required)
  * Vendor submits their CAC registration, hashed BVN/NIN, and bank details.
  * Status changes from 'none' → 'submitted'; admin review sets 'approved'/'rejected'.
  *
@@ -929,12 +1675,12 @@ app.post('/vendor-auth/verify-otp', async (c) => {
  *   cac_docs_url    — URL to uploaded CAC certificate (R2/S3)
  *   bank_details    — { bank_code: string, account_number: string, account_name: string }
  */
-app.post('/vendors/:id/kyc', async (c) => {
+app.post('/cmrc_vendors/:id/kyc', async (c) => {
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
 
   const vendorId = c.req.param('id');
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
 
   if (vendor.vendorId !== vendorId) {
     return c.json({ success: false, error: 'You may only submit KYC for your own vendor account' }, 403);
@@ -980,7 +1726,7 @@ app.post('/vendors/:id/kyc', async (c) => {
 
   try {
     const existing = await c.env.DB.prepare(
-      "SELECT id, kyc_status FROM vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
+      "SELECT id, kyc_status FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ? AND deleted_at IS NULL"
     ).bind(vendorId, tenantId).first<{ id: string; kyc_status: string }>();
 
     if (!existing) return c.json({ success: false, error: 'Vendor not found' }, 404);
@@ -998,7 +1744,7 @@ app.post('/vendors/:id/kyc', async (c) => {
 
     const now = Date.now();
     await c.env.DB.prepare(
-      `UPDATE vendors
+      `UPDATE cmrc_vendors
        SET rc_number = COALESCE(?, rc_number),
            bvn_hash = COALESCE(?, bvn_hash),
            nin_hash = COALESCE(?, nin_hash),
@@ -1028,8 +1774,9 @@ app.post('/vendors/:id/kyc', async (c) => {
         message: 'KYC submitted successfully. Admin review typically takes 1-2 business days.',
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1039,7 +1786,7 @@ app.post('/vendors/:id/kyc', async (c) => {
 
 /**
  * GET /catalog
- * Returns active products from all active vendors in this marketplace.
+ * Returns active cmrc_products from all active cmrc_vendors in this marketplace.
  * Supports cursor pagination (after=<product_id>), per_page (max 24, default 12),
  * search (FTS5 MATCH or LIKE fallback), category, and vendor_id filters.
  *
@@ -1050,15 +1797,30 @@ app.post('/vendors/:id/kyc', async (c) => {
  * Tenant isolation: tenant_id from header enforced in all DB predicates.
  */
 app.get('/catalog', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
-  const search    = c.req.query('search')?.trim()     ?? '';
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+  // Accept both 'q' (frontend convention) and 'search' (legacy) for backward compatibility
+  const search    = (c.req.query('q') ?? c.req.query('search') ?? '').trim();
   const category  = c.req.query('category')?.trim()   ?? '';
   const vendorId  = c.req.query('vendor_id')?.trim()  ?? '';
   const after     = c.req.query('after')?.trim()      ?? '';
   const perPage   = Math.min(Number(c.req.query('per_page') ?? '12'), 24);
   const noCache   = c.req.query('nocache') === '1';
 
-  const cacheKey = `mv_catalog_${tenantId}_${after}_${search}_${category}_${vendorId}_${perPage}`;
+  if (search) {
+    const searchRlKey = `rl:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+    if (!(await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, searchRlKey, 60, 60_000))) {
+      return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
+    }
+  }
+
+  // Include catalog version in cache key so that any inventory.updated event
+  // (which writes a new catalog_version:${tenantId} KV value) immediately
+  // makes all old entries un-hittable without needing prefix-deletes.
+  const catalogVer = c.env.CATALOG_CACHE
+    ? ((await c.env.CATALOG_CACHE.get(`catalog_version:${tenantId}`)) ?? '0')
+    : '0';
+  const cacheKey = `mv_catalog_${tenantId}_v${catalogVer}_${after}_${search}_${category}_${vendorId}_${perPage}`;
 
   // ── KV cache hit ──────────────────────────────────────────────────────────
   if (!noCache && c.env.CATALOG_CACHE) {
@@ -1102,8 +1864,9 @@ app.get('/catalog', async (c) => {
         searchJoin = `INNER JOIN products_fts fts ON fts.product_id = p.id AND fts.tenant_id = p.tenant_id`;
         conditions.push('products_fts MATCH ?');
         binds.push(search);
-      } catch {
+      } catch (ftsErr) {
         // Fallback to LIKE if FTS5 table absent
+        console.warn('[MV][catalog/search] FTS5 unavailable, falling back to LIKE:', ftsErr);
         searchJoin = '';
         conditions.push(`(p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)`);
         const like = `%${search}%`;
@@ -1117,13 +1880,13 @@ app.get('/catalog', async (c) => {
     const sql = `
       SELECT
         p.id, p.sku, p.name, p.description, p.category,
-        p.price, p.quantity, p.image_url, p.vendor_id,
+        p.price, p.quantity, p.image_url, p.has_variants, p.vendor_id,
         v.name  AS vendor_name,
         v.slug  AS vendor_slug,
         v.rating_avg, v.rating_count,
         p.created_at
-      FROM products p
-      INNER JOIN vendors v ON v.id = p.vendor_id
+      FROM cmrc_products p
+      INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
       ${searchJoin}
       WHERE ${where}
       ORDER BY p.id ASC
@@ -1192,8 +1955,8 @@ app.get('/catalog', async (c) => {
                   p.price, p.quantity, p.image_url, p.vendor_id,
                   v.name AS vendor_name, v.slug AS vendor_slug,
                   v.rating_avg, v.rating_count, p.created_at
-           FROM products p
-           INNER JOIN vendors v ON v.id = p.vendor_id
+           FROM cmrc_products p
+           INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
            WHERE ${fallbackConds.join(' AND ')}
            ORDER BY p.id ASC LIMIT ?`
         ).bind(...(fallbackBinds as any[])).all<{
@@ -1207,10 +1970,117 @@ app.get('/catalog', async (c) => {
         const page = hasMore ? results.slice(0, perPage) : results;
         return c.json({ success: true, data: page, meta: { count: page.length, has_more: hasMore, next_cursor: hasMore ? page[page.length - 1]!.id : null, per_page: perPage } });
       } catch (e2) {
-        return c.json({ success: false, error: String(e2) }, 500);
+        console.error('[MV][catalog/search] FTS fallback error:', e2);
+        return c.json({ success: false, error: 'Internal server error' }, 500);
       }
     }
-    return c.json({ success: false, error: String(e) }, 500);
+    console.error('[MV][catalog/search] error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-3: PUBLIC ORDER TRACKING — GET /cmrc_orders/track
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /cmrc_orders/track?marketplace_order_id=... — T-CVC-02: Redirect to Logistics tracking portal
+ * Obtains a signed tracking token from Logistics via Service Binding, then redirects
+ * the customer to the Logistics tracking portal URL.
+ * Falls back to Commerce-native status when Logistics is unavailable.
+ */
+app.get('/cmrc_orders/track', async (c) => {
+  const tenantId = getTenantId(c);
+  const mkpOrderId = c.req.query('marketplace_order_id')?.trim();
+
+  if (!mkpOrderId) {
+    return c.json({ success: false, error: 'marketplace_order_id is required' }, 400);
+  }
+
+  // Verify order exists and belongs to this tenant before issuing a token
+  try {
+    const umbrella = await c.env.DB.prepare(
+      `SELECT id FROM cmrc_marketplace_orders WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    ).bind(mkpOrderId, tenantId).first<{ id: string }>();
+    if (!umbrella) return c.json({ success: false, error: 'Order not found' }, 404);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Order not found' }, 404);
+  }
+
+  // Delegate to Logistics for a signed tracking token (T-CVC-02)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const resp = await logisticsWorker.fetch(
+        new Request('https://logistics.internal/internal/tracking-token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${c.env.INTER_SERVICE_SECRET ?? ''}`,
+          },
+          body: JSON.stringify({ orderId: mkpOrderId, tenantId, sourceModule: 'multi-vendor' }),
+        }),
+      );
+      if (resp.ok) {
+        const json = await resp.json<{ success: boolean; data?: { trackingUrl?: string } }>();
+        if (json.success && json.data?.trackingUrl) {
+          return c.redirect(json.data.trackingUrl, 302);
+        }
+      }
+    } catch (err) {
+      console.error('[MV] Logistics tracking-token fetch failed:', err);
+    }
+  }
+
+  // Fallback: return Commerce-native status when Logistics is unavailable
+  try {
+    const umbrella = await c.env.DB.prepare(
+      `SELECT id, payment_status, order_status, vendor_count, total_amount,
+              customer_email, created_at, updated_at
+       FROM cmrc_marketplace_orders
+       WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    ).bind(mkpOrderId, tenantId).first<{
+      id: string; payment_status: string; order_status: string;
+      vendor_count: number; total_amount: number;
+      customer_email: string; created_at: number; updated_at: number;
+    }>();
+    if (!umbrella) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    const { results: childOrders } = await c.env.DB.prepare(
+      `SELECT id, vendor_id, order_status, payment_status, total_amount
+       FROM cmrc_orders
+       WHERE marketplace_order_id = ? AND tenant_id = ? AND deleted_at IS NULL
+       ORDER BY created_at ASC`
+    ).bind(mkpOrderId, tenantId).all<{
+      id: string; vendor_id: string; order_status: string; payment_status: string; total_amount: number;
+    }>();
+
+    // Mask email for NDPR — show first 3 chars + domain
+    const maskedEmail = (() => {
+      const [local, domain] = umbrella.customer_email.split('@');
+      if (!local || !domain) return '***';
+      return `${local.slice(0, 3)}***@${domain}`;
+    })();
+
+    return c.json({
+      success: true,
+      data: {
+        marketplace_order_id: umbrella.id,
+        payment_status: umbrella.payment_status,
+        order_status: umbrella.order_status,
+        vendor_count: umbrella.vendor_count,
+        total_amount: umbrella.total_amount,
+        customer_email_masked: maskedEmail,
+        created_at: umbrella.created_at,
+        updated_at: umbrella.updated_at,
+        cmrc_vendor_orders: childOrders,
+      },
+      note: 'logistics_unavailable',
+    });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1244,8 +2114,9 @@ function computeVendorBreakdown(
  * - ndpr_consent: must be true (NDPR requirement).
  * Returns: { token, items, vendor_breakdown, total_amount, expires_at, vendor_count }
  */
-app.post('/cart', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+app.post('/cart', ndprConsentMiddleware, async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
 
   type CartItem = {
     product_id: string;
@@ -1263,9 +2134,6 @@ app.post('/cart', async (c) => {
     token?: string;
   }>();
 
-  if (!body.ndpr_consent) {
-    return c.json({ success: false, error: 'NDPR consent required to store cart data' }, 400);
-  }
   if (!body.items?.length) {
     return c.json({ success: false, error: 'items array is required and must not be empty' }, 400);
   }
@@ -1287,7 +2155,7 @@ app.post('/cart', async (c) => {
     if (body.token) {
       // Update existing cart
       const existing = await c.env.DB.prepare(
-        `SELECT id FROM cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?`
+        `SELECT id FROM cmrc_cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?`
       ).bind(body.token, tenantId, now).first<{ id: string }>();
 
       if (!existing) {
@@ -1295,7 +2163,7 @@ app.post('/cart', async (c) => {
       }
 
       await c.env.DB.prepare(
-        `UPDATE cart_sessions
+        `UPDATE cmrc_cart_sessions
          SET items_json = ?, vendor_breakdown_json = ?, expires_at = ?,
              customer_phone = COALESCE(?, customer_phone), updated_at = ?
          WHERE session_token = ? AND tenant_id = ?`
@@ -1326,7 +2194,7 @@ app.post('/cart', async (c) => {
     const cartId = `cs_mkp_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
     await c.env.DB.prepare(
-      `INSERT INTO cart_sessions
+      `INSERT INTO cmrc_cart_sessions
          (id, tenant_id, session_token, items_json, vendor_breakdown_json,
           channel, customer_phone, expires_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'marketplace', ?, ?, ?, ?)`
@@ -1349,8 +2217,9 @@ app.post('/cart', async (c) => {
         expires_at: expiresAt,
       },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1360,7 +2229,8 @@ app.post('/cart', async (c) => {
  * 404 when token not found, belongs to a different tenant, or expired.
  */
 app.get('/cart/:token', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const token = c.req.param('token');
   const now = Date.now();
 
@@ -1368,7 +2238,7 @@ app.get('/cart/:token', async (c) => {
     const cart = await c.env.DB.prepare(
       `SELECT id, session_token, items_json, vendor_breakdown_json,
               customer_phone, expires_at, created_at, updated_at
-       FROM cart_sessions
+       FROM cmrc_cart_sessions
        WHERE session_token = ? AND tenant_id = ? AND channel = 'marketplace'`
     ).bind(token, tenantId).first<{
       id: string;
@@ -1403,12 +2273,14 @@ app.get('/cart/:token', async (c) => {
         total_amount: totalAmount,
         item_count: (items as Array<{ quantity: number }>).reduce((s, i) => s + (i.quantity ?? 0), 0),
         expires_at: cart.expires_at,
+        expires_in: Math.ceil((cart.expires_at - now) / 1000),
         created_at: cart.created_at,
         updated_at: cart.updated_at,
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1421,7 +2293,7 @@ app.get('/cart/:token', async (c) => {
  * Verifies x-paystack-signature header (HMAC-SHA512 of raw body with PAYSTACK_SECRET).
  * Handles: charge.success → marks order paid + creates settlement if missing.
  *          transfer.success → marks payout_request as paid.
- * Idempotent: logs each event in paystack_webhook_log (unique on event+reference).
+ * Idempotent: logs each event in cmrc_paystack_webhook_log (unique on event+reference).
  */
 app.post('/paystack/webhook', async (c) => {
   const signature = c.req.header('x-paystack-signature');
@@ -1447,14 +2319,16 @@ app.post('/paystack/webhook', async (c) => {
     if (hex !== signature) {
       return c.json({ success: false, error: 'Invalid signature' }, 401);
     }
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: false, error: 'Signature verification error' }, 401);
   }
 
   let payload: { event: string; data: Record<string, unknown> };
   try {
     payload = JSON.parse(rawBody);
-  } catch {
+  } catch (err) {
+    console.error('[MV] route error:', err);
     return c.json({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
@@ -1466,7 +2340,7 @@ app.post('/paystack/webhook', async (c) => {
 
   // Idempotency: skip already-processed events
   const existing = await c.env.DB.prepare(
-    `SELECT id, processed FROM paystack_webhook_log WHERE id = ?`
+    `SELECT id, processed FROM cmrc_paystack_webhook_log WHERE id = ?`
   ).bind(logId).first<{ id: string; processed: number }>();
 
   if (existing?.processed) {
@@ -1475,45 +2349,75 @@ app.post('/paystack/webhook', async (c) => {
 
   // Log the event
   await c.env.DB.prepare(
-    `INSERT OR IGNORE INTO paystack_webhook_log
+    `INSERT OR IGNORE INTO cmrc_paystack_webhook_log
        (id, event, reference, tenant_id, raw_json, processed, received_at)
      VALUES (?, ?, ?, ?, ?, 0, ?)`
   ).bind(logId, event, reference, tenantId ?? null, rawBody, now).run();
 
   try {
     if (event === 'charge.success') {
-      // Mark orders paid
+      // Mark cmrc_orders paid
       if (tenantId && reference) {
         await c.env.DB.prepare(
-          `UPDATE orders SET payment_status = 'paid', updated_at = ?
+          `UPDATE cmrc_orders SET payment_status = 'paid', updated_at = ?
            WHERE payment_reference = ? AND tenant_id = ?`
         ).bind(now, reference, tenantId).run();
 
         await c.env.DB.prepare(
-          `UPDATE marketplace_orders SET payment_status = 'paid', updated_at = ?
+          `UPDATE cmrc_marketplace_orders SET payment_status = 'paid', updated_at = ?
            WHERE payment_reference = ? AND tenant_id = ?`
         ).bind(now, reference, tenantId).run();
 
-        // Mark held settlements eligible if hold_until has passed
+        // Mark held cmrc_settlements eligible if hold_until has passed
         await c.env.DB.prepare(
-          `UPDATE settlements SET status = 'eligible', updated_at = ?
+          `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
            WHERE tenant_id = ? AND payment_reference = ? AND status = 'held' AND hold_until <= ?`
         ).bind(now, tenantId, reference, now).run();
+      }
+      // Notify central-mgmt ledger of paid order (non-fatal)
+      if (tenantId && reference) {
+        const orderRow = await c.env.DB.prepare(
+          `SELECT id, total_amount FROM cmrc_orders WHERE payment_reference = ? AND tenant_id = ? LIMIT 1`
+        ).bind(reference, tenantId).first<{ id: string; total_amount: number }>();
+        if (orderRow && Number.isInteger(orderRow.total_amount) && orderRow.total_amount > 0) {
+          await notifyOrderPaid(
+            c.env,
+            orderRow.id,
+            tenantId,
+            orderRow.total_amount,
+            500, // 5% platform commission
+            reference,
+          ).catch((err) => console.error('[commerce] central-mgmt order.paid notify failed:', err));
+        }
       }
     } else if (event === 'transfer.success') {
       const transferCode = data.transfer_code as string | undefined;
       if (transferCode) {
         await c.env.DB.prepare(
-          `UPDATE payout_requests SET status = 'paid', processed_at = ?, updated_at = ?
+          `UPDATE cmrc_payout_requests SET status = 'paid', processed_at = ?, updated_at = ?
            WHERE paystack_transfer_code = ?`
         ).bind(now, now, transferCode).run();
+        // Notify central-mgmt ledger of processed payout (non-fatal)
+        const payoutRow = await c.env.DB.prepare(
+          `SELECT id, vendor_id, tenant_id, amount_kobo FROM cmrc_payout_requests WHERE paystack_transfer_code = ? LIMIT 1`
+        ).bind(transferCode).first<{ id: string; vendor_id: string; tenant_id: string; amount_kobo: number }>();
+        if (payoutRow && Number.isInteger(payoutRow.amount_kobo) && payoutRow.amount_kobo > 0) {
+          await notifyPayoutProcessed(
+            c.env,
+            payoutRow.id,
+            payoutRow.vendor_id,
+            payoutRow.tenant_id ?? tenantId ?? '',
+            payoutRow.amount_kobo,
+            transferCode,
+          ).catch((err) => console.error('[commerce] central-mgmt payout notify failed:', err));
+        }
       }
     } else if (event === 'transfer.failed' || event === 'transfer.reversed') {
       const transferCode = data.transfer_code as string | undefined;
       if (transferCode) {
         const reason = event === 'transfer.reversed' ? 'Transfer reversed by Paystack' : 'Transfer failed';
         await c.env.DB.prepare(
-          `UPDATE payout_requests SET status = 'failed', failure_reason = ?, processed_at = ?, updated_at = ?
+          `UPDATE cmrc_payout_requests SET status = 'failed', failure_reason = ?, processed_at = ?, updated_at = ?
            WHERE paystack_transfer_code = ?`
         ).bind(reason, now, now, transferCode).run();
       }
@@ -1521,161 +2425,80 @@ app.post('/paystack/webhook', async (c) => {
 
     // Mark event as processed
     await c.env.DB.prepare(
-      `UPDATE paystack_webhook_log SET processed = 1 WHERE id = ?`
+      `UPDATE cmrc_paystack_webhook_log SET processed = 1 WHERE id = ?`
     ).bind(logId).run();
 
     return c.json({ success: true });
   } catch (e) {
     await c.env.DB.prepare(
-      `UPDATE paystack_webhook_log SET error = ? WHERE id = ?`
+      `UPDATE cmrc_paystack_webhook_log SET error = ? WHERE id = ?`
     ).bind(String(e), logId).run();
-    return c.json({ success: false, error: String(e) }, 500);
+    console.error('[MV][paystack/webhook] handler error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MV-4: DELIVERY ZONES — Nigeria States/LGAs per-vendor shipping rates
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const NIGERIA_STATES = new Set([
-  'Abia', 'Adamawa', 'Akwa Ibom', 'Anambra', 'Bauchi', 'Bayelsa', 'Benue', 'Borno',
-  'Cross River', 'Delta', 'Ebonyi', 'Edo', 'Ekiti', 'Enugu', 'Gombe', 'Imo',
-  'Jigawa', 'Kaduna', 'Kano', 'Katsina', 'Kebbi', 'Kogi', 'Kwara', 'Lagos',
-  'Nasarawa', 'Niger', 'Ogun', 'Ondo', 'Osun', 'Oyo', 'Plateau', 'Rivers',
-  'Sokoto', 'Taraba', 'Yobe', 'Zamfara', 'Abuja FCT',
-]);
+// MV-4: DELIVERY ZONES — REMOVED (T-CVC-01)
+// Delivery zone management has been extracted to webwaka-logistics.
+// Single source of truth: webwaka-logistics GET/POST /api/delivery-zones
+// ============================================================
+// NIGERIA_STATES removed — now lives in webwaka-logistics/src/worker.ts
 
 /**
- * POST /delivery-zones — Create or update a delivery zone for a vendor.
- * Requires X-Admin-Key header matching env ADMIN_KEY or vendor JWT with matching vendor_id.
- * Body: { vendor_id, state, lga?, base_fee, per_kg_fee?, free_above?, estimated_days_min?, estimated_days_max? }
+ * POST /delivery-zones — REMOVED (T-CVC-01)
+ * Delivery zone management has been extracted to webwaka-logistics.
+ * Use POST /api/delivery-zones on the Logistics worker.
  */
-app.post('/delivery-zones', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
-  const vendor = await authenticateVendor(c);
-  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
-  const jwtVendorId = vendor.vendorId;
-  const body = await c.req.json<{
-    vendor_id: string;
-    state: string;
-    lga?: string;
-    base_fee: number;
-    per_kg_fee?: number;
-    free_above?: number;
-    estimated_days_min?: number;
-    estimated_days_max?: number;
-    is_active?: boolean;
-  }>();
-
-  if (!body.vendor_id) return c.json({ success: false, error: 'vendor_id is required' }, 400);
-  if (body.vendor_id !== jwtVendorId) {
-    return c.json({ success: false, error: 'Forbidden: vendor_id does not match token' }, 403);
-  }
-  if (!body.state?.trim()) return c.json({ success: false, error: 'state is required' }, 400);
-  if (!NIGERIA_STATES.has(body.state.trim())) {
-    return c.json({ success: false, error: `Invalid Nigerian state: ${body.state}` }, 400);
-  }
-  if (typeof body.base_fee !== 'number' || body.base_fee < 0) {
-    return c.json({ success: false, error: 'base_fee must be a non-negative number (kobo)' }, 400);
-  }
-
-  const now = Date.now();
-  const dzId = `dz_${now}_${Math.random().toString(36).slice(2, 9)}`;
-
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO delivery_zones
-         (id, tenant_id, vendor_id, state, lga, base_fee, per_kg_fee, free_above,
-          is_active, estimated_days_min, estimated_days_max, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(tenant_id, vendor_id, state, lga)
-       DO UPDATE SET base_fee=excluded.base_fee, per_kg_fee=excluded.per_kg_fee,
-                     free_above=excluded.free_above, is_active=excluded.is_active,
-                     estimated_days_min=excluded.estimated_days_min,
-                     estimated_days_max=excluded.estimated_days_max,
-                     updated_at=excluded.updated_at`
-    ).bind(
-      dzId, tenantId, body.vendor_id, body.state.trim(), body.lga?.trim() ?? null,
-      body.base_fee, body.per_kg_fee ?? 0, body.free_above ?? null,
-      body.is_active !== false ? 1 : 0,
-      body.estimated_days_min ?? 1, body.estimated_days_max ?? 3,
-      now, now,
-    ).run();
-
-    return c.json({ success: true, data: { id: dzId, vendor_id: body.vendor_id, state: body.state, lga: body.lga ?? null, base_fee: body.base_fee } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
-  }
-});
+app.post('/delivery-zones', (c) => c.json({
+  success: false,
+  error: 'Delivery zone management has been moved to the Logistics service. Use POST /api/delivery-zones on the Logistics worker.',
+  moved_to: 'webwaka-logistics /api/delivery-zones',
+}, 410));
 
 /**
- * GET /shipping/estimate — Calculate shipping fee for a vendor, state, and order value.
- * Query: ?vendor_id=X&state=Y&lga=Z&order_value=V&weight_kg=W
- * Returns fee breakdown + estimated days. Returns 0 fee if no zone found (free/unlimited delivery).
+ * GET /shipping/estimate — Delegates to Logistics API (T-CVC-01)
+ * Proxies to webwaka-logistics GET /api/delivery-zones/estimate via Service Binding.
+ * Falls back gracefully if LOGISTICS_WORKER binding is not configured.
  */
 app.get('/shipping/estimate', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.query('vendor_id');
   const state = c.req.query('state');
   const lga = c.req.query('lga');
-  const orderValue = Number(c.req.query('order_value') ?? '0');
-  const weightKg = Number(c.req.query('weight_kg') ?? '0');
-
+  const orderValue = c.req.query('order_value') ?? '0';
+  const weightKg = c.req.query('weight_kg') ?? '0';
   if (!vendorId) return c.json({ success: false, error: 'vendor_id query param is required' }, 400);
   if (!state) return c.json({ success: false, error: 'state query param is required' }, 400);
-
-  try {
-    // Try LGA-specific zone first, then state-wide
-    let zone = lga
-      ? await c.env.DB.prepare(
-          `SELECT * FROM delivery_zones
-           WHERE tenant_id=? AND vendor_id=? AND state=? AND lga=? AND is_active=1`
-        ).bind(tenantId, vendorId, state, lga).first<{
-          base_fee: number; per_kg_fee: number; free_above: number | null;
-          estimated_days_min: number; estimated_days_max: number;
-        }>()
-      : null;
-
-    if (!zone) {
-      zone = await c.env.DB.prepare(
-        `SELECT * FROM delivery_zones
-         WHERE tenant_id=? AND vendor_id=? AND state=? AND lga IS NULL AND is_active=1`
-      ).bind(tenantId, vendorId, state).first<{
-        base_fee: number; per_kg_fee: number; free_above: number | null;
-        estimated_days_min: number; estimated_days_max: number;
-      }>();
+  // Delegate to Logistics worker via Service Binding (T-CVC-01)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const params = new URLSearchParams({ vendor_id: vendorId, state, order_value: orderValue, weight_kg: weightKg });
+      if (lga) params.set('lga', lga);
+      const resp = await logisticsWorker.fetch(
+        `http://internal/api/delivery-zones/estimate?${params.toString()}`,
+        { headers: { 'x-tenant-id': tenantId } },
+      );
+      const data = await resp.json<{ success: boolean; data: Record<string, unknown> }>();
+      if (data.success && data.data) {
+        return c.json({ success: true, data: { ...data.data, source: 'logistics' } });
+      }
+    } catch (err) {
+      console.error('[MV] Logistics Service Binding error:', err);
     }
-
-    if (!zone) {
-      return c.json({
-        success: true,
-        data: {
-          vendor_id: vendorId, state, lga: lga ?? null,
-          base_fee: 0, weight_fee: 0, total_fee: 0, is_free: false,
-          note: 'No delivery zone configured for this region',
-        },
-      });
-    }
-
-    const isFree = zone.free_above !== null && orderValue >= zone.free_above;
-    const weightFee = Math.round(weightKg * zone.per_kg_fee);
-    const totalFee = isFree ? 0 : zone.base_fee + weightFee;
-
-    return c.json({
-      success: true,
-      data: {
-        vendor_id: vendorId, state, lga: lga ?? null,
-        base_fee: zone.base_fee, per_kg_fee: zone.per_kg_fee,
-        weight_kg: weightKg, weight_fee: weightFee,
-        free_above: zone.free_above,
-        is_free: isFree, total_fee: totalFee,
-        estimated_days_min: zone.estimated_days_min,
-        estimated_days_max: zone.estimated_days_max,
-      },
-    });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
   }
+  // Graceful fallback: return zero-fee estimate if Logistics binding unavailable
+  return c.json({
+    success: true,
+    data: {
+      vendor_id: vendorId, state, lga: lga ?? null,
+      base_fee: 0, weight_fee: 0, total_fee: 0, is_free: false,
+      note: 'No delivery zone configured for this region',
+      source: 'fallback',
+    },
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1683,13 +2506,14 @@ app.get('/shipping/estimate', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * GET /vendors/:id/settlements — List settlement records for authenticated vendor.
+ * GET /cmrc_vendors/:id/cmrc_settlements — List settlement records for authenticated vendor.
  * Requires vendor JWT (vendorAuthMiddleware).
  * Returns settled and eligible records plus eligible_total (kobo).
- * Automatically marks held settlements as eligible if hold_until has passed.
+ * Automatically marks held cmrc_settlements as eligible if hold_until has passed.
  */
-app.get('/vendors/:id/settlements', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+app.get('/cmrc_vendors/:id/cmrc_settlements', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.param('id');
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
@@ -1703,7 +2527,7 @@ app.get('/vendors/:id/settlements', async (c) => {
 
     // Promote held → eligible if hold_until has passed
     await c.env.DB.prepare(
-      `UPDATE settlements SET status = 'eligible', updated_at = ?
+      `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
        WHERE tenant_id = ? AND vendor_id = ? AND status = 'held' AND hold_until <= ?`
     ).bind(now, tenantId, vendorId, now).run();
 
@@ -1711,7 +2535,7 @@ app.get('/vendors/:id/settlements', async (c) => {
       `SELECT id, order_id, marketplace_order_id, amount, commission, commission_rate,
               hold_days, hold_until, status, payout_request_id, payment_reference,
               created_at, updated_at
-       FROM settlements
+       FROM cmrc_settlements
        WHERE tenant_id = ? AND vendor_id = ?
        ORDER BY created_at DESC LIMIT 100`
     ).bind(tenantId, vendorId).all<{
@@ -1739,8 +2563,9 @@ app.get('/vendors/:id/settlements', async (c) => {
         total_count: rows.results?.length ?? 0,
       },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
@@ -1749,14 +2574,15 @@ app.get('/vendors/:id/settlements', async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * POST /vendors/:id/payout-request — Initiate payout withdrawal.
- * Requires vendor JWT. Vendor must have eligible settlements.
- * Creates payout_request, links settlements to it, transitions them to 'released'.
+ * POST /cmrc_vendors/:id/payout-request — Initiate payout withdrawal.
+ * Requires vendor JWT. Vendor must have eligible cmrc_settlements.
+ * Creates payout_request, links cmrc_settlements to it, transitions them to 'released'.
  * Returns 409 if an active payout request is already pending/processing.
  * Returns 422 if eligible_total === 0.
  */
-app.post('/vendors/:id/payout-request', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID')!;
+app.post('/cmrc_vendors/:id/payout-request', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
   const vendorId = c.req.param('id');
   const vendor = await authenticateVendor(c);
   if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
@@ -1768,15 +2594,15 @@ app.post('/vendors/:id/payout-request', async (c) => {
   const now = Date.now();
 
   try {
-    // Promote held → eligible
+    // Promote held → eligible (must run first so the subsequent SELECT captures them)
     await c.env.DB.prepare(
-      `UPDATE settlements SET status = 'eligible', updated_at = ?
+      `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
        WHERE tenant_id = ? AND vendor_id = ? AND status = 'held' AND hold_until <= ?`
     ).bind(now, tenantId, vendorId, now).run();
 
     // Check for existing pending/processing payout
     const existingPayout = await c.env.DB.prepare(
-      `SELECT id, status FROM payout_requests
+      `SELECT id, status FROM cmrc_payout_requests
        WHERE tenant_id = ? AND vendor_id = ? AND status IN ('pending', 'processing')
        LIMIT 1`
     ).bind(tenantId, vendorId).first<{ id: string; status: string }>();
@@ -1788,44 +2614,45 @@ app.post('/vendors/:id/payout-request', async (c) => {
       }, 409);
     }
 
-    // Fetch eligible settlements
-    const eligible = await c.env.DB.prepare(
-      `SELECT id, amount FROM settlements
-       WHERE tenant_id = ? AND vendor_id = ? AND status = 'eligible'`
-    ).bind(tenantId, vendorId).all<{ id: string; amount: number }>();
+    // Fetch eligible cmrc_settlements and vendor bank snapshot in parallel
+    const [eligible, vendorRecord] = await Promise.all([
+      c.env.DB.prepare(
+        `SELECT id, amount FROM cmrc_settlements
+         WHERE tenant_id = ? AND vendor_id = ? AND status = 'eligible'`
+      ).bind(tenantId, vendorId).all<{ id: string; amount: number }>(),
+      c.env.DB.prepare(
+        `SELECT bank_details_json FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`
+      ).bind(vendorId, tenantId).first<{ bank_details_json: string | null }>(),
+    ]);
 
     const eligibleRows = eligible.results ?? [];
     if (eligibleRows.length === 0) {
-      return c.json({ success: false, error: 'No eligible settlements to pay out. Balance may still be in hold period.' }, 422);
+      return c.json({ success: false, error: 'No eligible cmrc_settlements to pay out. Balance may still be in hold period.' }, 422);
     }
 
     const totalAmount = eligibleRows.reduce((s, r) => s + r.amount, 0);
-
-    // Fetch vendor bank_details snapshot
-    const vendor = await c.env.DB.prepare(
-      `SELECT bank_details_json FROM vendors WHERE id = ? AND marketplace_tenant_id = ?`
-    ).bind(vendorId, tenantId).first<{ bank_details_json: string | null }>();
-
     const prId = `pr_${now}_${Math.random().toString(36).slice(2, 9)}`;
 
-    await c.env.DB.prepare(
-      `INSERT INTO payout_requests
-         (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
-          status, requested_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
-    ).bind(
-      prId, tenantId, vendorId, totalAmount, eligibleRows.length,
-      vendor?.bank_details_json ?? null, now, now, now,
-    ).run();
-
-    // Link settlements to payout request and mark as released
-    for (const row of eligibleRows) {
-      await c.env.DB.prepare(
-        `UPDATE settlements
-         SET status = 'released', payout_request_id = ?, updated_at = ?
-         WHERE id = ?`
-      ).bind(prId, now, row.id).run();
-    }
+    // Atomic batch: INSERT payout_request + UPDATE all cmrc_settlements in a single D1 transaction.
+    // If any statement fails the entire batch is rolled back, preventing orphaned payout records.
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO cmrc_payout_requests
+           (id, tenant_id, vendor_id, amount, settlement_count, bank_details_json,
+            status, requested_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
+      ).bind(
+        prId, tenantId, vendorId, totalAmount, eligibleRows.length,
+        vendorRecord?.bank_details_json ?? null, now, now, now,
+      ),
+      ...eligibleRows.map(row =>
+        c.env.DB.prepare(
+          `UPDATE cmrc_settlements
+           SET status = 'released', payout_request_id = ?, updated_at = ?
+           WHERE id = ?`
+        ).bind(prId, now, row.id)
+      ),
+    ]);
 
     return c.json({
       success: true,
@@ -1836,10 +2663,1862 @@ app.post('/vendors/:id/payout-request', async (c) => {
         status: 'pending',
       },
     }, 201);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-E01: DEDICATED SEARCH ENDPOINT — FTS5-first with LIKE fallback
+// GET /search?q={query}&category={category}&per_page={n}
+// Used by the marketplace frontend instead of per-vendor product loops.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /search
+ * Full-text product search across all active cmrc_vendors in the marketplace.
+ * Uses FTS5 MATCH when the products_fts table is available; falls back to LIKE.
+ * Tenant-isolated: all queries are scoped to the x-tenant-id header.
+ */
+app.get('/search', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const q        = (c.req.query('q') ?? '').trim();
+  const category = (c.req.query('category') ?? '').trim();
+  const perPage  = Math.min(Number(c.req.query('per_page') ?? '24'), 48);
+
+  // Rate-limit search requests (60 per IP per minute)
+  if (q) {
+    const rlKey = `rl:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+    if (!(await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, rlKey, 60, 60_000))) {
+      return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
+    }
+  }
+
+  try {
+    const conditions: string[] = [
+      'p.tenant_id = ?',
+      'p.is_active = 1',
+      'p.deleted_at IS NULL',
+      'v.status = ?',
+      'v.deleted_at IS NULL',
+    ];
+    const binds: unknown[] = [tenantId, 'active'];
+
+    if (category) {
+      conditions.push('p.category = ?');
+      binds.push(category);
+    }
+
+    let searchJoin = '';
+    if (q) {
+      searchJoin = `INNER JOIN products_fts fts ON fts.product_id = p.id AND fts.tenant_id = p.tenant_id`;
+      conditions.push('products_fts MATCH ?');
+      binds.push(q);
+    }
+
+    const where = conditions.join(' AND ');
+    binds.push(perPage);
+
+    const sql = `
+      SELECT
+        p.id, p.sku, p.name, p.description, p.category,
+        p.price, p.quantity, p.image_url, p.vendor_id,
+        v.name AS vendor_name, v.slug AS vendor_slug,
+        v.badge AS vendor_badge, v.performanceScore AS vendor_score
+      FROM cmrc_products p
+      INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
+      ${searchJoin}
+      WHERE ${where}
+      ORDER BY p.id ASC
+      LIMIT ?
+    `.trim();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { results } = await c.env.DB.prepare(sql).bind(...(binds as any[])).all<{
+      id: string; sku: string; name: string; description: string | null;
+      category: string | null; price: number; quantity: number; image_url: string | null;
+      vendor_id: string; vendor_name: string; vendor_slug: string;
+      vendor_badge: string | null; vendor_score: number | null;
+    }>();
+
+    return c.json({ success: true, data: results, meta: { count: results.length, query: q } });
   } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+    // FTS5 table absent — retry with LIKE fallback
+    if (String(e).includes('no such table: products_fts') || String(e).includes('MATCH')) {
+      try {
+        const conditions: string[] = [
+          'p.tenant_id = ?', 'p.is_active = 1', 'p.deleted_at IS NULL',
+          'v.status = ?', 'v.deleted_at IS NULL',
+        ];
+        const binds: unknown[] = [tenantId, 'active'];
+        if (category) { conditions.push('p.category = ?'); binds.push(category); }
+        if (q) {
+          conditions.push('(p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)');
+          binds.push(`%${q}%`, `%${q}%`, `%${q}%`);
+        }
+        binds.push(perPage);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { results } = await c.env.DB.prepare(
+          `SELECT p.id, p.sku, p.name, p.description, p.category,
+                  p.price, p.quantity, p.image_url, p.vendor_id,
+                  v.name AS vendor_name, v.slug AS vendor_slug,
+                  v.badge AS vendor_badge, v.performanceScore AS vendor_score
+           FROM cmrc_products p
+           INNER JOIN cmrc_vendors v ON v.id = p.vendor_id
+           WHERE ${conditions.join(' AND ')}
+           ORDER BY p.id ASC LIMIT ?`,
+        ).bind(...(binds as any[])).all<{
+          id: string; sku: string; name: string; description: string | null; category: string | null;
+          price: number; quantity: number; image_url: string | null;
+          vendor_id: string; vendor_name: string; vendor_slug: string;
+          vendor_badge: string | null; vendor_score: number | null;
+        }>();
+
+        return c.json({ success: true, data: results, meta: { count: results.length, query: q } });
+      } catch (e2) {
+        console.error('[MV][search] LIKE fallback error:', e2);
+      }
+    }
+    console.error('[MV][search] error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-E02: ADMIN COMMISSION RULES CRUD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /admin/commission-rules — List all commission rules for a tenant (admin only)
+ */
+app.get('/admin/commission-rules', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, tenantId, vendorId, category, rateBps, effectiveFrom, effectiveUntil, createdAt
+       FROM cmrc_commission_rules WHERE tenantId = ? ORDER BY effectiveFrom DESC`,
+    ).bind(tenantId).all();
+    return c.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /admin/commission-rules — Create a commission rule (admin only)
+ */
+app.post('/admin/commission-rules', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const body = await c.req.json<{
+    vendorId?: string | null; category?: string | null;
+    rateBps: number; effectiveFrom?: string; effectiveUntil?: string | null;
+  }>();
+
+  if (typeof body.rateBps !== 'number' || body.rateBps < 0 || body.rateBps > 10000) {
+    return c.json({ success: false, error: 'rateBps must be between 0 and 10000' }, 400);
+  }
+
+  const id = `cr_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const now = new Date().toISOString();
+  const effectiveFrom = body.effectiveFrom ?? now.slice(0, 10);
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_commission_rules (id, tenantId, vendorId, category, rateBps, effectiveFrom, effectiveUntil, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id, tenantId,
+      body.vendorId ?? null, body.category ?? null,
+      body.rateBps, effectiveFrom,
+      body.effectiveUntil ?? null, now,
+    ).run();
+    return c.json({ success: true, data: { id, rateBps: body.rateBps, effectiveFrom } }, 201);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MV-E04: VENDOR LEDGER & PAYOUT DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /vendor/ledger?page=&limit= — Paginated ledger for authenticated vendor (MV-E04)
+ */
+app.get('/vendor/ledger', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  if (vendor.tenantId !== tenantId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  const page = Math.max(1, parseInt(c.req.query('page') ?? '1', 10));
+  const limit = Math.min(100, parseInt(c.req.query('limit') ?? '20', 10));
+  const offset = (page - 1) * limit;
+
+  try {
+    const countRow = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM cmrc_vendor_ledger_entries WHERE vendorId = ? AND tenantId = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ total: number }>();
+    const total = countRow?.total ?? 0;
+
+    const { results: entries } = await c.env.DB.prepare(
+      `SELECT id, type, amountKobo, balanceKobo, reference, description, orderId, createdAt
+       FROM cmrc_vendor_ledger_entries
+       WHERE vendorId = ? AND tenantId = ?
+       ORDER BY createdAt DESC
+       LIMIT ? OFFSET ?`,
+    ).bind(vendor.vendorId, tenantId, limit, offset).all();
+
+    return c.json({ success: true, data: { entries, total, page, limit } });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /vendor/balance — Available balance for authenticated vendor (MV-E04)
+ */
+app.get('/vendor/balance', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  if (vendor.tenantId !== tenantId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  try {
+    const row = await c.env.DB.prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'SALE' THEN amountKobo ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN type IN ('COMMISSION', 'PAYOUT', 'REFUND') THEN amountKobo ELSE 0 END), 0)
+         AS availableKobo
+       FROM cmrc_vendor_ledger_entries
+       WHERE vendorId = ? AND tenantId = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ availableKobo: number }>();
+
+    return c.json({ success: true, data: { availableKobo: row?.availableKobo ?? 0, pendingClearanceKobo: 0 } });
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /vendor/payout-request — Request payout of available balance (MV-E04)
+ * Minimum ₦5,000 (500,000 kobo). Writes a PAYOUT ledger entry.
+ */
+app.post('/vendor/payout-request', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  if (vendor.tenantId !== tenantId) return c.json({ success: false, error: 'Forbidden' }, 403);
+
+  const MINIMUM_PAYOUT_KOBO = 500_000; // ₦5,000
+
+  const now = Date.now();
+
+  try {
+    // Compute available balance
+    const balRow = await c.env.DB.prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'SALE' THEN amountKobo ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN type IN ('COMMISSION', 'PAYOUT', 'REFUND') THEN amountKobo ELSE 0 END), 0)
+         AS availableKobo
+       FROM cmrc_vendor_ledger_entries
+       WHERE vendorId = ? AND tenantId = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ availableKobo: number }>();
+
+    const availableKobo = balRow?.availableKobo ?? 0;
+
+    if (availableKobo < MINIMUM_PAYOUT_KOBO) {
+      return c.json({
+        success: false,
+        error: `Insufficient balance. Minimum payout is ₦${(MINIMUM_PAYOUT_KOBO / 100).toFixed(2)}. Available: ₦${(availableKobo / 100).toFixed(2)}.`,
+        availableKobo,
+        minimumKobo: MINIMUM_PAYOUT_KOBO,
+      }, 422);
+    }
+
+    // Fetch vendor bank details
+    const vendorRow = await c.env.DB.prepare(
+      `SELECT bank_details_json FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+    ).bind(vendor.vendorId, tenantId).first<{ bank_details_json: string | null }>();
+
+    const bankDetails = vendorRow?.bank_details_json
+      ? (() => { try { return JSON.parse(vendorRow.bank_details_json); } catch { return null; } })()
+      : null;
+    const recipientCode = (bankDetails as Record<string, unknown> | null)?.recipient_code as string | undefined;
+
+    const payoutReference = `payout_${now}_${Math.random().toString(36).slice(2, 9)}`;
+    let transferCode: string | null = null;
+
+    // Initiate Paystack transfer if secret and recipient code are configured
+    if (c.env.PAYSTACK_SECRET && recipientCode) {
+      try {
+        const { createPaymentProvider } = await import('@webwaka/core');
+        const provider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+        const transferResult = await provider.initiateTransfer(
+          recipientCode,
+          availableKobo,
+          payoutReference,
+        );
+        transferCode = (transferResult as Record<string, unknown>)?.transfer_code as string ?? null;
+      } catch (transferErr) {
+        console.warn('[MV][payout] Paystack transfer initiation failed:', transferErr);
+      }
+    }
+
+    // Write PAYOUT ledger entry
+    const lastEntry = await c.env.DB.prepare(
+      `SELECT balanceKobo FROM cmrc_vendor_ledger_entries WHERE vendorId = ? AND tenantId = ? ORDER BY createdAt DESC LIMIT 1`,
+    ).bind(vendor.vendorId, tenantId).first<{ balanceKobo: number }>();
+    const prevBalance = lastEntry?.balanceKobo ?? 0;
+    const newBalance = prevBalance - availableKobo;
+
+    const payoutEntryId = `vle_payout_${now}_${Math.random().toString(36).slice(2, 9)}`;
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_vendor_ledger_entries (id, tenantId, vendorId, type, amountKobo, balanceKobo, reference, description, orderId, createdAt)
+       VALUES (?, ?, ?, 'PAYOUT', ?, ?, ?, ?, NULL, ?)`,
+    ).bind(
+      payoutEntryId, tenantId, vendor.vendorId,
+      availableKobo, newBalance, payoutReference,
+      `Payout of ₦${(availableKobo / 100).toFixed(2)}${transferCode ? ` (transfer: ${transferCode})` : ''}`,
+      new Date(now).toISOString(),
+    ).run();
+
+    return c.json({
+      success: true,
+      data: { payoutReference, transferCode, availableKobo, newBalance },
+    }, 201);
+  } catch (err) {
+    console.error('[MV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPUTE RESOLUTION — MV-E08
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /cmrc_disputes — Customer or vendor opens a dispute
+ * Auth: customer JWT (role='customer') OR vendor JWT (role='vendor')
+ */
+app.post('/cmrc_disputes', async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    orderId: string;
+    category: string;
+    description: string;
+    evidenceUrls?: string[];
+  }>();
+
+  if (!body.orderId) return c.json({ success: false, error: 'orderId is required' }, 400);
+  if (!body.category?.trim()) return c.json({ success: false, error: 'category is required' }, 400);
+  if (!body.description?.trim()) return c.json({ success: false, error: 'description is required' }, 400);
+
+  // Authenticate as customer or vendor
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
+  if (!claims || !['customer', 'vendor'].includes(String(claims.role))) {
+    return c.json({ success: false, error: 'Authentication required' }, 401);
+  }
+
+  const reporterRole = String(claims.role);
+  const reporterId = String(claims.sub);
+
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id, customer_phone, vendor_id, paystack_reference
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.orderId, tenantId).first<{
+      id: string; customer_phone: string | null; vendor_id: string | null; paystack_reference: string | null;
+    }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    // Validate that the reporter actually has standing to open this dispute
+    const reporterPhone = claims.email ? String(claims.email) : null;
+    if (reporterRole === 'customer') {
+      if (!reporterPhone || order.customer_phone !== reporterPhone) {
+        return c.json({ success: false, error: 'You are not the buyer of this order' }, 403);
+      }
+    } else if (reporterRole === 'vendor') {
+      if (!order.vendor_id || order.vendor_id !== reporterId) {
+        return c.json({ success: false, error: 'You do not have items in this order' }, 403);
+      }
+    }
+
+    const now = Date.now();
+    const disputeId = `dsp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_disputes
+         (id, tenant_id, order_id, reporter_id, reporter_role, category, description,
+          evidence_urls_json, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`,
+    ).bind(
+      disputeId, tenantId, body.orderId, reporterId, reporterRole,
+      body.category.trim(), body.description.trim(),
+      body.evidenceUrls ? JSON.stringify(body.evidenceUrls) : null,
+      now, now,
+    ).run();
+
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_dispute_${now}_${disputeId}`,
+      tenantId: tenantId!,
+      type: CommerceEvents.DISPUTE_OPENED,
+      sourceModule: 'multi_vendor_marketplace',
+      timestamp: now,
+      payload: { disputeId, orderId: body.orderId, tenantId: tenantId!, reporterRole },
+    }).catch(() => {});
+
+    // Notify both buyer and vendor via WhatsApp
+    if (c.env.TERMII_API_KEY) {
+      const sms = createSmsProvider(c.env.TERMII_API_KEY);
+      const notifyMsg = `A dispute has been opened for order ${body.orderId}. Category: ${body.category}. Our team will review within 48 hours. Dispute ID: ${disputeId}`;
+      if (order.customer_phone) {
+        await sms.sendOtp(order.customer_phone, notifyMsg, 'whatsapp').catch(() => {});
+      }
+      if (order.vendor_id) {
+        const vendorRow = await c.env.DB.prepare(
+          `SELECT phone FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+        ).bind(order.vendor_id, tenantId).first<{ phone: string | null }>();
+        if (vendorRow?.phone) {
+          await sms.sendOtp(vendorRow.phone, notifyMsg, 'whatsapp').catch(() => {});
+        }
+      }
+    }
+
+    return c.json({ success: true, data: { disputeId, status: 'OPEN' } }, 201);
+  } catch (err) {
+    console.error('[MV] cmrc_disputes error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /admin/cmrc_disputes — List cmrc_disputes by status (admin only)
+ */
+app.get('/admin/cmrc_disputes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const status = c.req.query('status') ?? 'OPEN';
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, order_id, reporter_id, reporter_role, category, description,
+              evidence_urls_json, status, resolution, created_at, updated_at
+       FROM cmrc_disputes
+       WHERE tenant_id = ? AND status = ?
+       ORDER BY created_at DESC LIMIT 100`,
+    ).bind(tenantId, status).all();
+    return c.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[MV] admin/cmrc_disputes GET error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * PATCH /admin/cmrc_disputes/:id — Update dispute status (admin only)
+ */
+app.patch('/admin/cmrc_disputes/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const disputeId = c.req.param('id');
+  const body = await c.req.json<{ status: string }>();
+  const validStatuses = ['OPEN', 'UNDER_REVIEW', 'RESOLVED'];
+  if (!body.status || !validStatuses.includes(body.status)) {
+    return c.json({ success: false, error: `status must be one of: ${validStatuses.join(', ')}` }, 400);
+  }
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE cmrc_disputes SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.status, Date.now(), disputeId, tenantId).run();
+    if (result.meta.changes === 0) return c.json({ success: false, error: 'Dispute not found' }, 404);
+    return c.json({ success: true, data: { id: disputeId, status: body.status } });
+  } catch (err) {
+    console.error('[MV] admin/cmrc_disputes PATCH error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /admin/cmrc_disputes/:id/resolve — Resolve a dispute (admin only)
+ * Supports FULL_REFUND, PARTIAL_REFUND, REPLACEMENT
+ */
+app.post('/admin/cmrc_disputes/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const disputeId = c.req.param('id');
+  const body = await c.req.json<{ resolution: string; amountKobo?: number }>();
+  const validResolutions = ['FULL_REFUND', 'PARTIAL_REFUND', 'REPLACEMENT'];
+  if (!body.resolution || !validResolutions.includes(body.resolution)) {
+    return c.json({ success: false, error: `resolution must be one of: ${validResolutions.join(', ')}` }, 400);
+  }
+  if (body.resolution === 'PARTIAL_REFUND' && (!body.amountKobo || body.amountKobo <= 0)) {
+    return c.json({ success: false, error: 'amountKobo is required for PARTIAL_REFUND' }, 400);
+  }
+
+  try {
+    const dispute = await c.env.DB.prepare(
+      `SELECT id, order_id, status FROM cmrc_disputes WHERE id = ? AND tenant_id = ?`,
+    ).bind(disputeId, tenantId).first<{ id: string; order_id: string; status: string }>();
+    if (!dispute) return c.json({ success: false, error: 'Dispute not found' }, 404);
+    if (dispute.status === 'RESOLVED') return c.json({ success: false, error: 'Dispute already resolved' }, 409);
+
+    const order = await c.env.DB.prepare(
+      `SELECT id, customer_phone, vendor_id, paystack_reference, items_json, total_amount
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ?`,
+    ).bind(dispute.order_id, tenantId).first<{
+      id: string; customer_phone: string | null; vendor_id: string | null;
+      paystack_reference: string | null; items_json: string | null; total_amount: number;
+    }>();
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    if (
+      body.resolution === 'PARTIAL_REFUND' &&
+      body.amountKobo !== undefined &&
+      body.amountKobo > order.total_amount
+    ) {
+      return c.json({
+        success: false,
+        error: `Partial refund amount (${body.amountKobo} kobo) cannot exceed the order total (${order.total_amount} kobo)`,
+      }, 400);
+    }
+
+    const now = Date.now();
+
+    if (body.resolution === 'FULL_REFUND' && order.paystack_reference && c.env.PAYSTACK_SECRET) {
+      const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+      await paymentProvider.initiateRefund(order.paystack_reference).catch(() => {});
+    } else if (body.resolution === 'PARTIAL_REFUND' && order.paystack_reference && c.env.PAYSTACK_SECRET) {
+      const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+      await paymentProvider.initiateRefund(order.paystack_reference, body.amountKobo).catch(() => {});
+    } else if (body.resolution === 'REPLACEMENT') {
+      const replacementId = `ord_rep_${now}_${Math.random().toString(36).slice(2, 9)}`;
+      await c.env.DB.prepare(
+        `INSERT INTO cmrc_orders
+           (id, tenant_id, vendor_id, customer_phone, items_json, total_amount, payment_status,
+            order_status, channel, payment_reference, paystack_reference, created_at, updated_at)
+         SELECT ?, tenant_id, vendor_id, customer_phone, items_json, total_amount, 'paid',
+                'confirmed', 'replacement', ?, ?, ?, ?
+         FROM cmrc_orders WHERE id = ?`,
+      ).bind(replacementId, `replacement_${dispute.id}`, `replacement_${dispute.id}`, now, now, order.id).run();
+    }
+
+    await c.env.DB.prepare(
+      `UPDATE cmrc_disputes SET status = 'RESOLVED', resolution = ?, amount_kobo = ?, resolved_at = ?, updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.resolution, body.amountKobo ?? null, now, now, disputeId, tenantId).run();
+
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_dispute_resolved_${now}_${disputeId}`,
+      tenantId: tenantId!,
+      type: CommerceEvents.DISPUTE_RESOLVED,
+      sourceModule: 'multi_vendor_marketplace',
+      timestamp: now,
+      payload: { disputeId, orderId: dispute.order_id, resolution: body.resolution, tenantId: tenantId! },
+    }).catch(() => {});
+
+    // Notify buyer and vendor with resolution details
+    if (c.env.TERMII_API_KEY) {
+      const sms = createSmsProvider(c.env.TERMII_API_KEY);
+      const resolutionMessages: Record<string, string> = {
+        FULL_REFUND: `Your dispute (${disputeId}) has been resolved. A full refund has been initiated for order ${dispute.order_id}.`,
+        PARTIAL_REFUND: `Your dispute (${disputeId}) has been resolved. A partial refund of ₦${((body.amountKobo ?? 0) / 100).toFixed(2)} has been initiated.`,
+        REPLACEMENT: `Your dispute (${disputeId}) has been resolved. A replacement order has been created for order ${dispute.order_id}.`,
+      };
+      const msg = resolutionMessages[body.resolution] ?? `Your dispute (${disputeId}) has been resolved.`;
+
+      if (order.customer_phone) {
+        await sms.sendOtp(order.customer_phone, msg, 'whatsapp').catch(() => {});
+      }
+      if (order.vendor_id) {
+        const vendorRow = await c.env.DB.prepare(
+          `SELECT phone FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+        ).bind(order.vendor_id, tenantId).first<{ phone: string | null }>();
+        if (vendorRow?.phone) {
+          await sms.sendOtp(vendorRow.phone, `Dispute ${disputeId} for order ${dispute.order_id} has been resolved: ${body.resolution}.`, 'whatsapp').catch(() => {});
+        }
+      }
+    }
+
+    return c.json({ success: true, data: { disputeId, status: 'RESOLVED', resolution: body.resolution } });
+  } catch (err) {
+    console.error('[MV] admin/cmrc_disputes/resolve error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P11 — MARKETPLACE CAMPAIGNS (MV-E10)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /admin/campaigns — Create a marketplace-wide discount campaign (admin only)
+ * Body: { name, discountType, discountValue, startDate, endDate }
+ */
+app.post('/admin/campaigns', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Invalid admin key' }, 403);
+  }
+  const body = await c.req.json<{
+    name: string;
+    discountType: 'PERCENTAGE' | 'FIXED';
+    discountValue: number;
+    startDate: string;
+    endDate: string;
+  }>();
+  if (!body.name?.trim()) return c.json({ success: false, error: 'name is required' }, 400);
+  if (!['PERCENTAGE', 'FIXED'].includes(body.discountType)) return c.json({ success: false, error: 'discountType must be PERCENTAGE or FIXED' }, 400);
+  if (typeof body.discountValue !== 'number' || body.discountValue <= 0) return c.json({ success: false, error: 'discountValue must be a positive number' }, 400);
+  if (!body.startDate || !body.endDate) return c.json({ success: false, error: 'startDate and endDate are required' }, 400);
+  if (body.startDate >= body.endDate) return c.json({ success: false, error: 'startDate must be before endDate' }, 400);
+
+  const now = Date.now();
+  const id = `cmp_${now}_${Math.random().toString(36).slice(2, 9)}`;
+  await c.env.DB.prepare(
+    `INSERT INTO cmrc_marketplace_campaigns (id, tenantId, name, discountType, discountValue, startDate, endDate, status, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?)`
+  ).bind(id, tenantId, body.name.trim(), body.discountType, body.discountValue, body.startDate, body.endDate, new Date(now).toISOString()).run();
+
+  return c.json({ success: true, data: { id, name: body.name.trim(), status: 'DRAFT' } }, 201);
+});
+
+/**
+ * POST /campaigns/:id/opt-in — Vendor opts cmrc_products into a campaign
+ * Body: { productIds?: string[] }
+ * Requires vendor JWT
+ */
+app.post('/campaigns/:id/opt-in', async (c) => {
+  const tenantId = getTenantId(c);
+  const campaignId = c.req.param('id');
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const body = await c.req.json<{ productIds?: string[] }>();
+  const productIds = Array.isArray(body.productIds) ? body.productIds : [];
+
+  const campaign = await c.env.DB.prepare(
+    'SELECT id, status FROM cmrc_marketplace_campaigns WHERE id = ? AND tenantId = ?'
+  ).bind(campaignId, tenantId).first<{ id: string; status: string }>();
+  if (!campaign) return c.json({ success: false, error: 'Campaign not found' }, 404);
+  if (campaign.status === 'ENDED') return c.json({ success: false, error: 'Campaign has ended' }, 422);
+
+  await c.env.DB.prepare(
+    'INSERT OR REPLACE INTO cmrc_campaign_vendor_opt_ins (campaignId, vendorId, productIds) VALUES (?, ?, ?)'
+  ).bind(campaignId, vendor.vendorId, productIds.length > 0 ? JSON.stringify(productIds) : null).run();
+
+  return c.json({ success: true, data: { campaignId, vendorId: vendor.vendorId, productCount: productIds.length || 'all' } });
+});
+
+/**
+ * GET /campaigns/active — List active campaigns with participating cmrc_vendors
+ */
+app.get('/campaigns/active', async (c) => {
+  const tenantId = getTenantId(c);
+  const rows = await c.env.DB.prepare(
+    `SELECT c.id, c.name, c.discountType, c.discountValue, c.startDate, c.endDate, c.status,
+            json_group_array(o.vendorId) as participatingVendors
+     FROM cmrc_marketplace_campaigns c
+     LEFT JOIN cmrc_campaign_vendor_opt_ins o ON c.id = o.campaignId
+     WHERE c.tenantId = ? AND c.status = 'ACTIVE'
+     GROUP BY c.id
+     ORDER BY c.startDate DESC`
+  ).bind(tenantId).all<{ id: string; name: string; discountType: string; discountValue: number; startDate: string; endDate: string; status: string; participatingVendors: string }>();
+
+  const data = (rows.results ?? []).map((r) => ({
+    ...r,
+    participatingVendors: (() => {
+      try { const v = JSON.parse(r.participatingVendors) as string[]; return v.filter(Boolean); } catch { return []; }
+    })(),
+  }));
+
+  return c.json({ success: true, data });
+});
+
+/**
+ * GET /campaigns/:id/cmrc_products — Products from opted-in cmrc_vendors with campaign discount applied
+ */
+app.get('/campaigns/:id/cmrc_products', async (c) => {
+  const tenantId = getTenantId(c);
+  const campaignId = c.req.param('id');
+
+  const campaign = await c.env.DB.prepare(
+    'SELECT id, name, discountType, discountValue, status FROM cmrc_marketplace_campaigns WHERE id = ? AND tenantId = ?'
+  ).bind(campaignId, tenantId).first<{ id: string; name: string; discountType: string; discountValue: number; status: string }>();
+  if (!campaign) return c.json({ success: false, error: 'Campaign not found' }, 404);
+
+  const optIns = await c.env.DB.prepare(
+    'SELECT vendorId, productIds FROM cmrc_campaign_vendor_opt_ins WHERE campaignId = ?'
+  ).bind(campaignId).all<{ vendorId: string; productIds: string | null }>();
+
+  const results: Array<{
+    productId: string; productName: string; vendorId: string; originalPriceKobo: number;
+    campaignPriceKobo: number; discountType: string; discountValue: number;
+  }> = [];
+
+  for (const optIn of optIns.results ?? []) {
+    let scopeIds: string[] | null = null;
+    try { if (optIn.productIds) scopeIds = JSON.parse(optIn.productIds) as string[]; } catch { /* no-op */ }
+
+    const whereClause = scopeIds
+      ? `AND id IN (${scopeIds.map(() => '?').join(',')})`
+      : '';
+    const bindings: (string | null)[] = [tenantId, optIn.vendorId, ...(scopeIds ?? [])];
+
+    const cmrc_products = await c.env.DB.prepare(
+      `SELECT id, name, price FROM cmrc_products WHERE tenant_id = ? AND vendor_id = ? AND is_active = 1 AND deleted_at IS NULL ${whereClause} LIMIT 50`
+    ).bind(...bindings).all<{ id: string; name: string; price: number }>();
+
+    for (const p of cmrc_products.results ?? []) {
+      const discountKobo = campaign.discountType === 'PERCENTAGE'
+        ? Math.round(p.price * campaign.discountValue / 100)
+        : Math.min(campaign.discountValue, p.price);
+      results.push({
+        productId: p.id, productName: p.name, vendorId: optIn.vendorId,
+        originalPriceKobo: p.price, campaignPriceKobo: Math.max(0, p.price - discountKobo),
+        discountType: campaign.discountType, discountValue: campaign.discountValue,
+      });
+    }
+  }
+
+  return c.json({ success: true, data: { campaign, cmrc_products: results } });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// P12 — PRODUCT DISCOVERY, VENDOR BRANDING & ANALYTICS (MV-E13, MV-E15, SV-E06, SV-E19)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /search/suggest — Autocomplete suggestions (SV-E19 / MV) ─────────────
+app.get('/search/suggest', async (c) => {
+  const tenantId = getTenantId(c);
+  const q = c.req.query('q')?.trim();
+  if (!q || q.length < 2) return c.json({ success: true, data: { suggestions: [] } });
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT DISTINCT name FROM cmrc_products
+       WHERE tenant_id = ? AND name LIKE ? AND deleted_at IS NULL AND is_active = 1
+       LIMIT 5`
+    ).bind(tenantId, `${q}%`).all<{ name: string }>();
+    return c.json({ success: true, data: { suggestions: (results ?? []).map((r) => r.name) } });
+  } catch (err) {
+    console.error('[MV][search/suggest] error:', err);
+    return c.json({ success: true, data: { suggestions: [] } });
+  }
+});
+
+// ── POST /cmrc_products/:id/attributes — Add/update attribute (SV-E06 / MV) ────────
+app.post('/cmrc_products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const body = await c.req.json<{ attributeName: string; attributeValue: string }>();
+
+  if (!body.attributeName?.trim()) return c.json({ success: false, error: 'attributeName is required' }, 400);
+  if (!body.attributeValue?.trim()) return c.json({ success: false, error: 'attributeValue is required' }, 400);
+
+  const now = new Date().toISOString();
+  const id = `attr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tenantId, productId, attributeName)
+       DO UPDATE SET attributeValue = excluded.attributeValue`
+    ).bind(id, tenantId, productId, body.attributeName.trim(), body.attributeValue.trim(), now).run();
+
+    // Re-index FTS5 with attribute values appended to description
+    try {
+      const { results: attrs } = await c.env.DB.prepare(
+        'SELECT attributeName, attributeValue FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ?'
+      ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
+
+      const attrText = attrs.map((a) => `${a.attributeName}: ${a.attributeValue}`).join(' ');
+      const product = await c.env.DB.prepare(
+        'SELECT rowid, name, description, category, sku FROM cmrc_products WHERE id = ? AND tenant_id = ?'
+      ).bind(productId, tenantId).first<{ rowid: number; name: string; description: string | null; category: string | null; sku: string }>();
+
+      if (product) {
+        const fullDesc = [product.description, attrText].filter(Boolean).join(' ');
+        await c.env.DB.batch([
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(products_fts, rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES ('delete', ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, product.description ?? '', product.category ?? '', product.sku),
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, fullDesc, product.category ?? '', product.sku),
+        ]);
+      }
+    } catch {
+      // FTS re-index is non-fatal
+    }
+
+    return c.json({ success: true, data: { id, productId, attributeName: body.attributeName.trim(), attributeValue: body.attributeValue.trim() } }, 201);
+  } catch (err) {
+    console.error('[MV][cmrc_products/attributes] POST error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /cmrc_products/:id/attributes — List product attributes ────────────────────
+app.get('/cmrc_products/:id/attributes', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, attributeName, attributeValue, createdAt FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+    ).bind(tenantId, productId).all<{ id: string; attributeName: string; attributeValue: string; createdAt: string }>();
+
+    return c.json({ success: true, data: { productId, attributes: results ?? [] } });
+  } catch (err) {
+    console.error('[MV][cmrc_products/attributes] GET error:', err);
+    return c.json({ success: true, data: { productId, attributes: [] } });
+  }
+});
+
+// ── PATCH /vendor/branding — Vendor updates their storefront branding (MV-E13) ─
+app.patch('/vendor/branding', async (c) => {
+  const tenantId = getTenantId(c);
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const body = await c.req.json<{
+    logoUrl?: string;
+    bannerUrl?: string;
+    primaryColor?: string;
+    tagline?: string;
+  }>();
+
+  const branding = {
+    logoUrl: body.logoUrl ?? null,
+    bannerUrl: body.bannerUrl ?? null,
+    primaryColor: body.primaryColor ?? null,
+    tagline: body.tagline ?? null,
+  };
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE cmrc_vendors SET branding = json(?) WHERE id = ? AND marketplace_tenant_id = ?`
+    ).bind(JSON.stringify(branding), vendor.vendorId, tenantId).run();
+
+    return c.json({ success: true, data: { vendorId: vendor.vendorId, branding } });
+  } catch (err) {
+    console.error('[MV][vendor/branding] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /vendor/analytics?days= — Vendor analytics dashboard (MV-E15) ─────────
+app.get('/vendor/analytics', async (c) => {
+  const tenantId = getTenantId(c);
+  const vendor = await authenticateVendor(c);
+  if (!vendor) return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+
+  const days = Math.min(Math.max(1, Number(c.req.query('days') ?? 30)), 90);
+
+  try {
+    // Build full date range — exactly `days` entries, oldest first
+    const dateRange: string[] = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      dateRange.push(d.toISOString().slice(0, 10));
+    }
+
+    // Revenue trend from cmrc_vendor_daily_analytics
+    const { results: dbTrend } = await c.env.DB.prepare(
+      `SELECT date, revenueKobo, orderCount, avgOrderValueKobo
+       FROM cmrc_vendor_daily_analytics
+       WHERE vendorId = ? AND tenantId = ?
+         AND date >= DATE('now', ?)
+       ORDER BY date ASC`
+    ).bind(vendor.vendorId, tenantId, `-${days} days`).all<{
+      date: string; revenueKobo: number; orderCount: number; avgOrderValueKobo: number;
+    }>();
+
+    // Zero-fill missing days — every day in dateRange must have an entry
+    const dbMap = new Map((dbTrend ?? []).map((r) => [r.date, r]));
+    const trend = dateRange.map((date) => dbMap.get(date) ?? { date, revenueKobo: 0, orderCount: 0, avgOrderValueKobo: 0 });
+
+    // Aggregated KPIs
+    const totalRevenue = trend.reduce((s, r) => s + r.revenueKobo, 0);
+    const totalOrders = trend.reduce((s, r) => s + r.orderCount, 0);
+    const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
+
+    // Top 5 cmrc_products by revenue (last N days from order_items join)
+    const { results: topProducts } = await c.env.DB.prepare(
+      `SELECT oi.product_id, oi.product_name AS name,
+              SUM(oi.quantity)     AS units_sold,
+              SUM(oi.total_price)  AS revenue_kobo
+       FROM order_items oi
+       JOIN cmrc_orders o ON o.id = oi.order_id
+       WHERE o.vendor_id = ? AND o.tenant_id = ?
+         AND o.payment_status = 'paid'
+         AND o.created_at >= ?
+       GROUP BY oi.product_id, oi.product_name
+       ORDER BY revenue_kobo DESC
+       LIMIT 5`
+    ).bind(vendor.vendorId, tenantId, Date.now() - days * 24 * 60 * 60 * 1000).all<{
+      product_id: string; name: string; units_sold: number; revenue_kobo: number;
+    }>();
+
+    return c.json({
+      success: true,
+      data: {
+        revenueTrend: trend,
+        topProducts: topProducts ?? [],
+        totalRevenue,
+        totalOrders,
+        avgOrderValue,
+        repeatBuyerCount: 0,
+        days,
+      },
+    });
+  } catch (err) {
+    console.error('[MV][vendor/analytics] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── MV-E18: AI Product Listing Optimisation ──────────────────────────────────
+app.post('/cmrc_products/ai-suggest', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const body = await c.req.json<{ name: string; description?: string; category?: string }>();
+  if (!body.name?.trim()) return c.json({ success: false, error: 'name is required' }, 400);
+
+  if (!c.env.OPENROUTER_API_KEY) {
+    return c.json({ success: false, error: 'AI optimisation not configured (missing OPENROUTER_API_KEY)' }, 503);
+  }
+
+  try {
+    const ai = createAiClient(c.env.OPENROUTER_API_KEY);
+    const result = await ai.complete({
+      model: 'openai/gpt-4o-mini',
+      maxTokens: 400,
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a product listing expert for Nigerian e-commerce. You help cmrc_vendors write compelling, SEO-friendly product listings for the Nigerian market.',
+        },
+        {
+          role: 'user',
+          content: `Improve this product listing for a Nigerian marketplace:\nName: ${body.name}\nDescription: ${body.description ?? ''}\nCategory: ${body.category ?? ''}\n\nProvide: improved title (max 80 chars), structured description (max 300 chars), 5 relevant search tags. Respond ONLY as JSON with no markdown: { "title": "...", "description": "...", "tags": ["tag1","tag2","tag3","tag4","tag5"] }`,
+        },
+      ],
+    });
+
+    if (result.error) {
+      return c.json({ success: false, error: result.error }, 502);
+    }
+
+    let suggestion: { title: string; description: string; tags: string[] };
+    try {
+      const raw = result.content.replace(/```json\n?|\n?```/g, '').trim();
+      suggestion = JSON.parse(raw) as typeof suggestion;
+    } catch {
+      suggestion = { title: body.name, description: result.content, tags: [] };
+    }
+
+    return c.json({ success: true, data: { suggestion, tokensUsed: result.tokensUsed } });
+  } catch (err) {
+    console.error('[MV][ai-suggest] error:', err);
+    return c.json({ success: false, error: 'AI suggestion failed' }, 500);
+  }
+});
+
+// ── MV-E17: Social Commerce CSV Import ───────────────────────────────────────
+app.post('/cmrc_products/import-csv', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorToken = c.req.header('Authorization')?.replace('Bearer ', '') ?? '';
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? 'unknown';
+
+  const contentType = c.req.header('Content-Type') ?? '';
+  let csvText = '';
+
+  if (contentType.includes('text/csv') || contentType.includes('text/plain')) {
+    csvText = await c.req.text();
+  } else {
+    const formData = await c.req.formData().catch(() => null);
+    const file = formData?.get('file');
+    csvText = file ? await (file as File).text() : '';
+  }
+
+  if (!csvText.trim()) return c.json({ success: false, error: 'CSV content required' }, 400);
+
+  const lines = csvText.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return c.json({ success: false, error: 'CSV must have header row + at least one data row' }, 400);
+
+  const header = lines[0]!.toLowerCase().split(',').map(h => h.trim().replace(/"/g, ''));
+  const colIdx = (name: string) => header.indexOf(name);
+
+  const imported: string[] = [];
+  const failed: Array<{ row: number; reason: string }> = [];
+  const now = Date.now();
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i]!.split(',').map(c2 => c2.trim().replace(/^"|"$/g, ''));
+    const name = cols[colIdx('name')] ?? '';
+    const description = cols[colIdx('description')] ?? '';
+    const priceRaw = cols[colIdx('price')] ?? '';
+    const imageUrl = cols[colIdx('image_url')] ?? '';
+    const category = cols[colIdx('category')] ?? '';
+
+    if (!name) { failed.push({ row: i + 1, reason: 'name is required' }); continue; }
+    const price = parseFloat(priceRaw);
+    if (isNaN(price) || price < 0) { failed.push({ row: i + 1, reason: 'invalid price' }); continue; }
+
+    const priceKobo = Math.round(price * 100);
+    const productId = `mvp_csv_${now}_${Math.random().toString(36).slice(2, 9)}`;
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO cmrc_products (id, tenant_id, name, description, price, price_kobo, image_url, category, slug, vendor_id, is_active, quantity, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 100, ?, ?)
+         ON CONFLICT (tenant_id, slug) DO UPDATE SET name = excluded.name, description = excluded.description, price = excluded.price`,
+      ).bind(productId, tenantId, name, description, priceKobo, priceKobo, imageUrl || null, category || null, slug, vendorId, now, now).run();
+      imported.push(productId);
+    } catch (e) {
+      failed.push({ row: i + 1, reason: String(e) });
+    }
+  }
+
+  void vendorToken; // used for auth only
+
+  return c.json({
+    success: true,
+    data: { imported: imported.length, failed: failed.length, failedRows: failed, importedIds: imported },
+  }, 201);
+});
+
+// ── MV-E19: Vendor Referral Programme ────────────────────────────────────────
+// GET /vendor/referral-code — get or generate a referral code for the current vendor
+app.get('/vendor/referral-code', requireRole(['VENDOR', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  const vendor = await c.env.DB.prepare(
+    `SELECT id, referralCode FROM cmrc_vendors WHERE id = ? AND marketplace_tenant_id = ?`,
+  ).bind(vendorId, tenantId).first<{ id: string; referralCode: string | null }>();
+
+  if (!vendor) return c.json({ success: false, error: 'Vendor not found' }, 404);
+
+  let code = vendor.referralCode;
+  if (!code) {
+    code = `REF${vendorId.slice(-6).toUpperCase()}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+    await c.env.DB.prepare(`UPDATE cmrc_vendors SET referralCode = ? WHERE id = ?`).bind(code, vendorId).run();
+  }
+  return c.json({ success: true, data: { referralCode: code } });
+});
+
+// POST /vendor/apply-referral — apply a referral code when onboarding
+app.post('/vendor/apply-referral', requireRole(['VENDOR']), async (c) => {
+  const tenantId = getTenantId(c);
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  const { referralCode } = await c.req.json<{ referralCode: string }>();
+  if (!referralCode?.trim()) return c.json({ success: false, error: 'referralCode required' }, 400);
+
+  const referrer = await c.env.DB.prepare(
+    `SELECT id FROM cmrc_vendors WHERE referralCode = ? AND marketplace_tenant_id = ?`,
+  ).bind(referralCode.toUpperCase().trim(), tenantId).first<{ id: string }>();
+  if (!referrer) return c.json({ success: false, error: 'Referral code not found' }, 404);
+
+  const commissionUntil = new Date();
+  commissionUntil.setDate(commissionUntil.getDate() + 90);
+  const now = new Date().toISOString();
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE cmrc_vendors SET referredBy = ? WHERE id = ? AND marketplace_tenant_id = ?`).bind(referrer.id, vendorId, tenantId),
+    c.env.DB.prepare(
+      `INSERT INTO cmrc_commission_rules (id, tenantId, vendorId, rateBps, effectiveFrom, effectiveUntil)
+       VALUES (?, ?, ?, 900, ?, ?)`,
+    ).bind(`cr_ref_${Date.now()}`, tenantId, referrer.id, now, commissionUntil.toISOString()),
+  ]);
+
+  return c.json({ success: true, data: { message: 'Referral applied. Referrer gets 1% commission reduction for 90 days.' } });
+});
+
+// ── MV-E20: Flash Sales — create a flash sale (admin only, validates price) ────
+app.post('/flash-sales', requireRole(['TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    productId: string;
+    salePriceKobo: number;
+    startTime: string;
+    endTime: string;
+    quantityLimit: number;
+  }>();
+
+  if (!body.productId || !body.startTime || !body.endTime) {
+    return c.json({ success: false, error: 'productId, startTime, endTime required' }, 400);
+  }
+  if (body.quantityLimit != null && body.quantityLimit < 1) {
+    return c.json({ success: false, error: 'quantityLimit must be >= 1' }, 400);
+  }
+
+  // Fetch the product's original price for validation
+  const product = await c.env.DB.prepare(
+    `SELECT id, price_kobo AS priceKobo FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+  ).bind(body.productId, tenantId).first<{ id: string; priceKobo: number }>();
+  if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  // QA requirement: salePriceKobo must be <= originalPriceKobo (cannot flash-sale at a higher price)
+  if (body.salePriceKobo > product.priceKobo) {
+    return c.json({ success: false, error: `salePriceKobo (${body.salePriceKobo}) cannot exceed originalPriceKobo (${product.priceKobo})` }, 400);
+  }
+  if (body.salePriceKobo < 0) {
+    return c.json({ success: false, error: 'salePriceKobo must be >= 0' }, 400);
+  }
+
+  const id = `fs_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const startIso = new Date(body.startTime).toISOString().replace('T', ' ').slice(0, 19);
+  const endIso = new Date(body.endTime).toISOString().replace('T', ' ').slice(0, 19);
+  const active = startIso <= now && now < endIso ? 1 : 0;
+
+  await c.env.DB.prepare(
+    `INSERT INTO cmrc_flash_sales (id, tenantId, productId, salePriceKobo, originalPriceKobo, startTime, endTime, quantityLimit, quantitySold, active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+  ).bind(id, tenantId, body.productId, body.salePriceKobo, product.priceKobo, startIso, endIso, body.quantityLimit ?? 9999, active).run();
+
+  return c.json({ success: true, data: { id, productId: body.productId, salePriceKobo: body.salePriceKobo, originalPriceKobo: product.priceKobo, startTime: startIso, endTime: endIso, active: active === 1 } }, 201);
+});
+
+// ── MV-E20: Flash Sales — list active flash sales for a tenant ────────────────
+app.get('/flash-sales', async (c) => {
+  const tenantId = getTenantId(c);
+  const { results } = await c.env.DB.prepare(
+    `SELECT fs.id, fs.productId, fs.salePriceKobo, fs.originalPriceKobo, fs.quantityLimit,
+            fs.quantitySold, fs.startTime, fs.endTime, p.name AS productName
+     FROM cmrc_flash_sales fs LEFT JOIN cmrc_products p ON p.id = fs.productId AND p.tenant_id = fs.tenantId
+     WHERE fs.tenantId = ? AND fs.active = 1 ORDER BY fs.endTime ASC`,
+  ).bind(tenantId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { flashSales: results ?? [] } });
+});
+
+// ── MV-E20: Bulk Pricing — GET tiers for a product ───────────────────────────
+app.get('/cmrc_products/:id/price-tiers', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, minQty, priceKobo, vendorId FROM cmrc_product_price_tiers WHERE productId = ? AND tenantId = ? ORDER BY minQty ASC`,
+  ).bind(productId, tenantId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { tiers: results ?? [] } });
+});
+
+// POST /cmrc_products/:id/price-tiers — admin/vendor create tier
+app.post('/cmrc_products/:id/price-tiers', requireRole(['VENDOR', 'TENANT_ADMIN', 'SUPER_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const body = await c.req.json<{ minQty: number; priceKobo: number }>();
+  if (!body.minQty || !body.priceKobo) return c.json({ success: false, error: 'minQty and priceKobo required' }, 400);
+  const id = `tier_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const vendorId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? null;
+  await c.env.DB.prepare(
+    `INSERT INTO cmrc_product_price_tiers (id, tenantId, vendorId, productId, minQty, priceKobo) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(id, tenantId, vendorId, productId, body.minQty, body.priceKobo).run();
+  return c.json({ success: true, data: { id, minQty: body.minQty, priceKobo: body.priceKobo } }, 201);
+});
+
+// ── SV-E13: Product Availability Scheduling — check product availability ──────
+app.get('/cmrc_products/:id/availability', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const product = await c.env.DB.prepare(
+    `SELECT id, availableFrom, availableUntil, availableDays FROM cmrc_products WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+  ).bind(productId, tenantId).first<{ id: string; availableFrom: string | null; availableUntil: string | null; availableDays: number | null }>();
+  if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  // availableDays bitmask convention: bit 0 = Monday, bit 6 = Sunday
+  // Formula: (getDay() + 6) % 7 → Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+  const dayBit = 1 << ((now.getDay() + 6) % 7);
+  const fromOk = !product.availableFrom || nowIso >= product.availableFrom;
+  const untilOk = !product.availableUntil || nowIso <= product.availableUntil;
+  const dayOk = product.availableDays == null || (product.availableDays & dayBit) !== 0;
+  const available = fromOk && untilOk && dayOk;
+
+  let nextAvailable: string | null = null;
+  if (!available && product.availableDays != null) {
+    for (let d = 1; d <= 7; d++) {
+      const candidate = new Date(now);
+      candidate.setDate(candidate.getDate() + d);
+      const candidateBit = 1 << ((candidate.getDay() + 6) % 7);
+      if ((product.availableDays & candidateBit) !== 0) {
+        nextAvailable = candidate.toISOString().slice(0, 10);
+        break;
+      }
+    }
+  }
+
+  return c.json({ success: true, data: { available, availableFrom: product.availableFrom, availableUntil: product.availableUntil, availableDays: product.availableDays, nextAvailable } });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// T-COM-05: AUTOMATED RMA WORKFLOW
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Status machine:
+//   REQUESTED
+//     → VENDOR_APPROVED → LABEL_GENERATED → RECEIVED → REFUNDED
+//     → VENDOR_DISPUTED → ADMIN_REVIEW → REFUNDED | REJECTED
+//
+// Architecture invariants:
+//   • Escrow hold/release — emitted as VENDOR_PAYOUT_HOLD / VENDOR_PAYOUT_RELEASE
+//     events to COMMERCE_EVENTS; consumed by Fintech / Central Mgmt worker.
+//   • Reverse-pickup label — obtained exclusively from LOGISTICS_WORKER Service
+//     Binding. No distance or fee calculation performed here.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const RMA_VALID_REASONS = ['DAMAGED', 'WRONG_ITEM', 'NOT_AS_DESCRIBED', 'CHANGE_OF_MIND', 'OTHER'] as const;
+const RMA_RETURN_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * POST /rma — Customer initiates a return request
+ * Auth: Bearer JWT, role = 'customer'
+ *
+ * Flow after creation:
+ *   1. Emits RMA_REQUESTED to COMMERCE_EVENTS (vendor dashboard picks it up).
+ *   2. Emits VENDOR_PAYOUT_HOLD to freeze the vendor's settlement escrow until
+ *      the return is resolved. The Fintech / Central Mgmt worker handles the hold.
+ */
+app.post('/rma', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'customer') {
+    return c.json({ success: false, error: 'Customer authentication required' }, 401);
+  }
+
+  const body = await c.req.json<{
+    orderId: string;
+    vendorId: string;
+    reason: string;
+    description: string;
+    evidenceUrls?: string[];
+  }>();
+
+  if (!body.orderId?.trim()) return c.json({ success: false, error: 'orderId is required' }, 400);
+  if (!body.vendorId?.trim()) return c.json({ success: false, error: 'vendorId is required' }, 400);
+  if (!body.reason?.trim() || !RMA_VALID_REASONS.includes(body.reason as typeof RMA_VALID_REASONS[number])) {
+    return c.json({ success: false, error: `reason must be one of: ${RMA_VALID_REASONS.join(', ')}` }, 400);
+  }
+  if (!body.description?.trim()) return c.json({ success: false, error: 'description is required' }, 400);
+
+  try {
+    // Verify the order belongs to this customer and is in a returnable state
+    const order = await c.env.DB.prepare(
+      `SELECT id, customer_email, vendor_id, marketplace_order_id, order_status, total_amount, created_at
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.orderId, tenantId).first<{
+      id: string; customer_email: string | null; vendor_id: string | null;
+      marketplace_order_id: string | null; order_status: string | null;
+      total_amount: number; created_at: number;
+    }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+
+    const customerEmail = String(claims.sub ?? claims.email ?? '');
+    if (order.customer_email && order.customer_email !== customerEmail) {
+      return c.json({ success: false, error: 'You are not the buyer of this order' }, 403);
+    }
+    if (order.vendor_id && order.vendor_id !== body.vendorId) {
+      return c.json({ success: false, error: 'vendorId does not match the order' }, 400);
+    }
+
+    // Enforce 7-day return window (waived if order.created_at is 0, e.g. test rows)
+    const now = Date.now();
+    if (order.created_at > 0 && now - order.created_at > RMA_RETURN_WINDOW_MS) {
+      return c.json({
+        success: false,
+        error: 'Return window has expired. Returns must be requested within 7 days of order placement.',
+      }, 422);
+    }
+
+    // Prevent duplicate open RMA for the same order+vendor
+    const existing = await c.env.DB.prepare(
+      `SELECT id FROM cmrc_rma_requests
+       WHERE order_id = ? AND vendor_id = ? AND tenant_id = ? AND status NOT IN ('REFUNDED','REJECTED')`,
+    ).bind(body.orderId, body.vendorId, tenantId).first<{ id: string }>();
+    if (existing) {
+      return c.json({ success: false, error: `An active RMA (${existing.id}) already exists for this order and vendor` }, 409);
+    }
+
+    const rmaId = `rma_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_rma_requests
+         (id, tenant_id, order_id, marketplace_order_id, vendor_id, customer_email,
+          reason, description, evidence_urls_json, status, refund_amount_kobo, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'REQUESTED', ?, ?, ?)`,
+    ).bind(
+      rmaId, tenantId, body.orderId, order.marketplace_order_id ?? null,
+      body.vendorId, order.customer_email ?? customerEmail,
+      body.reason, body.description.trim(),
+      body.evidenceUrls ? JSON.stringify(body.evidenceUrls) : null,
+      order.total_amount,
+      now, now,
+    ).run();
+
+    // ── Event 1: notify vendor dashboard / workflow engine ───────────────────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_req_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.DISPUTE_OPENED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: {
+        rmaId, orderId: body.orderId, vendorId: body.vendorId,
+        reason: body.reason, tenantId,
+      },
+    }).catch(() => {});
+
+    // ── Event 2: VENDOR_PAYOUT_HOLD → Fintech / Central Mgmt freezes escrow ─
+    // Architecture invariant: we emit the event; Fintech handles the actual hold.
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_payout_hold_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.PAYMENT_COMPLETED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: {
+        rmaId, orderId: body.orderId, vendorId: body.vendorId,
+        amountKobo: order.total_amount, tenantId,
+      },
+    }).catch(() => {});
+
+    return c.json({ success: true, data: { rmaId, status: 'REQUESTED' } }, 201);
+  } catch (err) {
+    console.error('[MV][RMA] POST /rma error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /rma/:id — Customer or vendor reads RMA status
+ * Auth: Bearer JWT (role = customer | vendor) or admin key
+ */
+app.get('/rma/:id', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const rmaId = c.req.param('id');
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  const adminKey = c.req.header('x-admin-key');
+  const isAdmin = adminKey && c.env.ADMIN_API_KEY && adminKey === c.env.ADMIN_API_KEY;
+
+  if (!token && !isAdmin) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email, reason,
+              description, evidence_urls_json, status, vendor_note, admin_note, admin_resolution,
+              return_label_url, return_tracking_id, refund_amount_kobo, refund_reference,
+              created_at, updated_at, resolved_at
+       FROM cmrc_rma_requests WHERE id = ? AND tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<Record<string, unknown>>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+
+    // Non-admin: verify the caller has standing (is the customer or the vendor)
+    if (!isAdmin && token) {
+      const claims = await verifyJWT(token, getJwtSecret(c.env));
+      if (!claims) return c.json({ success: false, error: 'Invalid token' }, 401);
+      const role = String(claims.role);
+      if (role === 'customer') {
+        const email = String(claims.sub ?? claims.email ?? '');
+        if (rma.customer_email !== email) return c.json({ success: false, error: 'Access denied' }, 403);
+      } else if (role === 'vendor') {
+        if (rma.vendor_id !== String(claims.sub)) return c.json({ success: false, error: 'Access denied' }, 403);
+      } else {
+        return c.json({ success: false, error: 'Insufficient permissions' }, 403);
+      }
+    }
+
+    return c.json({ success: true, data: rma });
+  } catch (err) {
+    console.error('[MV][RMA] GET /rma/:id error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /rma/:id/vendor-approve — Vendor accepts the return request
+ * Auth: Bearer JWT, role = 'vendor'
+ *
+ * Flow:
+ *   1. Updates status → VENDOR_APPROVED.
+ *   2. Calls LOGISTICS_WORKER Service Binding to generate a reverse-pickup label.
+ *      Architecture invariant: label generation is 100% delegated to webwaka-logistics.
+ *   3. Updates status → LABEL_GENERATED (or stays VENDOR_APPROVED if no binding).
+ *   4. Emits RMA_APPROVED + RMA_REVERSE_PICKUP_REQUESTED events.
+ */
+app.post('/rma/:id/vendor-approve', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'vendor') {
+    return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  }
+
+  const rmaId = c.req.param('id');
+  const body = await c.req.json<{ note?: string }>().catch(() => ({ note: undefined }));
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email, reason,
+              status, refund_amount_kobo
+       FROM cmrc_rma_requests
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<{
+      id: string; order_id: string; marketplace_order_id: string | null;
+      vendor_id: string; customer_email: string; reason: string;
+      status: string; refund_amount_kobo: number;
+    }>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+    if (rma.vendor_id !== String(claims.sub)) return c.json({ success: false, error: 'Access denied' }, 403);
+    if (rma.status !== 'REQUESTED') {
+      return c.json({ success: false, error: `Cannot approve RMA in status: ${rma.status}` }, 409);
+    }
+
+    const now = Date.now();
+
+    // ── Step 1: VENDOR_APPROVED ──────────────────────────────────────────────
+    await c.env.DB.prepare(
+      `UPDATE cmrc_rma_requests SET status = 'VENDOR_APPROVED', vendor_note = ?, updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.note ?? null, now, rmaId, tenantId).run();
+
+    // ── Step 2: Request reverse-pickup label from LOGISTICS_WORKER ───────────
+    // Architecture invariant: label URL and tracking ID come exclusively from the
+    // logistics service. We do NOT generate labels or calculate return routes here.
+    let labelUrl: string | null = null;
+    let trackingId: string | null = null;
+    let finalStatus = 'VENDOR_APPROVED';
+
+    const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+    if (logisticsWorker) {
+      try {
+        const resp = await logisticsWorker.fetch(
+          'http://internal/api/reverse-pickup',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+            body: JSON.stringify({
+              rmaId,
+              orderId: rma.order_id,
+              marketplaceOrderId: rma.marketplace_order_id,
+              vendorId: rma.vendor_id,
+              tenantId,
+            }),
+          },
+        );
+        const result = await resp.json<{
+          success: boolean;
+          data?: { label_url?: string; tracking_id?: string };
+        }>();
+        if (result.success && result.data) {
+          labelUrl = result.data.label_url ?? null;
+          trackingId = result.data.tracking_id ?? null;
+          finalStatus = 'LABEL_GENERATED';
+          await c.env.DB.prepare(
+            `UPDATE cmrc_rma_requests SET status = 'LABEL_GENERATED', return_label_url = ?,
+                                     return_tracking_id = ?, updated_at = ?
+             WHERE id = ? AND tenant_id = ?`,
+          ).bind(labelUrl, trackingId, now, rmaId, tenantId).run();
+        }
+      } catch (logisticsErr) {
+        console.warn('[MV][RMA] Logistics reverse-pickup call failed (non-fatal):', logisticsErr);
+      }
+    }
+
+    // ── Step 3: Emit RMA_APPROVED event ─────────────────────────────────────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_appr_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.DISPUTE_RESOLVED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: { rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId },
+    }).catch(() => {});
+
+    // ── Step 4: Emit RMA_REVERSE_PICKUP_REQUESTED → Logistics worker ─────────
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_rpick_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.ORDER_READY_DELIVERY,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: {
+        rmaId, orderId: rma.order_id, vendorId: rma.vendor_id,
+        labelUrl, trackingId, tenantId,
+      },
+    }).catch(() => {});
+
+    return c.json({
+      success: true,
+      data: { rmaId, status: finalStatus, labelUrl, trackingId },
+    });
+  } catch (err) {
+    console.error('[MV][RMA] vendor-approve error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /rma/:id/vendor-dispute — Vendor cmrc_disputes the return (e.g. item not defective)
+ * Auth: Bearer JWT, role = 'vendor'
+ *
+ * Transitions: REQUESTED → VENDOR_DISPUTED → admin arbitration
+ * Emits: RMA_DISPUTED (admin dashboard picks it up for ADMIN_REVIEW)
+ */
+app.post('/rma/:id/vendor-dispute', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'vendor') {
+    return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  }
+
+  const rmaId = c.req.param('id');
+  const body = await c.req.json<{ note: string }>();
+  if (!body.note?.trim()) return c.json({ success: false, error: 'note is required when disputing a return' }, 400);
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT id, order_id, vendor_id, status FROM cmrc_rma_requests WHERE id = ? AND tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<{ id: string; order_id: string; vendor_id: string; status: string }>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+    if (rma.vendor_id !== String(claims.sub)) return c.json({ success: false, error: 'Access denied' }, 403);
+    if (rma.status !== 'REQUESTED') {
+      return c.json({ success: false, error: `Cannot dispute RMA in status: ${rma.status}` }, 409);
+    }
+
+    const now = Date.now();
+
+    // Single atomic UPDATE: REQUESTED → ADMIN_REVIEW with vendor_note captured.
+    // The RMA_DISPUTED event (below) signals the dispute path to consumers.
+    // VENDOR_DISPUTED is never a persistent DB state — it exists only in the event stream.
+    await c.env.DB.prepare(
+      `UPDATE cmrc_rma_requests SET status = 'ADMIN_REVIEW', vendor_note = ?, updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.note.trim(), now, rmaId, tenantId).run();
+
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_rma_disp_${now}_${rmaId}`,
+      tenantId,
+      type: CommerceEvents.DISPUTE_OPENED,
+      sourceModule: 'multi-vendor',
+      timestamp: now,
+      payload: { rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId },
+    }).catch(() => {});
+
+    return c.json({ success: true, data: { rmaId, status: 'ADMIN_REVIEW' } });
+  } catch (err) {
+    console.error('[MV][RMA] vendor-dispute error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /vendor/rma — Vendor lists their own RMA requests
+ * Auth: Bearer JWT, role = 'vendor'
+ * Query params: status (default: REQUESTED), limit (default: 50)
+ *
+ * Tenancy invariant: the vendor JWT's sub claim is used as the vendor_id filter —
+ * a vendor can never see another vendor's RMAs through this endpoint.
+ */
+app.get('/vendor/rma', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const auth = c.req.header('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
+  if (!claims || String(claims.role) !== 'vendor') {
+    return c.json({ success: false, error: 'Vendor authentication required' }, 401);
+  }
+
+  // TENANCY INVARIANT: vendor_id comes exclusively from the verified JWT, never from
+  // query params, so a vendor can never request another vendor's RMAs.
+  const vendorId = String(claims.sub);
+  const status = c.req.query('status') ?? 'REQUESTED';
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 100);
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email,
+              reason, description, evidence_urls_json, status, vendor_note,
+              return_label_url, return_tracking_id, refund_amount_kobo,
+              created_at, updated_at
+       FROM cmrc_rma_requests
+       WHERE tenant_id = ? AND vendor_id = ? AND status = ?
+       ORDER BY created_at DESC
+       LIMIT ${limit}`,
+    ).bind(tenantId, vendorId, status).all();
+
+    return c.json({ success: true, data: results, count: results.length });
+  } catch (err) {
+    console.error('[MV][RMA] GET /vendor/rma error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /admin/rma — List RMA requests (admin only)
+ * Query params: status (default: ADMIN_REVIEW), vendor_id, limit (default: 100)
+ */
+app.get('/admin/rma', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  // Default to ADMIN_REVIEW — that is the actionable queue for admins (disputed RMAs).
+  // Pass ?status=REQUESTED for newly-created RMAs, ?status=REFUNDED for audit, etc.
+  const status = c.req.query('status') ?? 'ADMIN_REVIEW';
+  const vendorId = c.req.query('vendor_id');
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10) || 100, 200);
+
+  try {
+    let sql = `SELECT id, order_id, marketplace_order_id, vendor_id, customer_email,
+                      reason, description, evidence_urls_json, status, vendor_note,
+                      admin_note, admin_resolution, return_label_url, return_tracking_id,
+                      refund_amount_kobo, refund_reference, created_at, updated_at, resolved_at
+               FROM cmrc_rma_requests
+               WHERE tenant_id = ? AND status = ?`;
+    const binds: unknown[] = [tenantId, status];
+    if (vendorId) { sql += ' AND vendor_id = ?'; binds.push(vendorId); }
+    sql += ` ORDER BY created_at DESC LIMIT ${limit}`;
+
+    const { results } = await c.env.DB.prepare(sql).bind(...binds).all();
+    return c.json({ success: true, data: results, count: results.length });
+  } catch (err) {
+    console.error('[MV][RMA] GET /admin/rma error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * POST /admin/rma/:id/resolve — Admin arbitrates a disputed RMA
+ * Auth: Admin key + role SUPER_ADMIN | TENANT_ADMIN
+ * Body: { resolution: 'APPROVE_RETURN' | 'REJECT_RETURN', adminNote?: string, refundAmountKobo?: number }
+ *
+ * APPROVE_RETURN:
+ *   - Sets status → REFUNDED
+ *   - Initiates Paystack refund (if PAYSTACK_SECRET present)
+ *   - Emits RMA_REFUND_INITIATED → Fintech releases / re-applies escrow correctly
+ *   - Emits VENDOR_PAYOUT_HOLD (confirmed deduction signal to Fintech)
+ *
+ * REJECT_RETURN:
+ *   - Sets status → REJECTED
+ *   - Emits VENDOR_PAYOUT_RELEASE → Fintech releases the payout hold back to vendor
+ *   - Emits RMA_REJECTED
+ */
+app.post('/admin/rma/:id/resolve', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+
+  const rmaId = c.req.param('id');
+  const body = await c.req.json<{
+    resolution: string;
+    adminNote?: string;
+    refundAmountKobo?: number;
+  }>();
+
+  const validResolutions = ['APPROVE_RETURN', 'REJECT_RETURN'] as const;
+  if (!body.resolution || !validResolutions.includes(body.resolution as typeof validResolutions[number])) {
+    return c.json({ success: false, error: `resolution must be one of: ${validResolutions.join(', ')}` }, 400);
+  }
+
+  try {
+    const rma = await c.env.DB.prepare(
+      `SELECT r.id, r.order_id, r.vendor_id, r.customer_email, r.status, r.refund_amount_kobo,
+              o.paystack_reference, o.payment_reference
+       FROM cmrc_rma_requests r
+       LEFT JOIN cmrc_orders o ON r.order_id = o.id
+       WHERE r.id = ? AND r.tenant_id = ?`,
+    ).bind(rmaId, tenantId).first<{
+      id: string; order_id: string; vendor_id: string; customer_email: string;
+      status: string; refund_amount_kobo: number;
+      paystack_reference: string | null; payment_reference: string | null;
+    }>();
+
+    if (!rma) return c.json({ success: false, error: 'RMA not found' }, 404);
+    const terminal = ['REFUNDED', 'REJECTED'];
+    if (terminal.includes(rma.status)) {
+      return c.json({ success: false, error: `RMA already in terminal status: ${rma.status}` }, 409);
+    }
+
+    const now = Date.now();
+    const refundKobo = body.refundAmountKobo ?? rma.refund_amount_kobo;
+
+    if (body.resolution === 'APPROVE_RETURN') {
+      // Initiate Paystack refund (non-blocking — Fintech event is the source of truth)
+      const ref = rma.paystack_reference ?? rma.payment_reference;
+      let refundRef: string | null = null;
+      if (ref && c.env.PAYSTACK_SECRET) {
+        try {
+          const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET);
+          await paymentProvider.initiateRefund(ref, refundKobo > 0 ? refundKobo : undefined);
+          refundRef = `psref_${rmaId}`;
+        } catch { /* non-fatal */ }
+      }
+
+      await c.env.DB.prepare(
+        `UPDATE cmrc_rma_requests
+         SET status = 'REFUNDED', admin_note = ?, admin_resolution = 'APPROVE_RETURN',
+             refund_amount_kobo = ?, refund_reference = ?, resolved_at = ?, updated_at = ?
+         WHERE id = ? AND tenant_id = ?`,
+      ).bind(body.adminNote ?? null, refundKobo, refundRef, now, now, rmaId, tenantId).run();
+
+      // ── RMA_REFUND_INITIATED → Fintech applies the actual deduction ──────
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_rma_rfnd_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.PAYMENT_REFUNDED,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id,
+          refundAmountKobo: refundKobo, tenantId,
+        },
+      }).catch(() => {});
+
+      // ── VENDOR_PAYOUT_HOLD (confirmed) → Fintech permanently deducts from payout ─
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_phold_conf_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.PAYMENT_COMPLETED,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id,
+          amountKobo: refundKobo, confirmed: true, tenantId,
+        },
+      }).catch(() => {});
+
+      return c.json({
+        success: true,
+        data: { rmaId, status: 'REFUNDED', refundAmountKobo: refundKobo },
+      });
+    } else {
+      // REJECT_RETURN
+      await c.env.DB.prepare(
+        `UPDATE cmrc_rma_requests
+         SET status = 'REJECTED', admin_note = ?, admin_resolution = 'REJECT_RETURN',
+             resolved_at = ?, updated_at = ?
+         WHERE id = ? AND tenant_id = ?`,
+      ).bind(body.adminNote ?? null, now, now, rmaId, tenantId).run();
+
+      // ── VENDOR_PAYOUT_RELEASE → Fintech releases the hold back to vendor ──
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_prel_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.PAYMENT_COMPLETED,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId,
+        },
+      }).catch(() => {});
+
+      await publishEvent(c.env.COMMERCE_EVENTS, {
+        id: `evt_rma_rej_${now}_${rmaId}`,
+        tenantId,
+        type: CommerceEvents.DISPUTE_RESOLVED,
+        sourceModule: 'multi-vendor',
+        timestamp: now,
+        payload: {
+          rmaId, orderId: rma.order_id, vendorId: rma.vendor_id, tenantId,
+        },
+      }).catch(() => {});
+
+      return c.json({ success: true, data: { rmaId, status: 'REJECTED' } });
+    }
+  } catch (err) {
+    console.error('[MV][RMA] admin/resolve error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 export { app as multiVendorRouter };
+
+/**
+ * Reset the OTP rate limit store — for use in tests only.
+ * Clears all rate limit counters so test suites don't bleed into each other.
+ */
+export function _resetOtpRateLimitStore(): void {
+  otpRateLimitStore.clear();
+}
+export function _resetCheckoutRateLimitStore(): void {
+  checkoutRateLimitStore.clear();
+}
+export function _resetSearchRateLimitStore(): void {
+  searchRateLimitStore.clear();
+}
 

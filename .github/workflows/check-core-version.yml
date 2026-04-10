@@ -1,0 +1,79 @@
+name: Check @webwaka/core Version Consistency
+
+on:
+  push:
+    paths:
+      - "package.json"
+      - "**/package.json"
+  pull_request:
+    paths:
+      - "package.json"
+      - "**/package.json"
+
+jobs:
+  check-core-version:
+    name: "@webwaka/core version consistency"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch latest published @webwaka/core version
+        id: latest
+        run: |
+          LATEST=$(curl -s https://registry.npmjs.org/@webwaka/core/latest | python3 -c "import json,sys; print(json.load(sys.stdin)[\"version\"])")
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest @webwaka/core on npm: $LATEST"
+
+      - name: Check package.json pins
+        run: |
+          LATEST="${{ steps.latest.outputs.latest }}"
+          FAIL=0
+
+          check_pkg() {
+            local file=$1
+            if [ ! -f "$file" ]; then return; fi
+
+            VERSION=$(python3 -c "
+          import json
+          with open(\"$file\") as f:
+              pkg = json.load(f)
+          deps = {**pkg.get(\"dependencies\",{}), **pkg.get(\"devDependencies\",{})}
+          print(deps.get(\"@webwaka/core\", \"NOT_FOUND\"))
+          ")
+            if [ "$VERSION" = "NOT_FOUND" ]; then
+              echo "ℹ️  $file: @webwaka/core not listed (may be intentional)"
+              return
+            fi
+            if [[ "$VERSION" == github:* ]] || [[ "$VERSION" == file:* ]]; then
+              echo "❌ $file: @webwaka/core uses non-registry ref: $VERSION"
+              FAIL=1
+              return
+            fi
+            PIN="${VERSION#^}"
+            PIN="${PIN#~}"
+            MAJOR_LATEST=$(echo $LATEST | cut -d. -f1)
+            MINOR_LATEST=$(echo $LATEST | cut -d. -f2)
+            MAJOR_PIN=$(echo $PIN | cut -d. -f1)
+            MINOR_PIN=$(echo $PIN | cut -d. -f2)
+            if [ "$MAJOR_PIN" != "$MAJOR_LATEST" ] || [ "$MINOR_PIN" != "$MINOR_LATEST" ]; then
+              echo "⚠️  $file: @webwaka/core is $VERSION (latest minor: $LATEST)"
+              FAIL=1
+            else
+              echo "✅ $file: @webwaka/core $VERSION is current"
+            fi
+          }
+
+          check_pkg "package.json"
+          for f in packages/*/package.json apps/*/package.json workers/package.json frontend/package.json; do
+            check_pkg "$f"
+          done
+
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "❌ One or more package.json files have stale or non-registry @webwaka/core pins."
+            echo "   Please upgrade to ^$LATEST"
+            exit 1
+          else
+            echo ""
+            echo "✅ All @webwaka/core pins are current."
+          fi

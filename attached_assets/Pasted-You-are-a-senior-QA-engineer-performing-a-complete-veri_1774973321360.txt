@@ -1,0 +1,105 @@
+You are a senior QA engineer performing a complete verification of Phase P07 (Core Merchant Operations) in the webwaka-commerce repository.
+
+This phase covers financial and inventory operations. Verify every computation, every DB write, and every edge case.
+
+## Step 1 — Read Everything First
+Read completely:
+- src/modules/pos/api.ts
+- src/modules/pos/ui.tsx
+- src/modules/pos/useBackgroundSync.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/multi-vendor/ui.tsx
+- src/modules/admin/ui.tsx
+- src/core/offline/db.ts
+- migrations/0006_returns.sql (or equivalent)
+
+## Step 2 — Verify Partial Returns API (P07-T01)
+- [ ] order_returns table exists in migration: id, tenantId, originalOrderId, returnedItems (JSON), returnMethod, creditAmountKobo, status, createdAt
+- [ ] returnMethod has CHECK IN ('CASH', 'STORE_CREDIT', 'EXCHANGE')
+- [ ] stock_adjustment_log table exists: id, tenantId, productId, previousQty, newQty, delta, reason, sessionId, createdAt
+- [ ] POST /api/pos/orders/:id/return endpoint exists
+- [ ] Requires authentication (STAFF or ADMIN role)
+- [ ] Validates: order exists and belongs to tenantId
+- [ ] Validates: return quantity for each item <= quantity in original order (prevents over-returning)
+- [ ] D1 batch transaction: inventory is incremented atomically for returned items
+- [ ] If returnMethod = 'STORE_CREDIT': customers.creditBalanceKobo is incremented
+- [ ] INSERT into order_returns after successful batch
+- [ ] CommerceEvents.INVENTORY_UPDATED published for each returned product
+- [ ] Returns { success: true, creditAmountKobo, returnId }
+- [ ] EDGE CASE: attempting to return items not in the original order returns HTTP 422 — NOT 500
+
+## Step 3 — Verify Offline Customer Cache (P07-T02)
+- [ ] GET /api/pos/customers/top endpoint exists — returns top 200 customers ordered by lastPurchaseAt DESC
+- [ ] Response includes: id, tenantId, name, phone, creditBalanceKobo, loyaltyPoints (or equivalent field)
+- [ ] In src/modules/pos/useBackgroundSync.ts: syncCustomerCache(tenantId) is called after mutation flush
+- [ ] syncCustomerCache fetches /api/pos/customers/top and calls db.table('customers').bulkPut(customers)
+- [ ] In src/modules/pos/ui.tsx: customer lookup queries Dexie 'customers' table first
+- [ ] Dexie query uses phone startsWith or name startsWith matching
+- [ ] If Dexie returns results: uses them (does NOT make a network call when offline)
+- [ ] If Dexie is empty AND online: falls back to network fetch
+- [ ] loyaltyPoints column exists on customers table (verify in migration — add if missing)
+
+## Step 4 — Verify Stock Take Interface (P07-T03)
+- [ ] POST /api/pos/stock-adjustments endpoint exists
+- [ ] Requires ADMIN role
+- [ ] Accepts body: { sessionId, adjustments: [{productId, countedQuantity, reason}] }
+- [ ] reason must be one of: 'DAMAGE', 'THEFT', 'SUPPLIER_SHORT', 'CORRECTION'
+- [ ] For each adjustment: reads currentQty from D1, updates products.quantity = countedQuantity
+- [ ] For each adjustment: inserts into stock_adjustment_log with previousQty, newQty, delta, reason
+- [ ] For each adjustment: publishes CommerceEvents.STOCK_ADJUSTED and CommerceEvents.INVENTORY_UPDATED
+- [ ] Returns { adjusted: N, log: [...] }
+- [ ] In src/modules/pos/ui.tsx: StockTake modal exists (wrapped in RequireRole role='ADMIN')
+- [ ] Modal fetches all products, renders table with editable counted quantity
+- [ ] "Preview Changes" shows diff before submission
+- [ ] "Submit Stock Take" calls POST /api/pos/stock-adjustments
+- [ ] EDGE CASE: submitting zero adjustments returns success with adjusted:0 — does not error
+
+## Step 5 — Verify Offline Receipt Reprint (P07-T04)
+- [ ] "Recent Orders" tab exists in POS bottom navigation (admin only, behind RequireRole)
+- [ ] Tab reads from Dexie 'posReceipts' or 'orders' table (whichever stores completed orders)
+- [ ] Reads last 50 records ordered by createdAt DESC
+- [ ] Renders each as: order number, total, items count, date
+- [ ] "Print" button triggers window.print() with receipt content injected
+- [ ] "WhatsApp" button generates a wa.me share link with receipt summary
+- [ ] EDGE CASE: if Dexie posReceipts table is empty: shows empty state message, not a crash
+
+## Step 6 — Verify Cashier-Level Sales Reporting (P07-T05)
+- [ ] PATCH /api/pos/sessions/:id/close in api.ts: includes cashierBreakdown query
+- [ ] SQL groups by cashierId and computes: orderCount, revenueKobo, cashKobo, digitalKobo per cashier
+- [ ] cashierBreakdown is included in the response body (not just in shift_analytics insert)
+- [ ] orders table has cashierId column (verify in schema)
+- [ ] POST /api/pos/sessions/:id/checkout sets cashierId from JWT claim (not from request body — prevents spoofing)
+- [ ] EDGE CASE: a session where all orders have the same cashierId returns a breakdown array with one entry
+
+## Step 7 — Verify Commission Engine (P07-T06)
+- [ ] resolveCommissionRate(db, tenantId, vendorId, category) function exists in multi-vendor/api.ts
+- [ ] Tries vendor-specific rule first (commission_rules WHERE vendorId = ?)
+- [ ] Then tries category rule (commission_rules WHERE category = ? AND vendorId IS NULL)
+- [ ] Falls back to 1000 bps (10%) if no rule found
+- [ ] effectiveUntil is checked: rule only applies if effectiveUntil IS NULL OR effectiveUntil > NOW()
+- [ ] effectiveFrom is checked: rule only applies if effectiveFrom <= NOW()
+- [ ] Search for any hardcoded 0.1 or 0.10 commission multiplier in multi-vendor/api.ts — must not exist
+- [ ] In src/modules/admin/ui.tsx: Commission Management section exists with rule list and add form
+
+## Step 8 — Verify Vendor Ledger and Payout (P07-T07)
+- [ ] GET /api/multi-vendor/vendor/ledger endpoint exists (requireRole: VENDOR)
+- [ ] GET /api/multi-vendor/vendor/balance endpoint exists (requireRole: VENDOR)
+- [ ] POST /api/multi-vendor/vendor/payout-request endpoint exists (requireRole: VENDOR)
+- [ ] Balance calculation: SALE entries are credits; COMMISSION, PAYOUT, REFUND entries are debits
+- [ ] Payout request: minimum balance is ₦5,000 (500,000 kobo) — rejects if below
+- [ ] Payout uses createPaymentProvider(env.PAYSTACK_SECRET_KEY).initiateTransfer(...)
+- [ ] After payout: INSERT into vendor_ledger_entries with type 'PAYOUT'
+- [ ] After each vendor order payment: TWO entries are inserted: SALE (credit) and COMMISSION (debit)
+- [ ] balanceKobo on each ledger entry is a running total — verify it is computed correctly (not just the delta)
+- [ ] In MV vendor dashboard UI: balance cards exist, payout button is disabled below minimum, ledger table is paginated
+- [ ] EDGE CASE: vendor with zero balance cannot request payout — verify this is enforced both API-side and UI-side
+
+## Step 9 — TypeScript and Tests
+Run: npx tsc --noEmit — fix all errors.
+Run: npm test — fix all failures.
+
+## Step 10 — Fix All Issues
+Fix every issue found.
+
+## Step 11 — Completion Confirmation
+"P07 QA COMPLETE — Partial returns with inventory reversal and store credit, offline customer cache with Dexie sync, stock take UI and API, offline receipt reprint, cashier-level Z-reports, commission resolution from rules table, vendor ledger with running balance and payout via Paystack. All edge cases handled. TypeScript clean. Tests passing."

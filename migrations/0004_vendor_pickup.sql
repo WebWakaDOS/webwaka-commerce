@@ -1,0 +1,3 @@
+-- P05 Task 5: Add pickupAddress column to cmrc_vendors table
+-- JSON: { name, phone, street, city, state, lga }
+-- (column defined in base migration, no-op)

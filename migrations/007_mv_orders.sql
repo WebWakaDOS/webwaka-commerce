@@ -5,15 +5,15 @@
 
 -- ════════════════════════════════════════════════════════════════════════════
 -- MARKETPLACE ORDERS (Umbrella)
--- One marketplace_order groups N child orders (one per vendor).
--- Child orders remain in the existing `orders` table with marketplace_order_id set.
+-- One marketplace_order groups N child cmrc_orders (one per vendor).
+-- Child cmrc_orders remain in the existing `cmrc_orders` table with marketplace_order_id set.
 -- ════════════════════════════════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS marketplace_orders (
+CREATE TABLE IF NOT EXISTS cmrc_marketplace_orders (
   id                   TEXT PRIMARY KEY,                  -- mkp_ord_{ts}_{rand}
   tenant_id            TEXT NOT NULL,
   customer_email       TEXT,
   customer_phone       TEXT,
-  items_json           TEXT NOT NULL,                     -- all items across all vendors
+  items_json           TEXT NOT NULL,                     -- all items across all cmrc_vendors
   vendor_count         INTEGER NOT NULL DEFAULT 0,
   subtotal             INTEGER NOT NULL,                  -- kobo: sum of all vendor subtotals
   total_amount         INTEGER NOT NULL,                  -- kobo: subtotal (VAT added in MV-4)
@@ -30,24 +30,24 @@ CREATE TABLE IF NOT EXISTS marketplace_orders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mkp_orders_tenant
-  ON marketplace_orders(tenant_id, payment_status, created_at DESC);
+  ON cmrc_marketplace_orders(tenant_id, payment_status, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_mkp_orders_payment_ref
-  ON marketplace_orders(payment_reference);
+  ON cmrc_marketplace_orders(payment_reference);
 
--- ── Link child vendor orders back to the umbrella marketplace_order ───────────
-ALTER TABLE orders ADD COLUMN marketplace_order_id TEXT;    -- NULL for non-marketplace orders
+-- ── Link child vendor cmrc_orders back to the umbrella marketplace_order ───────────
+ALTER TABLE cmrc_orders ADD COLUMN marketplace_order_id TEXT;    -- NULL for non-marketplace cmrc_orders
 
 CREATE INDEX IF NOT EXISTS idx_orders_mkp_id
-  ON orders(marketplace_order_id)
+  ON cmrc_orders(marketplace_order_id)
   WHERE marketplace_order_id IS NOT NULL;
 
 -- ════════════════════════════════════════════════════════════════════════════
 -- CART SESSIONS — add vendor breakdown for marketplace carts
 -- ════════════════════════════════════════════════════════════════════════════
-ALTER TABLE cart_sessions ADD COLUMN vendor_breakdown_json TEXT; -- JSON: { vnd_xxx: { subtotal, item_count } }
-ALTER TABLE cart_sessions ADD COLUMN channel TEXT NOT NULL DEFAULT 'storefront'; -- storefront | marketplace
-ALTER TABLE cart_sessions ADD COLUMN customer_phone TEXT;
+ALTER TABLE cmrc_cart_sessions ADD COLUMN vendor_breakdown_json TEXT; -- JSON: { vnd_xxx: { subtotal, item_count } }
+ALTER TABLE cmrc_cart_sessions ADD COLUMN channel TEXT NOT NULL DEFAULT 'storefront'; -- storefront | marketplace
+ALTER TABLE cmrc_cart_sessions ADD COLUMN customer_phone TEXT;
 
 -- ════════════════════════════════════════════════════════════════════════════
 -- FTS5 FULL-TEXT SEARCH — Marketplace product catalog
@@ -72,17 +72,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(
 
 -- Cross-vendor catalog browsing (GET /catalog)
 CREATE INDEX IF NOT EXISTS idx_products_catalog
-  ON products(tenant_id, is_active, deleted_at, vendor_id, category);
+  ON cmrc_products(tenant_id, is_active, deleted_at, vendor_id, category);
 
 -- Category drill-down
 CREATE INDEX IF NOT EXISTS idx_products_category
-  ON products(tenant_id, category, is_active)
+  ON cmrc_products(tenant_id, category, is_active)
   WHERE deleted_at IS NULL;
 
 -- Marketplace cart lookups
 CREATE INDEX IF NOT EXISTS idx_carts_channel
-  ON cart_sessions(tenant_id, channel, expires_at);
+  ON cmrc_cart_sessions(tenant_id, channel, expires_at);
 
 -- Marketplace order vendor link
 CREATE INDEX IF NOT EXISTS idx_orders_channel_tenant
-  ON orders(tenant_id, channel, marketplace_order_id, created_at DESC);
+  ON cmrc_orders(tenant_id, channel, marketplace_order_id, created_at DESC);

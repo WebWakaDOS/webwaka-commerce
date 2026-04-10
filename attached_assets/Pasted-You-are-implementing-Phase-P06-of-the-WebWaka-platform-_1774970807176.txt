@@ -1,0 +1,97 @@
+You are implementing Phase P06 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase implements authentication hardening: cashier PIN enforcement for POS and WhatsApp MFA for Single-Vendor customer accounts.
+
+Read the following files fully before starting:
+- src/modules/pos/api.ts
+- src/modules/pos/ui.tsx
+- src/modules/single-vendor/api.ts
+- src/middleware/auth.ts
+- packages/webwaka-core/src/pin.ts (from Phase P01)
+
+## Tasks:
+
+### TASK 1 — Cashier PIN: Database Schema
+Create migration 0005_cashier_pin.sql:
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS cashierPinHash TEXT;
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS cashierPinSalt TEXT;
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS pinLockedUntil TEXT;
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS pinFailedAttempts INTEGER NOT NULL DEFAULT 0;
+(If a 'staff' table does not exist, check for 'users' table and apply to that instead)
+Apply: wrangler d1 execute webwaka-commerce-db --file=migrations/0005_cashier_pin.sql --env staging
+
+### TASK 2 — Cashier PIN: Admin Set-PIN Endpoint
+In src/modules/pos/api.ts:
+Add POST /api/pos/staff/:staffId/set-pin (requireRole: ADMIN):
+- Validate body: { pin: string } — must be 4-6 digits
+- Import hashPin from @webwaka/core
+- Call const { hash, salt } = await hashPin(body.pin)
+- UPDATE staff SET cashierPinHash = hash, cashierPinSalt = salt, pinFailedAttempts = 0, pinLockedUntil = NULL WHERE id = staffId AND tenantId = tenantId
+- Return { success: true }
+
+### TASK 3 — Cashier PIN: Enforce on Session Open
+In src/modules/pos/api.ts, in POST /api/pos/sessions:
+Before creating the session:
+1. Read cashierId from body
+2. Fetch staff record: cashierPinHash, cashierPinSalt, pinLockedUntil, pinFailedAttempts from D1
+3. If pinLockedUntil is set and is in the future: return HTTP 423 { error: 'account_locked', lockedUntil: pinLockedUntil }
+4. If cashierPinHash is NULL: allow session (PIN not yet set for this cashier — allow but log warning)
+5. Import verifyPin from @webwaka/core
+6. Call const valid = await verifyPin(body.pin, cashierPinHash, cashierPinSalt)
+7. If invalid:
+- Increment pinFailedAttempts in D1
+- If pinFailedAttempts >= 5: SET pinLockedUntil = (now + 30 minutes), notify manager via SMS using createSmsProvider
+- Return HTTP 401 { error: 'invalid_pin', attemptsRemaining: 5 - newCount }
+8. If valid: reset pinFailedAttempts to 0, proceed with session creation
+
+### TASK 4 — Cashier PIN: PIN Entry UI
+In src/modules/pos/ui.tsx:
+Add a PinEntryScreen component that renders:
+- A numeric keypad (digits 0-9, delete, submit)
+- A "••••••" display showing entered digits as dots
+- An error message area
+
+Display PinEntryScreen:
+- Before opening a session (user must enter PIN to open)
+- After 5 minutes of no POS interaction (inactivity lock):
+- Set an inactivity timer in useEffect that resets on any user event (click, keypress)
+- When timer fires: set a 'locked' state that shows PinEntryScreen as an overlay
+- On successful PIN: clear 'locked' state and resume
+
+### TASK 5 — WhatsApp MFA for SV Customer Login
+In src/modules/single-vendor/api.ts:
+
+Replace or extend POST /api/single-vendor/auth/login:
+1. Accept: { phone: string, deviceId?: string }
+2. Check trusted device: look up KV key 'trusted_device:sv:${phone}:${deviceId}'. If found and not expired: issue JWT directly (skip OTP).
+3. Generate 6-digit OTP: Math.floor(100000 + Math.random() * 900000).toString()
+4. Store in KV: key = 'otp:sv:${phone}', value = OTP, TTL = 600 seconds (10 minutes)
+5. Use checkRateLimit from @webwaka/core to limit OTP sends to 5 per phone per 60 minutes
+6. Send via createSmsProvider(env.TERMII_API_KEY).sendOtp(phone, `Your WebWaka code: ${otp}`, 'whatsapp')
+7. Return { otpSent: true, channel: 'whatsapp' }
+
+Add POST /api/single-vendor/auth/verify-otp:
+1. Accept: { phone: string, otp: string, deviceId?: string }
+2. Read stored OTP from KV: 'otp:sv:${phone}'
+3. If not found or doesn't match: return HTTP 401 { error: 'invalid_otp' }
+4. If valid: delete KV key, issue JWT
+5. If deviceId provided: store 'trusted_device:sv:${phone}:${deviceId}' in KV with TTL = 30 days
+6. Return { token: jwtString }
+
+### TASK 6 — Role-Based UI: Wire UserContext
+In src/app.tsx:
+Create UserContext: React.createContext<{ userId: string; role: string; tenantId: string } | null>(null)
+On app load: read JWT from sessionStorage. Decode (without verifying — verification happens on server) to extract { userId, role, tenantId }. Provide through UserContext.Provider.
+Export a useUser hook: () => useContext(UserContext)
+
+In src/modules/pos/ui.tsx:
+Import useUser and RequireRole.
+Apply RequireRole wrapping as specified in Phase P03-T04.
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Manual test: attempt to open POS session without PIN — should be rejected if PIN is set
+4. Manual test: enter wrong PIN 5 times — account should lock for 30 minutes
+5. Manual test: SV customer login sends WhatsApp OTP (check Termii dashboard in staging)
+```

@@ -39,13 +39,13 @@ jobs:
           cache: 'npm'
       - name: Install dependencies
         run: npm ci
-      - name: Apply D1 Migrations (Staging)
+      - name: Apply D1 Migrations (Staging) — all files in order
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: d1 execute webwaka-commerce-db-staging --env staging --file migrations/001_commerce_schema.sql --remote
-      - name: Deploy Workers to Staging
+          command: d1 migrations apply webwaka-staging-db --env staging --remote
+      - name: Deploy Worker to Staging
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -54,10 +54,12 @@ jobs:
       - name: Verify API health (Staging)
         run: |
           sleep 15
-          curl -sf https://webwaka-commerce-api-staging.webwaka.workers.dev/health || echo "Health check pending..."
+          curl -sf https://webwaka-commerce-api-staging.webwaka.workers.dev/health \
+            && echo "✅ Staging health OK" \
+            || echo "⚠️  Health check pending..."
 
   # ============================================================================
-  # PWA DEPLOY (Staging)
+  # PWA DEPLOY (Staging — Cloudflare Pages)
   # ============================================================================
   deploy-pages-staging:
     name: Deploy PWA to Cloudflare Pages (Staging)

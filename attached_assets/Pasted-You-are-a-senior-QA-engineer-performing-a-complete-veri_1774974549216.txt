@@ -1,0 +1,65 @@
+You are a senior QA engineer performing a complete verification of Phase P08 (KYC Provider Concrete Implementations) in the @webwaka/core package.
+
+KYC handles sensitive identity data. Verify every field, every API call, every error case, and that no raw identity data is logged.
+
+## Step 1 — Read Everything First
+Read completely:
+- packages/webwaka-core/src/kyc.ts
+- packages/webwaka-core/src/index.ts
+- packages/webwaka-core/package.json
+
+## Step 2 — Verify SmileIdentityProvider (P08-T01, P08-T02)
+- [ ] SmileIdentityProvider class exported from kyc.ts
+- [ ] Implements IKycProvider interface (all 3 methods: verifyBvn, verifyNin, verifyCac)
+- [ ] Constructor accepts: partnerId (string), apiKey (string), environment ('sandbox'|'production')
+- [ ] Base URL switches based on environment: production = 'https://api.smileidentity.com/v1', sandbox = 'https://testapi.smileidentity.com/v1'
+- [ ] verifyBvn sends POST request with id_type: 'BVN' and country: 'NG'
+- [ ] verifyBvn returns verified:true when ResultCode is '1012'
+- [ ] verifyBvn parses ConfidenceValue into matchScore (number 0-100)
+- [ ] verifyNin sends POST request with id_type: 'NIN' (no dob field)
+- [ ] All methods handle network errors gracefully: returns { verified: false, reason: 'provider_error', provider: 'smile_identity' } — does NOT throw
+- [ ] CRITICAL: No raw BVN, NIN, or personal data is logged anywhere in these functions
+
+## Step 3 — Verify CAC Verification (P08-T02, P08-T03)
+- [ ] verifyCac sends POST to https://api.prembly.com/identitypass/verification/cac
+- [ ] Request headers include x-api-key and app-id
+- [ ] RC number is sent in request body as rc_number
+- [ ] Business name match check: data.company_name.toLowerCase().includes(businessName.toLowerCase())
+- [ ] Returns verified:true only if API status is OK AND name matches
+- [ ] Returns verified:false if API fails, with reason from API response
+- [ ] provider field in result is 'prembly' (not 'smile_identity')
+- [ ] Error handling: network failure returns { verified: false, reason: 'provider_error', provider: 'prembly' }
+
+## Step 4 — Verify Factory Function (P08-T04)
+- [ ] createKycProvider factory function exported
+- [ ] Accepts: smilePartnerId, smileApiKey, premblyApiKey, premblyAppId, environment (optional)
+- [ ] Returns an object that implements IKycProvider
+- [ ] The factory correctly routes verifyBvn and verifyNin to Smile Identity
+- [ ] The factory correctly routes verifyCac to Prembly
+- [ ] The same IKycProvider interface is fulfilled — caller does not need to know which underlying provider handles which method
+
+## Step 5 — Verify Index Exports
+- [ ] SmileIdentityProvider is exported from src/index.ts
+- [ ] createKycProvider is exported from src/index.ts
+- [ ] KycVerificationResult and IKycProvider (from P01) are still exported
+
+## Step 6 — Verify Package Version
+- [ ] package.json version is '1.3.0' (bumped from 1.2.0)
+
+## Step 7 — Sandbox Integration Test
+Using sandbox credentials (or mock fetch responses):
+Test 1: Call verifyBvn with a valid test BVN. Verify it returns { verified: true or false (based on sandbox), provider: 'smile_identity' } — does NOT throw.
+Test 2: Call verifyCac with an invalid Prembly key. Verify it returns { verified: false, reason: 'provider_error', provider: 'prembly' } — does NOT throw.
+Test 3: Call verifyNin. Verify it returns a KycVerificationResult object — does NOT throw.
+If any test throws instead of returning a result object: fix the error handling.
+
+## Step 8 — TypeScript Verification
+Run: npx tsc --noEmit — fix all errors.
+Verify: import { SmileIdentityProvider, createKycProvider } from '@webwaka/core' — no type error.
+
+## Step 9 — Fix All Issues
+Fix every issue found.
+
+## Step 10 — Completion Confirmation
+"P08 QA COMPLETE — SmileIdentityProvider BVN and NIN verified, Prembly CAC verified, error handling confirmed (no throws on failure), createKycProvider factory routes correctly, no raw identity data logged, package version 1.3.0. TypeScript clean."
+```

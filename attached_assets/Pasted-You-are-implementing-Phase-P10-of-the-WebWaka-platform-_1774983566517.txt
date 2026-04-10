@@ -1,0 +1,114 @@
+You are implementing Phase P10 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase implements trust and conversion features: BNPL, abandoned cart recovery, customer reviews, escrow payments, dispute resolution, and vendor performance scoring.
+
+Read the following files fully before starting:
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/modules/admin/ui.tsx
+- src/core/event-bus/handlers/index.ts
+- src/worker.ts
+
+## Tasks:
+
+### TASK 1 — Abandoned Cart Recovery via WhatsApp (SV-E05)
+In src/worker.ts in the scheduled handler, the existing abandoned cart cron already queries cart_sessions.
+Extend it:
+1. For carts with lastActivity > 60 minutes ago AND nudgedAt IS NULL AND not converted (status != 'COMPLETED'):
+Publish CommerceEvents.CART_ABANDONED with { customerPhone, items: JSON.parse(cartItems), tenantId, cartId, cartUrl }
+2. For carts with lastActivity > 24 hours AND nudgedAt IS NOT NULL (first nudge sent) AND still not converted:
+Query promos table for an auto-generated 10% off code for this tenant. If none exists, generate one.
+Publish CommerceEvents.CART_ABANDONED with { customerPhone, items, tenantId, cartId, promoCode, isSecondNudge: true }
+
+In src/core/event-bus/handlers/index.ts, implement handleCartAbandoned:
+1. Extract customerPhone, items, cartId, promoCode, isSecondNudge from event.payload
+2. Build message:
+- First nudge: "You left {item1}, {item2}{+N more} in your cart. Complete your order: {cartUrl}"
+- Second nudge: "Still thinking? Here's 10% off your order: {promoCode}. Shop now: {cartUrl}"
+3. Send via createSmsProvider(env.TERMII_API_KEY).sendMessage(customerPhone, message)
+4. UPDATE cart_sessions SET nudgedAt = NOW() WHERE id = cartId
+
+### TASK 2 — Customer Reviews (SV-E07)
+In src/modules/single-vendor/api.ts:
+POST /api/single-vendor/reviews:
+- Auth: customer JWT required
+- Body: { orderId, productId, rating (1-5), body }
+- Validate: order belongs to customer; status = 'DELIVERED'; no existing review for this order+product combination
+- INSERT into product_reviews (status: 'PENDING' — requires moderation before public)
+- Return { reviewId, status: 'PENDING' }
+
+GET /api/single-vendor/products/:id/reviews?page=&limit=:
+- Only return reviews WHERE status = 'APPROVED'
+- Include: SELECT AVG(rating) as avgRating, COUNT(*) as totalReviews alongside paginated list
+
+In src/modules/admin/ui.tsx add a Review Moderation section:
+- List pending reviews with: product name, rating, body text
+- "Approve" and "Reject" buttons per review
+- PATCH /api/admin/reviews/:id: UPDATE product_reviews SET status = ? WHERE id = ? AND tenantId = ?
+
+In src/core/event-bus/handlers/index.ts in handleDeliveryStatusUpdated:
+When status = 'DELIVERED':
+- Look up if a review invitation has already been queued for this order
+- INSERT into a review_invites table (orderId, customerId, customerPhone, sendAt = NOW() + 3 days)
+- This table is processed by the scheduled cron in worker.ts (check for review_invites WHERE sendAt <= NOW() AND sent = 0, then send WhatsApp and mark sent = 1)
+- Create migration 0007_reviews_schedule.sql for review_invites table
+
+### TASK 3 — Dispute Resolution System (MV-E08)
+In src/modules/multi-vendor/api.ts:
+POST /api/multi-vendor/disputes:
+- Auth: customer or vendor JWT
+- Body: { orderId, category, description, evidenceUrls: string[] }
+- Validate: order exists and belongs to tenant; reporter is buyer or vendor for that order
+- INSERT into disputes
+- Publish CommerceEvents.DISPUTE_OPENED
+- Notify both buyer and vendor via WhatsApp
+
+In src/modules/admin/ui.tsx add a Dispute Management section:
+- Tabbed list: Open, Under Review, Resolved
+- Click any dispute to see: order info, reporter details, description, evidence images
+- Action buttons:
+- "Under Review" — PATCH /api/admin/disputes/:id { status: 'UNDER_REVIEW' }
+- "Full Refund" — POST /api/admin/disputes/:id/resolve { resolution: 'FULL_REFUND' }
+- "Partial Refund" — POST /api/admin/disputes/:id/resolve { resolution: 'PARTIAL_REFUND', amountKobo }
+- "Replacement" — POST /api/admin/disputes/:id/resolve { resolution: 'REPLACEMENT' }
+
+In src/modules/multi-vendor/api.ts add POST /api/admin/disputes/:id/resolve (requireRole: ADMIN):
+1. Read dispute from D1
+2. If resolution = 'FULL_REFUND': createPaymentProvider(env.PAYSTACK_SECRET_KEY).initiateRefund(order.paystackRef)
+3. If resolution = 'PARTIAL_REFUND': initiateRefund(order.paystackRef, body.amountKobo)
+4. If resolution = 'REPLACEMENT': INSERT new order cloning the original
+5. UPDATE disputes SET status = 'RESOLVED', resolution = body.resolution, resolvedAt = NOW()
+6. Publish CommerceEvents.DISPUTE_RESOLVED
+7. Notify buyer and vendor via WhatsApp with resolution details
+
+### TASK 4 — Vendor Performance Scoring (MV-E09)
+Create migration 0008_vendor_scores.sql:
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS performanceScore INTEGER;
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS badge TEXT;
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS scoreUpdatedAt TEXT;
+Apply migration.
+
+In src/worker.ts in the scheduled handler, add a weekly vendor scoring cron (use a cron trigger that runs every Sunday):
+For each active vendor in each tenant:
+1. fulfillmentRate = COUNT(DELIVERED orders) / COUNT(all orders) in last 30 days (0 if no orders)
+2. avgRating = AVG(rating) from product_reviews for vendor's products in last 30 days (default 4.0 if none)
+3. disputeRate = COUNT(disputes) / COUNT(orders) in last 30 days (0 if none)
+4. score = Math.round(fulfillmentRate * 40 + (avgRating / 5) * 20 + (1 - disputeRate) * 30 + 10) — 10 points for being active
+5. badge:
+- score >= 90: 'TOP_SELLER'
+- score >= 75: 'VERIFIED'
+- score >= 60: 'TRUSTED'
+- score < 40: flag for review; send improvement SMS
+6. UPDATE vendors SET performanceScore = score, badge = badge, scoreUpdatedAt = NOW()
+7. If score < 40: send WhatsApp to vendor with specific improvement suggestions
+
+Display badge on vendor store page in MV UI and on search results.
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Apply migrations 0007, 0008 to staging
+4. Manual test: place an SV order, mark cart as abandoned, verify WhatsApp nudge is sent (check Termii staging dashboard)
+5. Manual test: submit a dispute as a test buyer; verify admin sees it in dispute queue
+6. Trigger weekly scoring cron manually for a test vendor; verify badge is assigned
+```

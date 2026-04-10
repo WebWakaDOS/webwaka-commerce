@@ -1,0 +1,92 @@
+You are implementing Phase P05 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase wires the commerce system to the logistics system via events. The logistics repo (Phase P04) has already defined the event contracts. This repo publishes delivery requests on order creation and consumes delivery status updates.
+
+Read the following files fully before starting:
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/core/event-bus/handlers/index.ts
+- src/worker.ts
+
+All event type strings must use CommerceEvents from @webwaka/core. Never hardcode event type strings.
+
+## Tasks:
+
+### TASK 1 — SV Order: Publish Delivery Request on Order Confirmation
+In src/modules/single-vendor/api.ts, in the order creation handler, immediately after the order record is successfully inserted into D1:
+Publish CommerceEvents.ORDER_READY_DELIVERY with:
+{
+orderId: newOrderId,
+tenantId,
+sourceModule: 'single-vendor',
+pickupAddress: tenantConfig.storeAddress, — read from tenant KV config
+deliveryAddress: order.shippingAddress, — from the checkout body
+itemsSummary: `${order.items.length} item(s)`,
+weightKg: order.totalWeightKg ?? undefined,
+}
+Use the publishEvent function with env.COMMERCE_EVENTS as the queue.
+
+### TASK 2 — Store Delivery Quotes in KV
+In src/core/event-bus/handlers/index.ts:
+Implement the handler for CommerceEvents.DELIVERY_QUOTE:
+- When this event arrives, store the quotes in KV: key = 'delivery_options:${orderId}', value = JSON.stringify(payload.quotes), TTL = 3600 seconds
+- This makes delivery options available to the frontend without re-querying the logistics service
+
+Add a new API endpoint in src/modules/single-vendor/api.ts:
+GET /api/single-vendor/orders/:id/delivery-options
+- Read from KV: 'delivery_options:${orderId}'
+- Return the quotes array
+- If not found: return { quotes: [], pending: true } (logistics system is still computing)
+
+### TASK 3 — MV Order: Publish Per-Vendor Delivery Requests
+In src/modules/multi-vendor/api.ts, in the umbrella order creation handler:
+After all vendor sub-orders are created in D1:
+For each vendorSubOrder:
+- Fetch the vendor's pickupAddress from the vendors table
+- Publish CommerceEvents.ORDER_READY_DELIVERY with:
+{
+orderId: vendorSubOrder.id,
+tenantId,
+sourceModule: 'multi-vendor',
+vendorId: vendorSubOrder.vendorId,
+pickupAddress: vendor.pickupAddress,
+deliveryAddress: umbrellaOrder.shippingAddress,
+itemsSummary: `${vendorSubOrder.items.length} item(s) from ${vendor.name}`,
+}
+
+### TASK 4 — Implement Delivery Status Event Handler
+In src/core/event-bus/handlers/index.ts, fully implement the handleDeliveryStatusUpdated function (it currently exists as a partial stub):
+
+1. Extract: orderId, tenantId, status, trackingUrl, provider, estimatedDelivery from event.payload
+2. Map the canonical status to internal order status using this mapping:
+PICKED_UP → 'PROCESSING'
+IN_TRANSIT → 'SHIPPED'
+OUT_FOR_DELIVERY → 'OUT_FOR_DELIVERY'
+DELIVERED → 'DELIVERED'
+FAILED → 'DELIVERY_FAILED'
+RETURNED → 'RETURNED'
+3. UPDATE orders SET status = mappedStatus, updatedAt = NOW() WHERE id = orderId AND tenantId = tenantId
+4. Fetch the order's customerPhone from D1
+5. Send a WhatsApp message via createSmsProvider from @webwaka/core using this template per status:
+- PICKED_UP: "Your order has been picked up by {provider}. Track here: {trackingUrl}"
+- IN_TRANSIT: "Your order is in transit. Estimated delivery: {estimatedDelivery}"
+- OUT_FOR_DELIVERY: "Your order is out for delivery today! Please be available."
+- DELIVERED: "Your order has been delivered! Thank you for shopping with us."
+- FAILED: "Delivery attempt failed. We will retry. Contact support if you need help."
+- RETURNED: "Your order has been returned. A refund will be processed shortly."
+6. Invalidate KV cache: delete 'order:${orderId}' from CATALOG_CACHE
+
+### TASK 5 — Add Vendor Pickup Address to Vendor Onboarding
+In the vendors table schema (if pickupAddress column is missing):
+Create migration 0004_vendor_pickup.sql:
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS pickupAddress TEXT; — JSON: { name, phone, street, city, state, lga }
+Apply: wrangler d1 execute webwaka-commerce-db --file=migrations/0004_vendor_pickup.sql --env staging
+
+In the MV vendor settings API: add pickupAddress to the vendor update endpoint body schema.
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Integration test: place a single-vendor order in staging, verify order.ready_for_delivery appears in COMMERCE_EVENTS queue
+4. Verify handleDeliveryStatusUpdated correctly updates order status for each status value
+```

@@ -5,7 +5,7 @@
 -- ============================================================
 
 -- Promo codes table
-CREATE TABLE IF NOT EXISTS promo_codes (
+CREATE TABLE IF NOT EXISTS cmrc_promo_codes (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   code TEXT NOT NULL,                      -- e.g. SAVE20, WELCOME10
@@ -22,13 +22,13 @@ CREATE TABLE IF NOT EXISTS promo_codes (
   deleted_at INTEGER
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_codes_code ON promo_codes(tenant_id, code);
-CREATE INDEX IF NOT EXISTS idx_promo_codes_tenant ON promo_codes(tenant_id, is_active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_codes_code ON cmrc_promo_codes(tenant_id, code);
+CREATE INDEX IF NOT EXISTS idx_promo_codes_tenant ON cmrc_promo_codes(tenant_id, is_active);
 
--- Add delivery_address_json to orders (safe: uses IF NOT EXISTS equivalent via try)
+-- Add delivery_address_json to cmrc_orders (safe: uses IF NOT EXISTS equivalent via try)
 -- Cloudflare D1 does not support ADD COLUMN IF NOT EXISTS, so we use a safe pattern:
-ALTER TABLE orders ADD COLUMN delivery_address_json TEXT;
-ALTER TABLE orders ADD COLUMN promo_code TEXT;
-ALTER TABLE orders ADD COLUMN discount_kobo INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE orders ADD COLUMN vat_kobo INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE orders ADD COLUMN paystack_reference TEXT;
+ALTER TABLE cmrc_orders ADD COLUMN delivery_address_json TEXT;
+ALTER TABLE cmrc_orders ADD COLUMN promo_code TEXT;
+ALTER TABLE cmrc_orders ADD COLUMN discount_kobo INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE cmrc_orders ADD COLUMN vat_kobo INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE cmrc_orders ADD COLUMN paystack_reference TEXT;

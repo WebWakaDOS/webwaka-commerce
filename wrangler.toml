@@ -1,37 +1,72 @@
 name = "webwaka-commerce-api"
 main = "src/worker.ts"
-compatibility_date = "2024-03-14"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
 
-# Cron Triggers — Abandoned Cart WhatsApp Nudge (hourly)
+# ─── Cron Triggers ────────────────────────────────────────────────────────────
+# Abandoned cart nudge (hourly) + daily payout settlement cycle (8am WAT = 7am UTC)
 [triggers]
-crons = ["0 * * * *"]
+crons = ["0 * * * *", "0 7 * * *"]
 
-# Staging Environment
-[env.staging]
-name = "webwaka-commerce-api-staging"
-workers_dev = true
-kv_namespaces = [
-  { binding = "TENANT_CONFIG", id = "018ac3a580104b8b8868712919be71bd" },
-  { binding = "EVENTS", id = "ee8c49024b2d43a98c54962dba43f15b" },
-  { binding = "SESSIONS_KV", id = "bde8befc71da40c5a5979ee35830022a" },
-  { binding = "CATALOG_CACHE", id = "cc3f9d1e4a7b41e0891f2c3d5e6f7a8b" }
-]
-[[env.staging.d1_databases]]
-binding = "DB"
-database_name = "webwaka-commerce-db-staging"
-database_id = "f39bc175-4485-482a-ae87-b1195ead0ef3"
-
-# Production Environment
+# ─── Production Environment ───────────────────────────────────────────────────
 [env.production]
 name = "webwaka-commerce-api-prod"
 workers_dev = true
+
 kv_namespaces = [
-  { binding = "TENANT_CONFIG", id = "e9a8b3178cf245a7815f4e5bf7e67299" },
-  { binding = "EVENTS", id = "4e0bd5d5233f47dbaff75f8b10b89a8d" },
-  { binding = "SESSIONS_KV", id = "f176cebbdf8445838c72d9fde0173628" },
-  { binding = "CATALOG_CACHE", id = "dd4a0e2f5b8c52f19a2031e4f7a8b9c0" }
+  { binding = "TENANT_CONFIG",  id = "e9a8b3178cf245a7815f4e5bf7e67299" },
+  { binding = "EVENTS",         id = "4e0bd5d5233f47dbaff75f8b10b89a8d" },
+  { binding = "SESSIONS_KV",    id = "f176cebbdf8445838c72d9fde0173628" },
+  { binding = "CATALOG_CACHE",  id = "1c68508a4bdd4ce794b2de6de61d99ec" }
 ]
+
 [[env.production.d1_databases]]
 binding = "DB"
-database_name = "webwaka-commerce-db-prod"
-database_id = "1cc45df9-36e5-44d4-8a3b-e8377881c00b"
+database_name = "webwaka-production-db"
+database_id   = "d01940d3-d69e-4455-94ba-bc2404cb3872"
+migrations_dir = "migrations"
+
+# CF Queues — event bus (P0-T01)
+[[env.production.queues.producers]]
+binding = "COMMERCE_EVENTS"
+queue   = "webwaka-commerce-events-prod"
+
+[[env.production.queues.consumers]]
+queue               = "webwaka-commerce-events-prod"
+max_batch_size      = 25
+max_batch_timeout   = 5
+max_retries         = 5
+dead_letter_queue   = "webwaka-commerce-events-dlq-prod"
+
+# T-CVC-01: Service Binding to webwaka-logistics for centralised delivery zone queries.
+[[env.production.services]]
+binding = "LOGISTICS_WORKER"
+service = "webwaka-logistics-api-prod"
+
+# Production secrets (set via: wrangler secret put <NAME> --env production)
+# PAYSTACK_SECRET, TERMII_API_KEY, JWT_SECRET,
+# ALLOWED_ORIGINS, OPENROUTER_API_KEY, KYCSALT, INTER_SERVICE_SECRET
+
+# ─── Staging Environment ───────────────────────────────────────────────────────
+[env.staging]
+name = "webwaka-commerce-api-staging"
+workers_dev = true
+
+[env.staging.triggers]
+crons = []
+
+kv_namespaces = [
+  { binding = "TENANT_CONFIG",  id = "018ac3a580104b8b8868712919be71bd" },
+  { binding = "EVENTS",         id = "ee8c49024b2d43a98c54962dba43f15b" },
+  { binding = "SESSIONS_KV",    id = "bde8befc71da40c5a5979ee35830022a" },
+  { binding = "CATALOG_CACHE",  id = "1c68508a4bdd4ce794b2de6de61d99ec" }
+]
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "webwaka-staging-db"
+database_id   = "d7278ca0-2408-40d5-a08b-d8456601f667"
+migrations_dir = "migrations"
+
+# Staging secrets (set via: wrangler secret put <NAME> --env staging)
+# JWT_SECRET, PAYSTACK_SECRET (test key), TERMII_API_KEY

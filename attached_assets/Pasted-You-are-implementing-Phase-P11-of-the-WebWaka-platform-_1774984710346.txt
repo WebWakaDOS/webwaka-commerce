@@ -1,0 +1,106 @@
+You are implementing Phase P11 of the WebWaka platform implementation plan in the webwaka-commerce repository.
+
+This phase implements retention and revenue features: loyalty tier system, enhanced promo codes, marketplace campaigns, and real-time cross-channel stock sync.
+
+Read the following files fully before starting:
+- src/modules/pos/core.ts
+- src/modules/pos/api.ts
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/core/event-bus/handlers/index.ts
+- src/core/tenant/index.ts
+- src/worker.ts
+
+## Tasks:
+
+### TASK 1 — Loyalty Tier System (POS-E10)
+In src/core/tenant/index.ts, extend the TenantConfig type to include:
+loyalty?: {
+pointsPerHundredKobo: number; // default 1
+redeemRate: number; // points per ₦100 discount; default 100
+tiers: Array<{ name: string; minPoints: number; discountBps: number }>;
+}
+Default tiers: [{ name:'BRONZE',minPoints:0,discountBps:0 }, { name:'SILVER',minPoints:500,discountBps:250 }, { name:'GOLD',minPoints:2000,discountBps:500 }]
+
+In src/modules/pos/core.ts, after successful checkout:
+1. Read tenantConfig.loyalty from KV
+2. Compute points = Math.floor(totalKobo / 10000) * loyaltyConfig.pointsPerHundredKobo
+3. UPDATE customer_loyalty SET points = points + ?, updatedAt = NOW() WHERE tenantId = ? AND customerId = ?
+If no row: INSERT with points = computed, tier = 'BRONZE'
+4. Re-evaluate tier: find the highest tier whose minPoints <= newTotal. UPDATE tier if it changed.
+5. If customer wants to redeem points at checkout:
+- Validate: redeemPoints * (100/redeemRate) kobo discount <= totalKobo
+- Apply as a negative line item: discountKobo = redeemPoints * (100/redeemRate) * 100
+- Deduct points: UPDATE customer_loyalty SET points = points - redeemPoints
+- Add to checkout response: { loyaltyEarned: pointsEarned, loyaltyBalance: newBalance, tier: newTier }
+
+Apply same points-earning logic in single-vendor/api.ts and multi-vendor/api.ts checkouts.
+
+In POS UI: show loyalty points balance and tier on the customer display area. Show "Redeem Points" option at checkout if customer has points.
+
+### TASK 2 — Promo Code Engine Enhancements (SV-E10)
+Create migration 0009_promo_engine.sql:
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS promoType TEXT NOT NULL DEFAULT 'PERCENTAGE';
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS minOrderValueKobo INTEGER;
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS maxUsesTotal INTEGER;
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS maxUsesPerCustomer INTEGER DEFAULT 1;
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS validFrom TEXT;
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS validUntil TEXT;
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS productScope TEXT; -- JSON array of product IDs
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS usedCount INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS promo_usage (id TEXT PRIMARY KEY, promoId TEXT NOT NULL, customerId TEXT NOT NULL, tenantId TEXT NOT NULL, usedAt TEXT NOT NULL);
+Apply migration.
+
+In src/modules/single-vendor/api.ts promo validation:
+Enforce in this order:
+1. validFrom <= NOW() <= validUntil (if set)
+2. totalOrderKobo >= minOrderValueKobo (if set)
+3. usedCount < maxUsesTotal (if set)
+4. COUNT(promo_usage WHERE promoId = ? AND customerId = ?) < maxUsesPerCustomer (if set)
+5. If productScope is set: discount applies ONLY to items whose productId is in scope
+6. Apply discount by promoType:
+- PERCENTAGE: discountKobo = Math.round(applicableAmountKobo * value / 100)
+- FIXED: discountKobo = Math.min(valueKobo, totalKobo)
+- FREE_SHIPPING: deliveryFeeKobo = 0
+- BOGO: for each qualifying product pair, add a negative line item equal to the unit price
+7. After successful checkout: UPDATE promos SET usedCount = usedCount + 1; INSERT into promo_usage
+
+### TASK 3 — Marketplace Campaigns (MV-E10)
+In src/modules/multi-vendor/api.ts:
+POST /api/admin/campaigns (requireRole: ADMIN):
+Body: { name, discountType, discountValue, startDate, endDate }
+INSERT into marketplace_campaigns
+
+POST /api/multi-vendor/campaigns/:id/opt-in (requireRole: VENDOR):
+Body: { productIds?: string[] }
+INSERT OR REPLACE into campaign_vendor_opt_ins
+
+GET /api/multi-vendor/campaigns/active:
+SELECT c.*, json_group_array(o.vendorId) as participatingVendors FROM marketplace_campaigns c JOIN campaign_vendor_opt_ins o ON c.id = o.campaignId WHERE c.status = 'ACTIVE' AND c.tenantId = ?
+
+GET /api/multi-vendor/campaigns/:id/products:
+Return all products from opted-in vendors (or specified productIds) with campaign discount applied
+
+In src/worker.ts scheduled handler:
+Every hour: UPDATE marketplace_campaigns SET status = 'ACTIVE' WHERE startDate <= NOW() AND endDate > NOW() AND status = 'DRAFT'
+UPDATE marketplace_campaigns SET status = 'ENDED' WHERE endDate <= NOW() AND status = 'ACTIVE'
+
+### TASK 4 — Cross-Channel Inventory Sync (MV-E16)
+In src/core/event-bus/handlers/index.ts, fully implement handleInventoryUpdated:
+1. Delete from KV: 'catalog:${tenantId}', 'product:${productId}', 'catalog_version:${tenantId}' (increment version)
+2. If newQuantity > 0 in the event payload:
+a. Query wishlists WHERE productId = ? AND tenantId = ?
+b. For each customer in the wishlist:
+- Fetch customer.phone from customers table
+- Fetch product.name from products table
+- Send WhatsApp: "Good news! [product name] is back in stock. Shop now: [storeUrl]"
+3. Log the sync event for audit purposes
+
+## Verification
+1. npx tsc --noEmit
+2. npm test
+3. Apply migrations to staging
+4. Manual test: complete a checkout with a customer who has loyalty points. Verify points are earned and balance updates.
+5. Manual test: apply a BOGO promo code with 2 qualifying items. Verify discount is correctly half the qualifying items' value.
+6. Manual test: create a campaign, have a vendor opt in, verify campaign products appear at GET /api/multi-vendor/campaigns/:id/products
+```

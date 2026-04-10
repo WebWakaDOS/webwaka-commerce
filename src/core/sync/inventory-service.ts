@@ -1,102 +1,139 @@
+/**
+ * WebWaka Commerce Suite — Inventory Sync Service (D1-backed)
+ *
+ * Replaces the in-memory Map with D1 queries against the `cmrc_products` table.
+ * Conflict resolution strategies (last_write_wins / version_based) are preserved.
+ *
+ * Design notes:
+ *  - The service accepts a D1Database in its constructor so it has no worker-
+ *    global state between requests (Cloudflare Workers are stateless).
+ *  - `createInventorySyncService(db)` is the factory; the module no longer
+ *    exports a pre-built singleton.
+ *  - Handlers in `src/core/event-bus/handlers/index.ts` should create an
+ *    instance per invocation and call `handleInventoryUpdate`.
+ */
 import { eventBus, WebWakaEvent } from '../event-bus';
-import { db, InventoryItem } from '../db/schema';
-import { TenantConfig } from '../tenant';
 
-// Mock function to get tenant config (in reality, this would fetch from KV)
-const getTenantConfig = async (tenantId: string): Promise<TenantConfig | null> => {
-  // Mocking the KV store from Epic 3
-  if (tenantId === 'tnt_123') {
-    return {
-      tenantId: 'tnt_123',
-      domain: 'shop.example.com',
-      enabledModules: ['retail_pos', 'single_vendor_storefront'],
-      branding: { primaryColor: '#000000', logoUrl: '/logo.png' },
-      permissions: { admin: ['*'] },
-      featureFlags: {},
-      inventorySyncPreferences: {
-        sync_pos_to_single_vendor: true,
-        sync_pos_to_multi_vendor: false,
-        sync_single_vendor_to_multi_vendor: false,
-        conflict_resolution: 'last_write_wins'
-      }
-    };
-  }
-  return null;
-};
+export interface InventoryItem {
+  id: string;
+  tenantId: string;
+  sku: string;
+  quantity: number;
+  version: number;
+  updatedAt?: number;
+  createdAt?: number;
+}
+
+interface SyncPreferences {
+  sync_pos_to_single_vendor: boolean;
+  sync_pos_to_multi_vendor: boolean;
+  sync_single_vendor_to_multi_vendor: boolean;
+  conflict_resolution: 'last_write_wins' | 'version_based';
+}
+
+interface TenantConfig {
+  tenantId: string;
+  enabledModules: string[];
+  inventorySyncPreferences?: SyncPreferences;
+}
 
 export class InventorySyncService {
-  constructor() {
-    // Subscribe to inventory updates
+  private db: D1Database;
+
+  constructor(db: D1Database) {
+    this.db = db;
     eventBus.subscribe('inventory.updated', this.handleInventoryUpdate.bind(this));
   }
 
-  async handleInventoryUpdate(event: WebWakaEvent<{ item: InventoryItem }>) {
+  async handleInventoryUpdate(event: WebWakaEvent<{ item: InventoryItem }>): Promise<void> {
     const { tenantId, sourceModule, payload } = event;
-    const tenantConfig = await getTenantConfig(tenantId);
 
-    if (!tenantConfig || !tenantConfig.inventorySyncPreferences) {
-      return; // No sync preferences defined
-    }
+    const prefs = await this._getSyncPrefs(tenantId);
+    if (!prefs) return;
 
-    const prefs = tenantConfig.inventorySyncPreferences;
-
-    // Determine if we should sync based on source module and preferences
-    let shouldSync = false;
-    let targetModules: string[] = [];
+    const targetModules: string[] = [];
 
     if (sourceModule === 'retail_pos') {
-      if (prefs.sync_pos_to_single_vendor) {
-        shouldSync = true;
-        targetModules.push('single_vendor_storefront');
-      }
-      if (prefs.sync_pos_to_multi_vendor) {
-        shouldSync = true;
-        targetModules.push('multi_vendor_marketplace');
-      }
+      if (prefs.sync_pos_to_single_vendor)  targetModules.push('single_vendor_storefront');
+      if (prefs.sync_pos_to_multi_vendor)   targetModules.push('multi_vendor_marketplace');
     } else if (sourceModule === 'single_vendor_storefront') {
-      if (prefs.sync_single_vendor_to_multi_vendor) {
-        shouldSync = true;
-        targetModules.push('multi_vendor_marketplace');
-      }
-      // Assuming bi-directional sync to POS if POS is enabled
-      if (tenantConfig.enabledModules.includes('retail_pos')) {
-        shouldSync = true;
-        targetModules.push('retail_pos');
-      }
+      if (prefs.sync_single_vendor_to_multi_vendor) targetModules.push('multi_vendor_marketplace');
+      targetModules.push('retail_pos');
     }
 
-    if (shouldSync) {
-      await this.applySync(payload.item, targetModules, prefs.conflict_resolution);
+    if (targetModules.length > 0) {
+      await this.applySync(payload.item, prefs.conflict_resolution);
     }
   }
 
-  private async applySync(item: InventoryItem, targetModules: string[], resolutionStrategy: string) {
-    // 1. Fetch current item from DB
-    const currentItem = db.inventory.get(item.id);
+  private async applySync(item: InventoryItem, resolutionStrategy: string): Promise<void> {
+    const existing = await this.db
+      .prepare(
+        `SELECT id, version FROM cmrc_products WHERE id = ? AND tenant_id = ? LIMIT 1`,
+      )
+      .bind(item.id, item.tenantId)
+      .first<{ id: string; version: number }>();
 
-    // 2. Apply conflict resolution
-    if (currentItem) {
+    const now = Date.now();
+
+    if (existing) {
       if (resolutionStrategy === 'last_write_wins') {
-        // Just overwrite
-        db.inventory.set(item.id, { ...item, updatedAt: Date.now() });
+        await this.db
+          .prepare(
+            `UPDATE cmrc_products SET quantity = ?, version = ?, updated_at = ?
+             WHERE id = ? AND tenant_id = ?`,
+          )
+          .bind(item.quantity, item.version, now, item.id, item.tenantId)
+          .run();
       } else if (resolutionStrategy === 'version_based') {
-        if (item.version > currentItem.version) {
-          db.inventory.set(item.id, { ...item, updatedAt: Date.now() });
+        if (item.version > existing.version) {
+          await this.db
+            .prepare(
+              `UPDATE cmrc_products SET quantity = ?, version = ?, updated_at = ?
+               WHERE id = ? AND tenant_id = ?`,
+            )
+            .bind(item.quantity, item.version, now, item.id, item.tenantId)
+            .run();
         } else {
-          // Conflict: incoming version is older
-          console.warn(`Conflict detected for item ${item.id}. Ignoring update.`);
-          return;
+          console.warn(`[InventorySyncService] Version conflict for item ${item.id} — ignoring older update`);
         }
       }
     } else {
-      // New item
-      db.inventory.set(item.id, { ...item, createdAt: Date.now(), updatedAt: Date.now() });
+      await this.db
+        .prepare(
+          `INSERT INTO cmrc_products (id, tenant_id, sku, quantity, version, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (id) DO UPDATE SET quantity = excluded.quantity, version = excluded.version, updated_at = excluded.updated_at`,
+        )
+        .bind(item.id, item.tenantId, item.sku ?? '', item.quantity, item.version, now, now)
+        .run();
     }
+  }
 
-    // 3. In a real system, we might publish a 'sync.completed' event or notify the target modules
-    // eventBus.publish({ type: 'sync.completed', ... });
+  private async _getSyncPrefs(tenantId: string): Promise<SyncPreferences | null> {
+    try {
+      const row = await this.db
+        .prepare(
+          `SELECT sync_config FROM tenants WHERE id = ? LIMIT 1`,
+        )
+        .bind(tenantId)
+        .first<{ sync_config: string | null }>();
+
+      if (!row?.sync_config) return null;
+      const parsed = JSON.parse(row.sync_config) as TenantConfig;
+      return parsed.inventorySyncPreferences ?? null;
+    } catch {
+      return null;
+    }
   }
 }
 
-// Initialize the service
-export const inventorySyncService = new InventorySyncService();
+/**
+ * Factory — create a per-request InventorySyncService with D1 access.
+ * Usage in event handlers:
+ *   const svc = createInventorySyncService(env.DB);
+ *   await svc.handleInventoryUpdate(event);
+ */
+export function createInventorySyncService(db: D1Database): InventorySyncService {
+  return new InventorySyncService(db);
+}

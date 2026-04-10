@@ -1,0 +1,75 @@
+You are a senior QA engineer performing a complete verification of Phase P11 (Loyalty, Promotions & Campaigns) in the webwaka-commerce repository.
+
+This phase handles financial incentive systems. Every computation must be verified with example inputs.
+
+## Step 1 — Read Everything First
+Read completely:
+- src/modules/pos/core.ts
+- src/modules/pos/api.ts
+- src/modules/single-vendor/api.ts
+- src/modules/multi-vendor/api.ts
+- src/core/event-bus/handlers/index.ts
+- src/core/tenant/index.ts
+- src/worker.ts
+- migrations/0009_promo_engine.sql
+
+## Step 2 — Verify Loyalty Tier System (P11-T01)
+- [ ] TenantConfig type extended with loyalty field (vatRate, redeemRate, tiers array)
+- [ ] Default tiers: BRONZE (0 pts, 0 discount), SILVER (500 pts, 2.5% discount), GOLD (2000 pts, 5% discount)
+- [ ] Points computed: Math.floor(totalKobo / 10000) * pointsPerHundredKobo — uses Math.floor (no partial points)
+- [ ] On checkout (POS, SV, MV): customer_loyalty table is updated (upserted)
+- [ ] Tier re-evaluated after every points update — tier is the highest qualifying tier
+- [ ] Points redemption: validated server-side that redeemPoints * redeemRate kobo <= totalKobo
+- [ ] Redemption reduces totalKobo before tax is computed (or after — verify which and confirm it is consistent across all 3 modules)
+- [ ] Points are deducted immediately on redemption — not on a delayed schedule
+- [ ] Loyalty balance shown in POS customer display area
+- [ ] "Redeem Points" option only shown when customer has enough points to redeem
+
+Compute test: customer has 1000 points. Total order = ₦10,000 (1,000,000 kobo). redeemRate = 100 (100 points = ₦100). Redeeming 500 points = ₦500 discount (50,000 kobo). New total = ₦9,500. Verify: after checkout, customer_loyalty.points = 500 (1000 - 500) + new earned points.
+
+## Step 3 — Verify Promo Code Engine (P11-T02)
+- [ ] migration 0009 adds all new columns to promos table
+- [ ] promo_usage table created in migration
+- [ ] Validation order is enforced: dates → minimum order → total usage → per-customer usage → product scope → discount computation
+- [ ] PERCENTAGE discount: Math.round(applicableKobo * value / 100) — uses Math.round
+- [ ] FIXED discount: Math.min(valueKobo, totalKobo) — cannot discount below zero
+- [ ] FREE_SHIPPING: sets delivery fee to 0 — does not affect product subtotal
+- [ ] BOGO: buy-one-get-one — adds a negative line item equal to the unit price of the cheapest qualifying item in each pair
+- [ ] After successful checkout: usedCount incremented, promo_usage record inserted
+- [ ] Attempting to use the same code twice (when maxUsesPerCustomer = 1): HTTP 422 'promo_already_used'
+- [ ] Expired promo code (validUntil in past): HTTP 422 'promo_expired'
+- [ ] EDGE CASE: BOGO with 3 qualifying items → 1 free item (not 1.5)
+
+## Step 4 — Verify Marketplace Campaigns (P11-T03)
+- [ ] POST /api/admin/campaigns: creates campaign record (requireRole: ADMIN)
+- [ ] POST /api/multi-vendor/campaigns/:id/opt-in: vendor opts in (requireRole: VENDOR)
+- [ ] GET /api/multi-vendor/campaigns/active: returns active campaigns with participating vendor IDs
+- [ ] GET /api/multi-vendor/campaigns/:id/products: returns opted-in products with discount applied
+- [ ] Scheduled cron: campaigns are activated when startDate <= NOW() AND endDate > NOW() AND status = 'DRAFT'
+- [ ] Scheduled cron: campaigns are ended when endDate <= NOW() AND status = 'ACTIVE'
+- [ ] Campaign discount applied in the products endpoint response — NOT at checkout (the discount is informational, checkout uses promo codes or campaign-linked codes)
+- [ ] EDGE CASE: vendor opts in with specific productIds — only those products appear in campaign results
+
+## Step 5 — Verify Cross-Channel Inventory Sync (P11-T04)
+- [ ] handleInventoryUpdated in handlers/index.ts: deletes KV cache keys for 'catalog:${tenantId}', 'product:${productId}'
+- [ ] If newQuantity > 0 in the event payload: checks wishlists for this productId
+- [ ] For each wishlist customer: fetches customer phone, fetches product name, sends WhatsApp restock notification
+- [ ] Notification sent only if newQuantity > 0 (not on stock decrease)
+- [ ] EDGE CASE: if product has 100 wishlist entries — all 100 notifications are sent (may be slow; check for rate limiting)
+- [ ] EDGE CASE: customer phone is null — notification skipped gracefully
+
+## Step 6 — Cross-Module Loyalty Verification
+- [ ] A customer who buys via POS (tenantId = X, customerId = C) earns points in customer_loyalty WHERE tenantId=X AND customerId=C
+- [ ] The SAME customer buying via SV or MV (same tenantId X, same customerId C) earns points in the SAME row
+- [ ] Points are cumulative across all modules for the same tenant
+
+## Step 7 — TypeScript and Tests
+Run: npx tsc --noEmit — fix all errors.
+Run: npm test — fix all failures.
+
+## Step 8 — Fix All Issues
+Fix every issue found.
+
+## Step 9 — Completion Confirmation
+"P11 QA COMPLETE — Loyalty tiers with correct points computation and redemption, promo engine with all 4 types and all constraint validations, marketplace campaign lifecycle cron, inventory sync with wishlist restock notifications. Cross-module loyalty accumulation verified. TypeScript clean. Tests passing."
+```

@@ -5,9 +5,13 @@
  */
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { createTaxEngine } from '@webwaka/core';
 import { getTranslations, getSupportedLanguages, getLanguageName, formatKoboToNaira, type Language } from './core/i18n';
 import { getCommerceDB, queueMutation, getPendingMutations, toggleWishlistItem, getWishlistItems } from './core/offline/db';
 import { useStorefrontCart } from './modules/single-vendor/useStorefrontCart';
+import { UserContext, decodeJwtPayload } from './contexts/UserContext';
+import type { UserContextValue } from './contexts/UserContext';
+import { ConflictResolver } from './components/ConflictResolver';
 
 // ============================================================
 // TYPES
@@ -376,7 +380,22 @@ const NIGERIAN_STATES = [
   'Sokoto','Taraba','Yobe','Zamfara',
 ];
 
-const VAT_RATE = 0.075; // FIRS 7.5%
+// ── LGAs per state (curated list for major states; others fall back to free text) ─
+const STATE_LGAS: Record<string, string[]> = {
+  'Abia': ['Aba North','Aba South','Arochukwu','Bende','Ikwuano','Isiala Ngwa North','Isiala Ngwa South','Isuikwuato','Obi Ngwa','Ohafia','Osisioma','Ugwunagbo','Ukwa East','Ukwa West','Umuahia North','Umuahia South','Umu Nneochi'],
+  'Anambra': ['Aguata','Awka North','Awka South','Anambra East','Anambra West','Anaocha','Ayamelum','Dunukofia','Ekwusigo','Idemili North','Idemili South','Ihiala','Njikoka','Nnewi North','Nnewi South','Ogbaru','Onitsha North','Onitsha South','Orumba North','Orumba South'],
+  'FCT (Abuja)': ['Abaji','Abuja Municipal (AMAC)','Bwari','Gwagwalada','Kuje','Kwali'],
+  'Edo': ['Akoko-Edo','Egor','Esan Central','Esan North-East','Esan South-East','Esan West','Etsako Central','Etsako East','Etsako West','Igueben','Ikpoba-Okha','Orhionmwon','Oredo','Ovia North-East','Ovia South-West','Owan East','Owan West','Uhunmwonde'],
+  'Enugu': ['Aninri','Awgu','Enugu East','Enugu North','Enugu South','Ezeagu','Igbo Etiti','Igbo Eze North','Igbo Eze South','Isi Uzo','Nkanu East','Nkanu West','Nsukka','Oji River','Udenu','Udi','Uzo Uwani'],
+  'Imo': ['Aboh Mbaise','Ahiazu Mbaise','Ehime Mbano','Ezinihitte','Ideato North','Ideato South','Ihitte/Uboma','Ikeduru','Isiala Mbano','Isu','Mbaitoli','Ngor Okpala','Njaba','Nkwerre','Nwangele','Obowo','Oguta','Ohaji/Egbema','Okigwe','Orlu','Orsu','Oru East','Oru West','Owerri Municipal','Owerri North','Owerri West','Unuimo'],
+  'Kaduna': ['Birnin Gwari','Chikun','Giwa','Igabi','Ikara','Jaba','Jema\'a','Kachia','Kaduna North','Kaduna South','Kagarko','Kajuru','Kaura','Kauru','Kubau','Kudan','Lere','Makarfi','Sabon Gari','Sanga','Soba','Zangon Kataf','Zaria'],
+  'Kano': ['Ajingi','Albasu','Bagwai','Bebeji','Bichi','Bunkure','Dala','Dambatta','Dawakin Kudu','Dawakin Tofa','Doguwa','Fagge','Gabasawa','Garko','Garun Mallam','Gaya','Gezawa','Gwale','Gwarzo','Kabo','Kano Municipal','Karaye','Kibiya','Kiru','Kumbotso','Kunchi','Kura','Madobi','Makoda','Minjibir','Nasarawa','Rano','Rimin Gado','Rogo','Shanono','Sumaila','Takai','Tarauni','Tofa','Tsanyawa','Tudun Wada','Ungogo','Warawa','Wudil'],
+  'Lagos': ['Agege','Ajeromi-Ifelodun','Alimosho','Amuwo-Odofin','Apapa','Badagry','Epe','Eti-Osa','Ibeju-Lekki','Ifako-Ijaiye','Ikeja','Ikorodu','Kosofe','Lagos Island','Lagos Mainland','Mushin','Ojo','Oshodi-Isolo','Shomolu','Surulere'],
+  'Ogun': ['Abeokuta North','Abeokuta South','Ado-Odo/Ota','Egbado North','Egbado South','Ewekoro','Ifo','Ijebu East','Ijebu North','Ijebu North East','Ijebu Ode','Ikenne','Imeko Afon','Ipokia','Obafemi Owode','Odeda','Odogbolu','Ogun Waterside','Remo North','Shagamu'],
+  'Oyo': ['Afijio','Akinyele','Atiba','Atisbo','Egbeda','Ibadan North','Ibadan North-East','Ibadan North-West','Ibadan South-East','Ibadan South-West','Ibarapa Central','Ibarapa East','Ibarapa North','Ido','Irepo','Iseyin','Itesiwaju','Iwajowa','Kajola','Lagelu','Ogbomosho North','Ogbomosho South','Ogo Oluwa','Olorunsogo','Oluyole','Ona Ara','Orelope','Ori Ire','Oyo East','Oyo West','Saki East','Saki West','Surulere'],
+  'Rivers': ['Abua/Odual','Ahoada East','Ahoada West','Akuku-Toru','Andoni','Asari-Toru','Bonny','Degema','Eleme','Emohua','Etche','Gokana','Ikwerre','Khana','Obio/Akpor','Ogba/Egbema/Ndoni','Ogu/Bolo','Okrika','Omuma','Opobo/Nkoro','Oyigbo','Port Harcourt','Tai'],
+  'Delta': ['Aniocha North','Aniocha South','Bomadi','Burutu','Ethiope East','Ethiope West','Ika North East','Ika South','Isoko North','Isoko South','Ndokwa East','Ndokwa West','Okpe','Oshimili North','Oshimili South','Patani','Sapele','Udu','Ughelli North','Ughelli South','Ukwuani','Uvwie','Warri North','Warri South','Warri South West'],
+};
 
 declare global {
   interface Window {
@@ -388,6 +407,44 @@ declare global {
       }): { openIframe(): void };
     };
   }
+}
+
+// ── Order Tracking Redirect (T-CVC-02) ───────────────────────────────────────
+// Commerce no longer hosts a local tracking UI.
+// This helper calls the Commerce API, which issues a 302 redirect to the
+// Logistics portal with a signed token. We follow the redirect by opening
+// the Logistics URL in a new tab.
+function useTrackingRedirect(tenantId: string) {
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState('');
+
+  const openTracking = React.useCallback((orderId: string, path: string) => {
+    setLoading(true); setError('');
+    fetch(`/api/${path}`, {
+      headers: { 'x-tenant-id': tenantId },
+      redirect: 'manual', // capture the 302 without following it
+    })
+      .then(r => {
+        if (r.type === 'opaqueredirect' || r.status === 302 || r.status === 301) {
+          // Follow the redirect to the Logistics portal in a new tab
+          // For manual redirects the Location header is available via r.url in some environments;
+          // fall back to a direct fetch that follows the redirect to extract the final URL.
+          return fetch(`/api/${path}`, { headers: { 'x-tenant-id': tenantId } })
+            .then(r2 => { window.open(r2.url, '_blank', 'noopener'); });
+        }
+        // Fallback: if Logistics is unavailable the API returns 200 JSON with note: logistics_unavailable
+        return r.json().then((d: unknown) => {
+          const resp = d as { success: boolean; note?: string; data?: { id?: string; order_status?: string } };
+          if (resp.note === 'logistics_unavailable') {
+            setError('Live tracking is temporarily unavailable. Your order status: ' + (resp.data?.order_status ?? 'confirmed'));
+          }
+        });
+      })
+      .catch(() => setError('Could not open tracking. Please try again.'))
+      .finally(() => setLoading(false));
+  }, [tenantId]);
+
+  return { loading, error, openTracking };
 }
 
 // Single-Vendor Storefront Module (COM-2) — SV Phase 2: Paystack, VAT, promo, address
@@ -409,32 +466,86 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [otpLoading, setOtpLoading] = useState(false);
   const [otpError, setOtpError] = useState('');
 
+  // ── Storefront branding — inject CSS variables from tenant config ────────────
+  useEffect(() => {
+    let styleEl: HTMLStyleElement | null = null;
+    fetch('/api/single-vendor/config', { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.ok ? r.json() as Promise<{ success: boolean; data?: { branding?: { primaryColor?: string; accentColor?: string; fontFamily?: string } } }> : null)
+      .then(json => {
+        const b = json?.data?.branding ?? {};
+        const primary = b.primaryColor ?? '#2563eb';
+        const accent = b.accentColor ?? '#16a34a';
+        const font = b.fontFamily ?? 'Inter, system-ui, sans-serif';
+        styleEl = document.createElement('style');
+        styleEl.setAttribute('data-ww-theme', tenantId);
+        styleEl.textContent = `:root { --color-primary: ${primary}; --color-accent: ${accent}; --font-family: ${font}; }`;
+        document.head.appendChild(styleEl);
+      })
+      .catch(() => {
+        styleEl = document.createElement('style');
+        styleEl.setAttribute('data-ww-theme', tenantId);
+        styleEl.textContent = ':root { --color-primary: #2563eb; --color-accent: #16a34a; --font-family: Inter, system-ui, sans-serif; }';
+        document.head.appendChild(styleEl);
+      });
+    return () => { if (styleEl) document.head.removeChild(styleEl); };
+  }, [tenantId]);
+
   // ── Wishlist (offline-first via Dexie) ────────────────────────────────────
+  const GUEST_WISHLIST_KEY = `webwaka_wishlist_${tenantId}`;
   const [wishlisted, setWishlisted] = useState<Set<string>>(new Set());
 
+  // Load wishlist: from Dexie if authenticated, or localStorage if guest
   useEffect(() => {
-    if (!customerId) return;
-    getWishlistItems(tenantId, customerId).then(items => {
-      setWishlisted(new Set(items.map(i => i.productId)));
-    }).catch(() => {});
-  }, [tenantId, customerId]);
+    if (customerId) {
+      getWishlistItems(tenantId, customerId).then(items => {
+        setWishlisted(new Set(items.map(i => i.productId)));
+      }).catch(() => {});
+    } else {
+      try {
+        const guestIds: string[] = JSON.parse(localStorage.getItem(GUEST_WISHLIST_KEY) ?? '[]');
+        setWishlisted(new Set(guestIds));
+      } catch { setWishlisted(new Set()); }
+    }
+  }, [tenantId, customerId, GUEST_WISHLIST_KEY]);
 
   const handleToggleWishlist = useCallback(async (p: Product) => {
-    if (!customerId) { setShowOtpModal(true); return; }
-    const action = await toggleWishlistItem(tenantId, customerId, { id: p.id, name: p.name, price: p.price, imageEmoji: '🛍️' });
+    if (!customerId) {
+      // Guest: persist to localStorage
+      const guestIds: string[] = JSON.parse(localStorage.getItem(GUEST_WISHLIST_KEY) ?? '[]');
+      const isIn = guestIds.includes(p.id);
+      const next = isIn ? guestIds.filter(id => id !== p.id) : [...guestIds, p.id];
+      localStorage.setItem(GUEST_WISHLIST_KEY, JSON.stringify(next));
+      setWishlisted(new Set(next));
+      return;
+    }
+
+    const isCurrentlyWishlisted = wishlisted.has(p.id);
+    // Optimistic UI update
     setWishlisted(prev => {
       const next = new Set(prev);
-      if (action === 'added') next.add(p.id); else next.delete(p.id);
+      if (isCurrentlyWishlisted) next.delete(p.id); else next.add(p.id);
       return next;
     });
+
+    // Update Dexie
+    await toggleWishlistItem(tenantId, customerId, { id: p.id, name: p.name, price: p.price, imageEmoji: '🛍️' }).catch(() => {});
+
+    // Sync to server
     if (authToken) {
-      fetch('/api/single-vendor/wishlist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
-        body: JSON.stringify({ product_id: p.id }),
-      }).catch(() => {});
+      if (isCurrentlyWishlisted) {
+        fetch(`/api/single-vendor/wishlist/${encodeURIComponent(p.id)}`, {
+          method: 'DELETE',
+          headers: { 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+        }).catch(() => {});
+      } else {
+        fetch('/api/single-vendor/wishlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+          body: JSON.stringify({ product_id: p.id }),
+        }).catch(() => {});
+      }
     }
-  }, [tenantId, customerId, authToken]);
+  }, [tenantId, customerId, authToken, wishlisted, GUEST_WISHLIST_KEY]);
 
   // ── OTP handlers ──────────────────────────────────────────────────────────
   const handleRequestOtp = async () => {
@@ -462,14 +573,33 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
       });
       const d = await res.json() as { success: boolean; data?: { token: string; customer_id: string; phone: string; loyalty_points: number }; error?: string };
       if (d.success && d.data) {
-        setAuthToken(d.data.token);
+        const newToken = d.data.token;
+        setAuthToken(newToken);
         setCustomerId(d.data.customer_id);
         setCustomerPhone(d.data.phone);
         setCustomerLoyalty(d.data.loyalty_points);
-        sessionStorage.setItem(`ww_tok_${tenantId}`, d.data.token);
+        sessionStorage.setItem(`ww_tok_${tenantId}`, newToken);
         sessionStorage.setItem(`ww_cid_${tenantId}`, d.data.customer_id);
         sessionStorage.setItem(`ww_cph_${tenantId}`, d.data.phone);
         setShowOtpModal(false); setOtpStep('phone'); setOtpCode(''); setOtpPhone('');
+
+        // ── Guest wishlist merge: POST localStorage items → server, then clear ──
+        try {
+          const guestKey = `webwaka_wishlist_${tenantId}`;
+          const guestIds: string[] = JSON.parse(localStorage.getItem(guestKey) ?? '[]');
+          if (guestIds.length > 0) {
+            await Promise.allSettled(
+              guestIds.map(productId =>
+                fetch('/api/single-vendor/wishlist', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, Authorization: `Bearer ${newToken}` },
+                  body: JSON.stringify({ product_id: productId }),
+                })
+              )
+            );
+            localStorage.removeItem(guestKey);
+          }
+        } catch { /* non-fatal */ }
       } else setOtpError(d.error ?? 'Invalid OTP');
     } catch { setOtpError('Network error. Try again.'); }
     finally { setOtpLoading(false); }
@@ -492,11 +622,40 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [promoError, setPromoError] = useState('');
   const [promoDiscount, setPromoDiscount] = useState(0); // kobo
 
+  // ── Delivery fee (T004: Delivery Zones) ──────────────────────────────────
+  const [deliveryFeeKobo, setDeliveryFeeKobo] = useState(0);
+  const [shippingLoading, setShippingLoading] = useState(false);
+  const [shippingEstDays, setShippingEstDays] = useState<{ min: number; max: number } | null>(null);
+
+  // ── Offline status ────────────────────────────────────────────────────────
+  const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  useEffect(() => {
+    const on = () => setIsOnline(true);
+    const off = () => setIsOnline(false);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off); };
+  }, []);
+
+  // ── Reviews (T007) ────────────────────────────────────────────────────────
+  const [modalReviews, setModalReviews] = useState<Array<{ id: string; rating: number; review_text: string | null; verified_purchase: number; customer_phone: string | null; created_at: number }>>([]);
+  const [modalAvgRating, setModalAvgRating] = useState(0);
+  const [modalReviewCount, setModalReviewCount] = useState(0);
+  const [reviewText, setReviewText] = useState('');
+  const [reviewRating, setReviewRating] = useState(0);
+  const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  const [reviewError, setReviewError] = useState('');
+
+  // ── Order tracking (T-CVC-02) ───────────────────────────────────────────
+  // Commerce no longer renders a local tracking UI; redirect to Logistics portal.
+  const { loading: svTrackingLoading, error: svTrackingError, openTracking: svOpenTracking } = useTrackingRedirect(tenantId);
+
   // ── Computed totals (client preview — server re-verifies) ─────────────────
   const subtotal = total; // from cart hook (kobo)
   const afterDiscount = Math.max(0, subtotal - promoDiscount);
-  const vatKobo = Math.round(afterDiscount * VAT_RATE);
-  const grandTotal = afterDiscount + vatKobo;
+  const { vatKobo } = createTaxEngine({ vatRate: 0.075, vatRegistered: true, exemptCategories: [] })
+    .compute([{ category: 'general', amountKobo: afterDiscount }]);
+  const grandTotal = afterDiscount + vatKobo + deliveryFeeKobo;
 
   // ── Catalog — paginated, search, category ────────────────────────────────
   const [products, setProducts] = useState<Product[]>([]);
@@ -508,8 +667,23 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
   const [searchQuery, setSearchQuery] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [activeCategory, setActiveCategory] = useState('');
+  const [svSuggestions, setSvSuggestions] = useState<string[]>([]);
+  const [svSuggestShow, setSvSuggestShow] = useState(false);
+  const [svSuggestIdx, setSvSuggestIdx] = useState(-1);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const gridContainerRef = useRef<HTMLDivElement>(null);
+
+  // ── SV Autocomplete — 300ms debounce, min 2 chars ────────────────────────
+  useEffect(() => {
+    if (!searchInput || searchInput.length < 2) { setSvSuggestions([]); return; }
+    const t = setTimeout(() => {
+      fetch(`/api/single-vendor/search/suggest?q=${encodeURIComponent(searchInput)}`, { headers: { 'x-tenant-id': tenantId } })
+        .then(r => r.json() as Promise<{ success: boolean; data?: { suggestions: string[] } }>)
+        .then(j => { setSvSuggestions(j.data?.suggestions ?? []); setSvSuggestShow(true); setSvSuggestIdx(-1); })
+        .catch(() => setSvSuggestions([]));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchInput, tenantId]);
 
   // ── Product modal ─────────────────────────────────────────────────────────
   const [modalProduct, setModalProduct] = useState<Product | null>(null);
@@ -523,7 +697,7 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     const groups: Record<string, ProductVariant[]> = {};
     for (const v of modalVariants) {
       if (!groups[v.option_name]) groups[v.option_name] = [];
-      groups[v.option_name].push(v);
+      groups[v.option_name]!.push(v);
     }
     return groups;
   }, [modalVariants]);
@@ -572,7 +746,7 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     if (!sentinel) return;
     const observer = new IntersectionObserver(entries => {
       if (entries[0]?.isIntersecting && hasMore && !isFetchingMore && !catalogLoading) {
-        fetchCatalog({ after: nextCursor ?? undefined, category: activeCategory, search: searchQuery });
+        fetchCatalog({ ...(nextCursor != null ? { after: nextCursor } : {}), category: activeCategory, search: searchQuery });
       }
     }, { threshold: 0.1 });
     observer.observe(sentinel);
@@ -585,6 +759,12 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     setModalQty(1);
     setSelectedVariant(null);
     setModalVariants([]);
+    setModalReviews([]);
+    setModalAvgRating(0);
+    setModalReviewCount(0);
+    setReviewText('');
+    setReviewRating(0);
+    setReviewError('');
     if (p.has_variants) {
       setModalVariantsLoading(true);
       try {
@@ -594,13 +774,25 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
       } catch { /* show modal without variants */ }
       finally { setModalVariantsLoading(false); }
     }
-  }, [tenantId]);
+    // Fetch reviews in background (non-blocking)
+    fetch(`/api/single-vendor/products/${p.id}/reviews`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data: { reviews: typeof modalReviews; count: number; avg_rating: number } }>)
+      .then(d => {
+        if (d.success) {
+          setModalReviews(d.data.reviews ?? []);
+          setModalAvgRating(d.data.avg_rating ?? 0);
+          setModalReviewCount(d.data.count ?? 0);
+        }
+      })
+      .catch(() => {});
+  }, [tenantId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const closeModal = useCallback(() => {
     setModalProduct(null);
     setModalVariants([]);
     setSelectedVariant(null);
     setModalQty(1);
+    setModalReviews([]);
   }, []);
 
   // ── Load Paystack Inline JS ───────────────────────────────────────────────
@@ -631,6 +823,52 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
     if (cartQty > availableQty) return;
     addToCart({ id: p.id, name: variant ? `${p.name} — ${variant.option_value}` : p.name, price: effectivePrice, quantity: availableQty, imageEmoji: '🛍️' });
   };
+
+  // ── Shipping estimate — fetch when state/LGA changes (T004) ─────────────
+  useEffect(() => {
+    if (!addrState) { setDeliveryFeeKobo(0); setShippingEstDays(null); return; }
+    setShippingLoading(true);
+    const params = new URLSearchParams({ state: addrState });
+    if (addrLga.trim()) params.set('lga', addrLga.trim());
+    fetch(`/api/single-vendor/shipping/estimate?${params}`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data: { fee_kobo: number; estimated_days_min: number; estimated_days_max: number } }>)
+      .then(d => {
+        if (d.success) {
+          setDeliveryFeeKobo(d.data.fee_kobo ?? 0);
+          setShippingEstDays({ min: d.data.estimated_days_min ?? 1, max: d.data.estimated_days_max ?? 7 });
+        }
+      })
+      .catch(() => { setDeliveryFeeKobo(0); })
+      .finally(() => setShippingLoading(false));
+  }, [addrState, addrLga, tenantId]);
+
+  // ── Review submit handler (T007) ─────────────────────────────────────────
+  const handleSubmitReview = useCallback(async () => {
+    if (!modalProduct || !authToken) return;
+    if (reviewRating < 1 || reviewRating > 5) { setReviewError('Please select a star rating'); return; }
+    setReviewSubmitting(true);
+    setReviewError('');
+    try {
+      const res = await fetch(`/api/single-vendor/products/${modalProduct.id}/reviews`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId, 'Authorization': `Bearer ${authToken}` },
+        body: JSON.stringify({ rating: reviewRating, review_text: reviewText.trim() || undefined }),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) {
+        setReviewText('');
+        setReviewRating(0);
+        // Refresh reviews
+        fetch(`/api/single-vendor/products/${modalProduct.id}/reviews`, { headers: { 'x-tenant-id': tenantId } })
+          .then(r => r.json() as Promise<{ success: boolean; data: { reviews: typeof modalReviews; count: number; avg_rating: number } }>)
+          .then(d2 => { if (d2.success) { setModalReviews(d2.data.reviews ?? []); setModalAvgRating(d2.data.avg_rating ?? 0); setModalReviewCount(d2.data.count ?? 0); } })
+          .catch(() => {});
+      } else {
+        setReviewError(d.error ?? 'Could not submit review');
+      }
+    } catch { setReviewError('Network error. Try again.'); }
+    finally { setReviewSubmitting(false); }
+  }, [modalProduct, authToken, tenantId, reviewRating, reviewText]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handlePromoValidate = async () => {
     if (!promoCode.trim()) return;
@@ -728,11 +966,37 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
         <h2 style={{ color: '#16a34a' }}>{t.storefront_order_placed}</h2>
         <p style={{ color: '#6b7280' }}>Ref: {orderRef}</p>
         <p style={{ color: '#6b7280', fontSize: '13px' }}>A confirmation will be sent to {email || phone}</p>
+
+        {/* Order Tracking Link (T-CVC-02) — redirects to Logistics portal */}
+        {orderRef && (
+          <button
+            onClick={() => svOpenTracking(orderRef, `single-vendor/orders/${encodeURIComponent(orderRef)}/track`)}
+            disabled={svTrackingLoading}
+            style={{ display: 'block', margin: '12px auto 0', padding: '8px 16px', backgroundColor: '#f0fdf4', color: '#16a34a', border: '1px solid #bbf7d0', borderRadius: '8px', cursor: svTrackingLoading ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 600 }}
+          >
+            {svTrackingLoading ? 'Opening tracker…' : 'Track Your Order →'}
+          </button>
+        )}
+        {svTrackingError && (
+          <div style={{ marginTop: '8px', padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '12px' }}>{svTrackingError}</div>
+        )}
+
         <button
-          onClick={() => { setStep('catalog'); setOrderRef(''); setPromoDiscount(0); setPromoCode(''); }}
+          onClick={() => { setStep('catalog'); setOrderRef(''); setPromoDiscount(0); setPromoCode(''); setDeliveryFeeKobo(0); }}
           style={{ marginTop: '16px', padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
         >
           Continue Shopping
+        </button>
+
+        {/* WhatsApp share of order */}
+        <button
+          onClick={() => {
+            const text = `My WebWaka order is confirmed!\nRef: ${orderRef}\nTotal: ${formatKoboToNaira(grandTotal)}\nTrack: ${window.location.origin}/?order=${orderRef}`;
+            window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener');
+          }}
+          style={{ marginTop: '8px', padding: '10px 20px', backgroundColor: '#25D366', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}
+        >
+          Share via WhatsApp
         </button>
       </div>
     );
@@ -857,6 +1121,15 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
             <span style={{ color: '#6b7280' }}>VAT (7.5% FIRS)</span>
             <span>{formatKoboToNaira(vatKobo)}</span>
           </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+            <span style={{ color: '#6b7280' }}>
+              Delivery {shippingLoading ? '(estimating…)' : addrState ? '' : '(select state)'}
+              {shippingEstDays && !shippingLoading && addrState && (
+                <span style={{ fontSize: '11px', color: '#9ca3af' }}> · {shippingEstDays.min}–{shippingEstDays.max} days</span>
+              )}
+            </span>
+            <span>{shippingLoading ? '…' : deliveryFeeKobo === 0 && addrState ? 'Free' : formatKoboToNaira(deliveryFeeKobo)}</span>
+          </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '15px', marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #d1fae5' }}>
             <span>Total</span>
             <span style={{ color: '#16a34a' }}>{formatKoboToNaira(grandTotal)}</span>
@@ -893,21 +1166,44 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
 
       {/* Top bar: search + account button */}
       <div style={{ padding: '10px 12px 0', display: 'flex', gap: '8px' }}>
-        <input
-          type="search"
-          placeholder="Search products… (e.g. Ankara)"
-          value={searchInput}
-          onChange={e => setSearchInput(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') { setSearchQuery(searchInput.trim()); setActiveCategory(''); } }}
-          style={{ flex: 1, padding: '9px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', outline: 'none' }}
-        />
+        <div style={{ position: 'relative', flex: 1 }}>
+          <input
+            type="search"
+            placeholder="Search products… (e.g. Ankara)"
+            value={searchInput}
+            onChange={e => { setSearchInput(e.target.value); setSvSuggestShow(true); }}
+            onBlur={() => setTimeout(() => setSvSuggestShow(false), 150)}
+            onFocus={() => svSuggestions.length > 0 && setSvSuggestShow(true)}
+            onKeyDown={e => {
+              if (svSuggestShow && svSuggestions.length > 0) {
+                if (e.key === 'ArrowDown') { e.preventDefault(); setSvSuggestIdx(i => Math.min(i + 1, svSuggestions.length - 1)); return; }
+                if (e.key === 'ArrowUp') { e.preventDefault(); setSvSuggestIdx(i => Math.max(i - 1, -1)); return; }
+                if (e.key === 'Enter' && svSuggestIdx >= 0) { e.preventDefault(); const s = svSuggestions[svSuggestIdx]; if (s) { setSearchInput(s); setSearchQuery(s); setSvSuggestShow(false); setSvSuggestIdx(-1); setActiveCategory(''); } return; }
+                if (e.key === 'Escape') { setSvSuggestShow(false); setSvSuggestIdx(-1); return; }
+              }
+              if (e.key === 'Enter') { setSearchQuery(searchInput.trim()); setActiveCategory(''); setSvSuggestShow(false); }
+            }}
+            style={{ width: '100%', padding: '9px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', outline: 'none', boxSizing: 'border-box' }}
+          />
+          {svSuggestShow && svSuggestions.length > 0 && (
+            <ul role="listbox" style={{ position: 'absolute', top: '100%', left: 0, right: 0, backgroundColor: '#fff', border: '1px solid #d1d5db', borderRadius: '0 0 8px 8px', margin: 0, padding: 0, listStyle: 'none', zIndex: 100, boxShadow: '0 4px 12px rgba(0,0,0,0.12)', maxHeight: '200px', overflowY: 'auto' }}>
+              {svSuggestions.map((s, idx) => (
+                <li key={s} role="option" aria-selected={idx === svSuggestIdx}
+                  onClick={() => { setSearchInput(s); setSearchQuery(s); setSvSuggestShow(false); setSvSuggestIdx(-1); setActiveCategory(''); }}
+                  onMouseEnter={() => setSvSuggestIdx(idx)} onMouseLeave={() => setSvSuggestIdx(-1)}
+                  style={{ padding: '8px 12px', cursor: 'pointer', fontSize: '13px', borderBottom: '1px solid #f3f4f6', backgroundColor: idx === svSuggestIdx ? '#f0fdf4' : 'transparent' }}
+                >{s}</li>
+              ))}
+            </ul>
+          )}
+        </div>
         <button
-          onClick={() => { setSearchQuery(searchInput.trim()); setActiveCategory(''); }}
+          onClick={() => { setSearchQuery(searchInput.trim()); setActiveCategory(''); setSvSuggestShow(false); }}
           style={{ padding: '9px 14px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600, fontSize: '13px' }}
         >🔍</button>
         {(searchQuery || activeCategory) && (
           <button
-            onClick={() => { setSearchQuery(''); setSearchInput(''); setActiveCategory(''); }}
+            onClick={() => { setSearchQuery(''); setSearchInput(''); setActiveCategory(''); setSvSuggestions([]); setSvSuggestShow(false); }}
             style={{ padding: '9px 12px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
           >✕</button>
         )}
@@ -938,6 +1234,14 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
           </div>
         );
       })()}
+
+      {/* Offline banner (T010) */}
+      {!isOnline && (
+        <div role="status" aria-live="polite" style={{ margin: '6px 12px', padding: '10px 14px', backgroundColor: '#fef3c7', border: '1px solid #fcd34d', borderRadius: '8px', fontSize: '13px', fontWeight: 600, color: '#92400e', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span>⚠️</span>
+          <span>You are offline. Showing cached products. Checkout unavailable.</span>
+        </div>
+      )}
 
       {/* Status */}
       {catalogError && (
@@ -1015,7 +1319,17 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
       {itemCount > 0 && (
         <div style={{ position: 'fixed', bottom: '60px', left: 0, right: 0, backgroundColor: '#fff', borderTop: '2px solid #16a34a', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', zIndex: 40 }}>
           <span style={{ fontSize: '14px', fontWeight: 600 }}>{itemCount} items • {formatKoboToNaira(total)}</span>
-          <button onClick={() => setStep('checkout')} style={{ padding: '10px 20px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 700 }}>
+          <button
+            onClick={() => {
+              if (!isOnline) {
+                alert('You are offline. Please reconnect to the internet before checking out.');
+                return;
+              }
+              setStep('checkout');
+            }}
+            style={{ padding: '10px 20px', backgroundColor: isOnline ? '#16a34a' : '#9ca3af', color: '#fff', border: 'none', borderRadius: '8px', cursor: isOnline ? 'pointer' : 'not-allowed', fontWeight: 700 }}
+            title={!isOnline ? 'Checkout unavailable while offline' : undefined}
+          >
             {t.storefront_checkout}
           </button>
         </div>
@@ -1148,6 +1462,80 @@ function StorefrontModule({ tenantId, t }: { tenantId: string; t: ReturnType<typ
             >
               {modalProduct.quantity === 0 ? 'Out of Stock' : (!!modalProduct.has_variants && modalVariants.length > 0 && !selectedVariant) ? 'Select an option' : `Add ${modalQty > 1 ? `${modalQty}x ` : ''}to Cart — ${formatKoboToNaira((modalProduct.price + (selectedVariant?.price_delta ?? 0)) * modalQty)}`}
             </button>
+
+            {/* WhatsApp share button (T003) */}
+            <button
+              onClick={() => {
+                const slug = (modalProduct as Product & { slug?: string }).slug ?? modalProduct.id;
+                const shareUrl = `${window.location.origin}/products/${slug}`;
+                const text = `Check out *${modalProduct.name}* for ${formatKoboToNaira(modalProduct.price + (selectedVariant?.price_delta ?? 0))}!\n${shareUrl}`;
+                window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener');
+              }}
+              aria-label={`Share ${modalProduct.name} on WhatsApp`}
+              style={{ width: '100%', marginTop: '10px', padding: '12px', fontSize: '14px', fontWeight: 600, borderRadius: '10px', border: 'none', backgroundColor: '#25D366', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+            >
+              Share on WhatsApp
+            </button>
+
+            {/* Reviews section (T007) */}
+            <div style={{ marginTop: '24px', borderTop: '1px solid #e5e7eb', paddingTop: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+                <div style={{ fontWeight: 700, fontSize: '14px' }}>Customer Reviews</div>
+                {modalReviewCount > 0 && (
+                  <div style={{ fontSize: '12px', color: '#6b7280' }}>
+                    {'★'.repeat(Math.round(modalAvgRating))}{'☆'.repeat(5 - Math.round(modalAvgRating))} {modalAvgRating.toFixed(1)} ({modalReviewCount})
+                  </div>
+                )}
+              </div>
+
+              {/* Submit review (authenticated users only) */}
+              {authToken && (
+                <div style={{ background: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '14px' }}>
+                  <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '8px', color: '#374151' }}>Write a Review</div>
+                  <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
+                    {[1,2,3,4,5].map(star => (
+                      <button key={star} onClick={() => setReviewRating(star)}
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '20px', padding: '2px', color: star <= reviewRating ? '#f59e0b' : '#d1d5db' }}>
+                        ★
+                      </button>
+                    ))}
+                  </div>
+                  <textarea
+                    value={reviewText}
+                    onChange={e => setReviewText(e.target.value)}
+                    placeholder="Share your experience (optional)"
+                    rows={3}
+                    style={{ width: '100%', padding: '8px', border: '1px solid #d1d5db', borderRadius: '6px', fontSize: '13px', resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit' }}
+                  />
+                  {reviewError && <div style={{ fontSize: '12px', color: '#dc2626', marginTop: '4px' }}>{reviewError}</div>}
+                  <button
+                    onClick={handleSubmitReview}
+                    disabled={reviewSubmitting || reviewRating === 0}
+                    style={{ marginTop: '8px', padding: '8px 16px', backgroundColor: reviewRating === 0 ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '6px', cursor: reviewRating === 0 ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 600 }}
+                  >
+                    {reviewSubmitting ? 'Submitting…' : 'Submit Review'}
+                  </button>
+                </div>
+              )}
+
+              {/* Review list */}
+              {modalReviews.length === 0 && !authToken && (
+                <p style={{ fontSize: '13px', color: '#9ca3af', textAlign: 'center' }}>No reviews yet. Sign in to be the first!</p>
+              )}
+              {modalReviews.length === 0 && authToken && (
+                <p style={{ fontSize: '13px', color: '#9ca3af', textAlign: 'center' }}>No reviews yet. Be the first!</p>
+              )}
+              {modalReviews.map(rv => (
+                <div key={rv.id} style={{ padding: '10px 0', borderBottom: '1px solid #f3f4f6' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                    <span style={{ color: '#f59e0b', fontSize: '13px' }}>{'★'.repeat(rv.rating)}{'☆'.repeat(5 - rv.rating)}</span>
+                    {rv.verified_purchase === 1 && <span style={{ fontSize: '10px', backgroundColor: '#dcfce7', color: '#16a34a', padding: '1px 6px', borderRadius: '10px', fontWeight: 600 }}>Verified</span>}
+                    <span style={{ fontSize: '11px', color: '#9ca3af', marginLeft: 'auto' }}>{new Date(rv.created_at).toLocaleDateString('en-NG', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                  </div>
+                  {rv.review_text && <p style={{ margin: 0, fontSize: '13px', color: '#374151', lineHeight: '1.5' }}>{rv.review_text}</p>}
+                </div>
+              ))}
+            </div>
 
             <button onClick={closeModal} style={{ width: '100%', marginTop: '10px', padding: '12px', fontSize: '14px', fontWeight: 600, borderRadius: '10px', border: '1px solid #e5e7eb', backgroundColor: '#fff', color: '#374151', cursor: 'pointer' }}>
               Close
@@ -1316,6 +1704,15 @@ interface CatalogProduct {
   vendor_slug: string;
   rating_avg: number | null;
   rating_count: number | null;
+  has_variants?: number;
+}
+
+interface MvProductVariant {
+  id: string;
+  option_name: string;
+  option_value: string;
+  price_delta: number;
+  quantity: number;
 }
 
 // ── Vendor badge colours (deterministic from vendor_slug hash) ────────────────
@@ -1332,48 +1729,352 @@ function vendorBadgeColor(vendorSlug: string) {
   return VENDOR_BADGE_COLORS[h % VENDOR_BADGE_COLORS.length]!;
 }
 
+// ── MV marketplace cart item ──────────────────────────────────────────────────
+interface MvCartItem {
+  product_id: string;
+  vendor_id: string;
+  vendor_name: string;
+  vendor_slug: string;
+  name: string;
+  price: number; // kobo
+  quantity: number;
+  image_url: string | null;
+}
+
 // Multi-Vendor Marketplace Module (COM-3 — MV-3 updated)
 function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<typeof getTranslations> }) {
+  const isOnline = useOnlineStatus();
   const [activeTab, setActiveTab] = useState<'browse' | 'vendors' | 'vendor-dashboard'>('browse');
+
+  // ── Cart state ────────────────────────────────────────────────────────────
+  const MV_CART_KEY = `ww_mv_cart_${tenantId}`;
+  const MV_CART_TOKEN_KEY = `ww_mv_cart_token_${tenantId}`;
+  const [mvCart, setMvCart] = useState<MvCartItem[]>(() => {
+    try { return JSON.parse(localStorage.getItem(MV_CART_KEY) ?? '[]'); } catch { return []; }
+  });
+  const [cartToken, setCartToken] = useState<string | null>(() =>
+    localStorage.getItem(MV_CART_TOKEN_KEY)
+  );
+  const [showCart, setShowCart] = useState(false);
+  const [showCheckout, setShowCheckout] = useState(false);
+  const [orderSuccess, setOrderSuccess] = useState<{ marketplace_order_id: string } | null>(null);
+  // T-CVC-02: Commerce no longer renders a local tracking UI; redirect to Logistics portal.
+  const { loading: mvTrackingLoading, error: mvTrackingError, openTracking: mvOpenTracking } = useTrackingRedirect(tenantId);
+
+  // Rehydrate cart from server on mount if we have a token
+  useEffect(() => {
+    const token = localStorage.getItem(MV_CART_TOKEN_KEY);
+    if (!token) return;
+    fetch(`/api/multi-vendor/cart/${encodeURIComponent(token)}`, { headers: { 'x-tenant-id': tenantId } })
+      .then(r => r.json() as Promise<{ success: boolean; data?: { items: MvCartItem[] } }>)
+      .then(d => {
+        if (d.success && d.data?.items?.length) {
+          setMvCart(d.data.items);
+          localStorage.setItem(MV_CART_KEY, JSON.stringify(d.data.items));
+        } else {
+          // Token expired or cart gone — fall back to localStorage items
+          const saved = localStorage.getItem(MV_CART_KEY);
+          if (saved) { try { setMvCart(JSON.parse(saved)); } catch { /* noop */ } }
+        }
+      })
+      .catch(() => {
+        const saved = localStorage.getItem(MV_CART_KEY);
+        if (saved) { try { setMvCart(JSON.parse(saved)); } catch { /* noop */ } }
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenantId]);
+
+  // Sync cart to server (POST /cart) and persist to localStorage whenever it changes
+  const cartSyncRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    localStorage.setItem(MV_CART_KEY, JSON.stringify(mvCart));
+    if (mvCart.length === 0) return;
+    // Debounce server sync by 600ms to avoid hammering API on rapid adds
+    if (cartSyncRef.current) clearTimeout(cartSyncRef.current);
+    cartSyncRef.current = setTimeout(async () => {
+      try {
+        const token = localStorage.getItem(MV_CART_TOKEN_KEY);
+        const res = await fetch('/api/multi-vendor/cart', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+          body: JSON.stringify({ items: mvCart, ndpr_consent: true, ...(token ? { token } : {}) }),
+        });
+        const d = await res.json() as { success: boolean; data?: { token: string } };
+        if (d.success && d.data?.token) {
+          localStorage.setItem(MV_CART_TOKEN_KEY, d.data.token);
+          setCartToken(d.data.token);
+        }
+      } catch { /* noop — cart already persisted in localStorage */ }
+    }, 600);
+  }, [mvCart, MV_CART_KEY, MV_CART_TOKEN_KEY, tenantId]);
+
+  const addToMvCart = useCallback((p: CatalogProduct) => {
+    setMvCart(prev => {
+      const existing = prev.find(i => i.product_id === p.id);
+      if (existing) {
+        return prev.map(i => i.product_id === p.id ? { ...i, quantity: i.quantity + 1 } : i);
+      }
+      return [...prev, {
+        product_id: p.id, vendor_id: p.vendor_id,
+        vendor_name: p.vendor_name, vendor_slug: p.vendor_slug,
+        name: p.name, price: p.price, quantity: 1, image_url: p.image_url,
+      }];
+    });
+  }, []);
+
+  const removeFromMvCart = useCallback((productId: string) => {
+    setMvCart(prev => prev.filter(i => i.product_id !== productId));
+  }, []);
+
+  const adjustMvCartQty = useCallback((productId: string, delta: number) => {
+    setMvCart(prev => prev
+      .map(i => i.product_id === productId ? { ...i, quantity: Math.max(0, i.quantity + delta) } : i)
+      .filter(i => i.quantity > 0)
+    );
+  }, []);
+
+  const mvCartTotal = mvCart.reduce((s, i) => s + i.price * i.quantity, 0);
+  const mvCartCount = mvCart.reduce((s, i) => s + i.quantity, 0);
+
+  // ── Product detail modal ──────────────────────────────────────────────────
+  const [selectedProduct, setSelectedProduct] = useState<CatalogProduct | null>(null);
+  const [modalQty, setModalQty] = useState(1);
+  const [mvVariants, setMvVariants] = useState<MvProductVariant[]>([]);
+  const [mvVariantsLoading, setMvVariantsLoading] = useState(false);
+  const [mvSelectedVariant, setMvSelectedVariant] = useState<MvProductVariant | null>(null);
+
+  const mvVariantGroups = useMemo<Record<string, MvProductVariant[]>>(() => {
+    const groups: Record<string, MvProductVariant[]> = {};
+    for (const v of mvVariants) {
+      if (!groups[v.option_name]) groups[v.option_name] = [];
+      groups[v.option_name]!.push(v);
+    }
+    return groups;
+  }, [mvVariants]);
+
+  const openProductModal = (p: CatalogProduct) => {
+    setSelectedProduct(p);
+    setModalQty(1);
+    setMvVariants([]);
+    setMvSelectedVariant(null);
+    if (p.has_variants) {
+      setMvVariantsLoading(true);
+      fetch(`/api/multi-vendor/vendors/${p.vendor_id}/products/${p.id}/variants`, {
+        headers: { 'x-tenant-id': tenantId },
+      })
+        .then(r => r.json() as Promise<{ success: boolean; data: { variants: MvProductVariant[] } }>)
+        .then(d => { if (d.success) setMvVariants(d.data.variants ?? []); })
+        .catch(() => {})
+        .finally(() => setMvVariantsLoading(false));
+    }
+  };
+
+  const closeProductModal = () => setSelectedProduct(null);
+
+  const handleAddFromModal = () => {
+    if (!selectedProduct) return;
+    const effectivePrice = selectedProduct.price + (mvSelectedVariant?.price_delta ?? 0);
+    const availableQty = mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity;
+    const name = mvSelectedVariant ? `${selectedProduct.name} — ${mvSelectedVariant.option_value}` : selectedProduct.name;
+    const cartKey = mvSelectedVariant ? `${selectedProduct.id}__${mvSelectedVariant.id}` : selectedProduct.id;
+    const qty = Math.min(modalQty, availableQty);
+    setMvCart(prev => {
+      const existing = prev.find(i => i.product_id === cartKey);
+      if (existing) {
+        return prev.map(i => i.product_id === cartKey ? { ...i, quantity: i.quantity + qty } : i);
+      }
+      return [...prev, {
+        product_id: cartKey,
+        vendor_id: selectedProduct.vendor_id,
+        vendor_name: selectedProduct.vendor_name,
+        vendor_slug: selectedProduct.vendor_slug,
+        name, price: effectivePrice, quantity: qty, image_url: selectedProduct.image_url,
+      }];
+    });
+    closeProductModal();
+  };
+
+  // ── Checkout form state ───────────────────────────────────────────────────
+  const [ckEmail, setCkEmail] = useState('');
+  const [ckPhone, setCkPhone] = useState('');
+  const [ckState, setCkState] = useState('');
+  const [ckLga, setCkLga] = useState('');
+  const [ckStreet, setCkStreet] = useState('');
+  const [ckNdpr, setCkNdpr] = useState(false);
+  const [ckLoading, setCkLoading] = useState(false);
+  const [ckError, setCkError] = useState('');
+  const [shippingEst, setShippingEst] = useState<{ fee: number; min_days: number; max_days: number } | null>(null);
+  const [shippingLoading, setShippingLoading] = useState(false);
+
+  // Fetch shipping estimates aggregated across all unique vendors in cart
+  useEffect(() => {
+    if (!ckState || mvCart.length === 0) { setShippingEst(null); return; }
+    // Extract unique vendor IDs (cart key may include variant suffix; vendor_id is always a clean ID)
+    const uniqueVendorIds = [...new Set(mvCart.map(i => i.vendor_id))];
+    setShippingLoading(true);
+    Promise.all(uniqueVendorIds.map(vendorId => {
+      const params = new URLSearchParams({ vendor_id: vendorId, state: ckState });
+      if (ckLga.trim()) params.set('lga', ckLga.trim());
+      return fetch(`/api/multi-vendor/shipping/estimate?${params}`, { headers: { 'x-tenant-id': tenantId } })
+        .then(r => r.json() as Promise<{ success: boolean; data?: { fee: number; min_days: number; max_days: number } }>)
+        .then(d => d.success && d.data ? d.data : null)
+        .catch(() => null);
+    }))
+      .then(results => {
+        const valid = results.filter((r): r is { fee: number; min_days: number; max_days: number } => r !== null);
+        if (valid.length === 0) { setShippingEst(null); return; }
+        setShippingEst({
+          fee: valid.reduce((s, r) => s + r.fee, 0),
+          min_days: Math.max(...valid.map(r => r.min_days)),
+          max_days: Math.max(...valid.map(r => r.max_days)),
+        });
+      })
+      .finally(() => setShippingLoading(false));
+  }, [ckState, ckLga, tenantId, mvCart]);
+
+  // Per-vendor breakdown
+  const vendorBreakdown = useMemo(() => {
+    const map = new Map<string, { vendor_name: string; vendor_slug: string; items: MvCartItem[]; subtotal: number }>();
+    for (const item of mvCart) {
+      const existing = map.get(item.vendor_id);
+      if (existing) {
+        existing.items.push(item);
+        existing.subtotal += item.price * item.quantity;
+      } else {
+        map.set(item.vendor_id, { vendor_name: item.vendor_name, vendor_slug: item.vendor_slug, items: [item], subtotal: item.price * item.quantity });
+      }
+    }
+    return Array.from(map.values());
+  }, [mvCart]);
+
+  const handleCheckout = async () => {
+    if (!ckEmail.trim()) { setCkError('Email is required'); return; }
+    if (!ckNdpr) { setCkError('Please accept NDPR data consent to continue'); return; }
+    if (mvCart.length === 0) return;
+    setCkLoading(true); setCkError('');
+    try {
+      const body = {
+        items: mvCart.map(i => ({
+          product_id: i.product_id,
+          vendor_id: i.vendor_id,
+          quantity: i.quantity,
+          price: i.price,
+          name: i.name,
+        })),
+        customer_email: ckEmail.trim(),
+        customer_phone: ckPhone.trim() || undefined,
+        payment_method: 'pay_on_delivery',
+        ndpr_consent: true,
+        delivery_address: ckState ? { state: ckState, lga: ckLga, street: ckStreet } : undefined,
+      };
+      const res = await fetch('/api/multi-vendor/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify(body),
+      });
+      const d = await res.json() as { success: boolean; data?: { marketplace_order_id: string }; error?: string };
+      if (d.success && d.data) {
+        setOrderSuccess({ marketplace_order_id: d.data.marketplace_order_id });
+        setMvCart([]);
+        setCartToken(null);
+        localStorage.removeItem(MV_CART_KEY);
+        localStorage.removeItem(MV_CART_TOKEN_KEY);
+        setShowCheckout(false);
+        setShowCart(false);
+      } else {
+        setCkError(d.error ?? 'Checkout failed. Please try again.');
+      }
+    } catch {
+      setCkError('Network error. Please try again.');
+    } finally {
+      setCkLoading(false);
+    }
+  };
 
   // ── Catalog state (MV-3 live fetch + infinite scroll) ────────────────────
   const [products, setProducts] = useState<CatalogProduct[]>([]);
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [category, setCategory] = useState('');
+  const [vendorFilter, setVendorFilter] = useState<string>(''); // vendor id for pill filter
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState('');
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const mvGridRef = useRef<HTMLDivElement | null>(null);
+  // Derive unique categories from all loaded products (updated on every fetch)
+  const [allCategories, setAllCategories] = useState<string[]>([]);
+
+  // ── Virtualizer: 2-column MV browse grid ────────────────────────────────
+  const MV_GRID_COLS = 2;
+  const mvProductRows = useMemo(() => Math.ceil(products.length / MV_GRID_COLS), [products.length]);
+  const mvRowVirtualizer = useVirtualizer({
+    count: mvProductRows,
+    getScrollElement: () => mvGridRef.current,
+    estimateSize: () => 230,
+    overscan: 3,
+  });
 
   const fetchCatalog = useCallback(async (cursor = '', reset = false) => {
     setCatalogLoading(true);
     setCatalogError('');
     try {
-      const params = new URLSearchParams({ per_page: '12' });
-      if (cursor)   params.set('after', cursor);
-      if (search)   params.set('search', search);
-      if (category) params.set('category', category);
-      const res = await fetch(`/api/multi-vendor/catalog?${params}`, {
-        headers: { 'x-tenant-id': tenantId },
+      let url: string;
+      let fetchedProducts: CatalogProduct[] = [];
+      let fetchedHasMore = false;
+      let fetchedNextCursor: string | null = null;
+
+      if (vendorFilter) {
+        // Vendor pill selected — fetch that vendor's products
+        const res = await fetch(`/api/multi-vendor/vendors/${encodeURIComponent(vendorFilter)}/products`, {
+          headers: { 'x-tenant-id': tenantId },
+        });
+        if (!res.ok) throw new Error(`Vendor products fetch failed (${res.status})`);
+        const json = await res.json() as { success: boolean; data: CatalogProduct[] };
+        // Client-side category filter
+        fetchedProducts = json.data ?? [];
+        if (category) fetchedProducts = fetchedProducts.filter(p => p.category === category);
+        if (search) fetchedProducts = fetchedProducts.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
+        fetchedHasMore = false;
+        fetchedNextCursor = null;
+      } else {
+        const params = new URLSearchParams({ per_page: '12' });
+        if (cursor)   params.set('after', cursor);
+        if (search)   params.set('q', search);
+        if (category) params.set('category', category);
+        url = `/api/multi-vendor/catalog?${params}`;
+        const res = await fetch(url, { headers: { 'x-tenant-id': tenantId } });
+        if (!res.ok) throw new Error(`Catalog fetch failed (${res.status})`);
+        const json = await res.json() as {
+          success: boolean;
+          data: CatalogProduct[];
+          meta: { has_more: boolean; next_cursor: string | null };
+        };
+        fetchedProducts = json.data;
+        fetchedHasMore = json.meta.has_more;
+        fetchedNextCursor = json.meta.next_cursor;
+      }
+
+      setProducts(prev => {
+        const next = reset ? fetchedProducts : [...prev, ...fetchedProducts];
+        // Update category list from all loaded products
+        setAllCategories(cats => {
+          const seen = new Set(reset ? [] : cats);
+          for (const p of fetchedProducts) { if (p.category) seen.add(p.category); }
+          return Array.from(seen).sort();
+        });
+        return next;
       });
-      if (!res.ok) throw new Error(`Catalog fetch failed (${res.status})`);
-      const json = await res.json() as {
-        success: boolean;
-        data: CatalogProduct[];
-        meta: { has_more: boolean; next_cursor: string | null };
-      };
-      setProducts(prev => reset ? json.data : [...prev, ...json.data]);
-      setHasMore(json.meta.has_more);
-      setNextCursor(json.meta.next_cursor);
+      setHasMore(fetchedHasMore);
+      setNextCursor(fetchedNextCursor);
     } catch (e) {
       setCatalogError(String(e));
       if (reset) setProducts([]);
     } finally {
       setCatalogLoading(false);
     }
-  }, [tenantId, search, category]);
+  }, [tenantId, search, category, vendorFilter]);
 
   // Initial load and when filters change
   useEffect(() => {
@@ -1393,19 +2094,21 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
     return () => obs.disconnect();
   }, [hasMore, catalogLoading, nextCursor, fetchCatalog]);
 
-  // ── Vendor list state (live from /vendors) ───────────────────────────────
+  // ── Vendor list state (live from /vendors — used for browse pills + vendors tab) ──
   const [vendors, setVendors] = useState<Array<{ id: string; name: string; slug: string; status: string; commission_rate: number }>>([]);
   const [vendorsLoading, setVendorsLoading] = useState(false);
 
   useEffect(() => {
-    if (activeTab !== 'vendors') return;
+    // Load vendors for the browse vendor filter pills and the vendors tab
+    if (activeTab !== 'vendors' && activeTab !== 'browse') return;
+    if (vendors.length > 0) return; // already loaded
     setVendorsLoading(true);
     fetch('/api/multi-vendor/vendors', { headers: { 'x-tenant-id': tenantId } })
       .then(r => r.ok ? r.json() as Promise<{ success: boolean; data: typeof vendors }> : Promise.reject(r.status))
       .then(j => setVendors(j.data ?? []))
       .catch(() => setVendors([]))
       .finally(() => setVendorsLoading(false));
-  }, [activeTab, tenantId]);
+  }, [activeTab, tenantId, vendors.length]);
 
   const tabs: Array<{ id: typeof activeTab; label: string }> = [
     { id: 'browse', label: t.marketplace_products },
@@ -1413,8 +2116,371 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
     { id: 'vendor-dashboard', label: '🏪 Vendor' },
   ];
 
+  // ── Shared input style ────────────────────────────────────────────────────
+  const inp: React.CSSProperties = { width: '100%', padding: '10px 12px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px', boxSizing: 'border-box', marginBottom: '10px' };
+  const lbl: React.CSSProperties = { fontSize: '12px', fontWeight: 600, color: '#374151', display: 'block', marginBottom: '4px' };
+
   return (
-    <div>
+    <div style={{ position: 'relative' }}>
+
+      {/* ── Offline banner ─────────────────────────────────────────────────── */}
+      {!isOnline && (
+        <div style={{ backgroundColor: '#fef3c7', borderBottom: '1px solid #fcd34d', padding: '8px 12px', fontSize: '12px', color: '#92400e', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span>⚠️</span>
+          <span>You are offline. Browsing cached products. Checkout is unavailable until you reconnect.</span>
+        </div>
+      )}
+
+      {/* ── Order success screen ────────────────────────────────────────────── */}
+      {orderSuccess && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '16px', padding: '28px 20px', maxWidth: '380px', width: '100%', maxHeight: '90vh', overflowY: 'auto' }}>
+            <div style={{ textAlign: 'center', marginBottom: '16px' }}>
+              <div style={{ fontSize: '48px', marginBottom: '8px' }}>🎉</div>
+              <div style={{ fontSize: '20px', fontWeight: 700, color: '#111827' }}>Order Placed!</div>
+              <div style={{ fontSize: '13px', color: '#6b7280', marginTop: '4px' }}>Your order has been received and vendors have been notified.</div>
+            </div>
+            <div style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '8px', padding: '12px', marginBottom: '12px', textAlign: 'center' }}>
+              <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>Order Reference</div>
+              <div style={{ fontSize: '13px', fontWeight: 700, color: '#15803d', wordBreak: 'break-all' }}>{orderSuccess.marketplace_order_id}</div>
+              <button
+                onClick={() => { navigator.clipboard?.writeText(orderSuccess.marketplace_order_id).catch(() => {}); }}
+                style={{ marginTop: '8px', padding: '5px 14px', backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px', fontSize: '12px', color: '#15803d', cursor: 'pointer', fontWeight: 600 }}
+              >
+                📋 Copy Reference
+              </button>
+            </div>
+
+            {/* Track order button (T-CVC-02) — opens Logistics portal in new tab */}
+            <button
+              onClick={() => mvOpenTracking(
+                orderSuccess.marketplace_order_id,
+                `multi-vendor/orders/track?marketplace_order_id=${encodeURIComponent(orderSuccess.marketplace_order_id)}`,
+              )}
+              disabled={mvTrackingLoading}
+              style={{ width: '100%', padding: '10px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '8px', fontWeight: 600, cursor: mvTrackingLoading ? 'wait' : 'pointer', fontSize: '13px', marginBottom: '10px' }}
+            >
+              {mvTrackingLoading ? 'Opening tracker…' : '📦 Track This Order'}
+            </button>
+            {mvTrackingError && (
+              <div style={{ marginBottom: '10px', padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '12px' }}>{mvTrackingError}</div>
+            )}
+
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                onClick={() => { setOrderSuccess(null); setActiveTab('browse'); }}
+                style={{ flex: 1, padding: '11px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: 'pointer', fontSize: '13px' }}
+              >
+                Shop More
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Product detail bottom-sheet modal ──────────────────────────────── */}
+      {selectedProduct && (
+        <div
+          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}
+          onClick={closeProductModal}
+        >
+          <div
+            style={{ backgroundColor: '#fff', borderRadius: '20px 20px 0 0', width: '100%', maxWidth: '600px', padding: '20px', maxHeight: '85vh', overflowY: 'auto' }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Drag handle */}
+            <div style={{ width: '40px', height: '4px', backgroundColor: '#e5e7eb', borderRadius: '2px', margin: '0 auto 16px' }} />
+
+            {/* Product image */}
+            {selectedProduct.image_url ? (
+              <img src={selectedProduct.image_url} alt={selectedProduct.name} style={{ width: '100%', height: '200px', objectFit: 'cover', borderRadius: '12px', marginBottom: '16px' }} />
+            ) : (
+              <div style={{ backgroundColor: '#fef9c3', height: '160px', borderRadius: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '48px', marginBottom: '16px' }}>
+                🛍️
+              </div>
+            )}
+
+            {/* Vendor badge */}
+            {(() => {
+              const badge = vendorBadgeColor(selectedProduct.vendor_slug);
+              return (
+                <span style={{ display: 'inline-block', fontSize: '11px', fontWeight: 600, backgroundColor: badge.bg, color: badge.text, borderRadius: '4px', padding: '2px 8px', marginBottom: '8px' }}>
+                  @{selectedProduct.vendor_slug}
+                </span>
+              );
+            })()}
+
+            {selectedProduct.category && (
+              <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '4px' }}>{selectedProduct.category}</div>
+            )}
+            <div style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px', color: '#111827' }}>{selectedProduct.name}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+              <span style={{ fontSize: '22px', fontWeight: 800, color: '#16a34a' }}>
+                {formatKoboToNaira(selectedProduct.price + (mvSelectedVariant?.price_delta ?? 0))}
+              </span>
+              {mvSelectedVariant?.price_delta ? (
+                <span style={{ fontSize: '12px', color: mvSelectedVariant.price_delta > 0 ? '#dc2626' : '#16a34a' }}>
+                  {mvSelectedVariant.price_delta > 0 ? '+' : ''}{formatKoboToNaira(mvSelectedVariant.price_delta)}
+                </span>
+              ) : null}
+            </div>
+
+            {selectedProduct.rating_avg != null && (
+              <div style={{ fontSize: '12px', color: '#f59e0b', marginBottom: '10px' }}>
+                {'★'.repeat(Math.round(selectedProduct.rating_avg))}{'☆'.repeat(5 - Math.round(selectedProduct.rating_avg))}
+                <span style={{ color: '#9ca3af', marginLeft: '4px' }}>({selectedProduct.rating_count} reviews)</span>
+              </div>
+            )}
+
+            {selectedProduct.description && (
+              <div style={{ fontSize: '13px', color: '#4b5563', lineHeight: '1.6', marginBottom: '16px' }}>{selectedProduct.description}</div>
+            )}
+
+            {/* Variant picker */}
+            {mvVariantsLoading && <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '12px' }}>Loading options…</div>}
+            {Object.entries(mvVariantGroups).map(([optionName, variants]) => (
+              <div key={optionName} style={{ marginBottom: '14px' }}>
+                <div style={{ fontSize: '12px', fontWeight: 700, color: '#374151', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{optionName}</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {variants.map(v => (
+                    <button
+                      key={v.id}
+                      onClick={() => setMvSelectedVariant(prev => prev?.id === v.id ? null : v)}
+                      disabled={v.quantity === 0}
+                      style={{
+                        padding: '6px 14px', borderRadius: '20px', fontSize: '13px', fontWeight: 600, cursor: v.quantity === 0 ? 'not-allowed' : 'pointer',
+                        border: `2px solid ${mvSelectedVariant?.id === v.id ? '#16a34a' : '#e5e7eb'}`,
+                        backgroundColor: mvSelectedVariant?.id === v.id ? '#f0fdf4' : v.quantity === 0 ? '#f9fafb' : '#fff',
+                        color: v.quantity === 0 ? '#9ca3af' : mvSelectedVariant?.id === v.id ? '#15803d' : '#374151',
+                        textDecoration: v.quantity === 0 ? 'line-through' : 'none',
+                      }}
+                    >
+                      {v.option_value}{v.price_delta !== 0 ? ` (${v.price_delta > 0 ? '+' : ''}${formatKoboToNaira(v.price_delta)})` : ''}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+
+            <div style={{ fontSize: '12px', color: (mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity) > 0 ? '#16a34a' : '#dc2626', marginBottom: '16px', fontWeight: 600 }}>
+              {(mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity) > 0
+                ? `${mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity} in stock`
+                : 'Out of stock'}
+            </div>
+
+            {/* Quantity stepper */}
+            {(mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity) > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
+                <span style={{ fontSize: '13px', color: '#374151', fontWeight: 600 }}>Quantity:</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0', border: '1px solid #e5e7eb', borderRadius: '8px', overflow: 'hidden' }}>
+                  <button onClick={() => setModalQty(q => Math.max(1, q - 1))} style={{ padding: '8px 14px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '16px', fontWeight: 700 }}>−</button>
+                  <span style={{ padding: '8px 16px', fontSize: '15px', fontWeight: 700, minWidth: '40px', textAlign: 'center' }}>{modalQty}</span>
+                  <button onClick={() => setModalQty(q => Math.min(mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity, q + 1))} style={{ padding: '8px 14px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '16px', fontWeight: 700 }}>+</button>
+                </div>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            {(() => {
+              const needsVariant = !!selectedProduct.has_variants && mvVariants.length > 0 && !mvSelectedVariant;
+              const stockQty = mvSelectedVariant ? mvSelectedVariant.quantity : selectedProduct.quantity;
+              const isDisabled = stockQty === 0 || needsVariant;
+              const effectivePrice = selectedProduct.price + (mvSelectedVariant?.price_delta ?? 0);
+              return (
+                <div style={{ display: 'flex', gap: '10px', marginBottom: '12px' }}>
+                  <button
+                    onClick={handleAddFromModal}
+                    disabled={isDisabled}
+                    style={{ flex: 1, padding: '13px', backgroundColor: isDisabled ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: isDisabled ? 'not-allowed' : 'pointer' }}
+                  >
+                    {stockQty === 0 ? 'Out of Stock' : needsVariant ? 'Select an option' : `Add ${modalQty > 1 ? `${modalQty}x ` : ''}to Cart — ${formatKoboToNaira(effectivePrice * modalQty)}`}
+                  </button>
+                  {/* WhatsApp share */}
+                  <a
+                    href={`https://wa.me/?text=${encodeURIComponent(`Check out "${selectedProduct.name}" for ${formatKoboToNaira(effectivePrice)} on WebWaka Marketplace!\n${window.location.origin}/?product=${encodeURIComponent(selectedProduct.vendor_slug + '_' + selectedProduct.id)}`)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '13px 16px', backgroundColor: '#25d366', color: '#fff', borderRadius: '10px', textDecoration: 'none', fontSize: '20px' }}
+                    title="Share on WhatsApp"
+                  >
+                    💬
+                  </a>
+                </div>
+              );
+            })()}
+
+            <button
+              onClick={closeProductModal}
+              style={{ width: '100%', padding: '10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Checkout modal ──────────────────────────────────────────────────── */}
+      {showCheckout && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '20px 20px 0 0', width: '100%', maxWidth: '600px', padding: '20px', maxHeight: '90vh', overflowY: 'auto' }}>
+            <div style={{ width: '40px', height: '4px', backgroundColor: '#e5e7eb', borderRadius: '2px', margin: '0 auto 16px' }} />
+            <div style={{ fontWeight: 700, fontSize: '18px', marginBottom: '16px' }}>Checkout</div>
+
+            {/* Per-vendor breakdown */}
+            <div style={{ marginBottom: '16px' }}>
+              <div style={{ fontSize: '13px', fontWeight: 600, color: '#374151', marginBottom: '8px' }}>Order Summary</div>
+              {vendorBreakdown.map(vg => {
+                const badge = vendorBadgeColor(vg.vendor_slug);
+                return (
+                  <div key={vg.vendor_slug} style={{ border: '1px solid #e5e7eb', borderRadius: '8px', padding: '10px 12px', marginBottom: '8px' }}>
+                    <span style={{ display: 'inline-block', fontSize: '11px', fontWeight: 600, backgroundColor: badge.bg, color: badge.text, borderRadius: '4px', padding: '1px 6px', marginBottom: '6px' }}>@{vg.vendor_slug}</span>
+                    {vg.items.map(item => (
+                      <div key={item.product_id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#4b5563', padding: '2px 0' }}>
+                        <span>{item.name} × {item.quantity}</span>
+                        <span style={{ fontWeight: 600 }}>{formatKoboToNaira(item.price * item.quantity)}</span>
+                      </div>
+                    ))}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', fontWeight: 700, color: '#111827', marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #f3f4f6' }}>
+                      <span>Vendor subtotal</span>
+                      <span style={{ color: '#16a34a' }}>{formatKoboToNaira(vg.subtotal)}</span>
+                    </div>
+                  </div>
+                );
+              })}
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '15px', padding: '8px 0', borderTop: '2px solid #e5e7eb', marginTop: '4px' }}>
+                <span>Total</span>
+                <span style={{ color: '#16a34a' }}>{formatKoboToNaira(mvCartTotal)}</span>
+              </div>
+              {shippingEst && (
+                <div style={{ fontSize: '12px', color: '#6b7280', marginTop: '4px' }}>
+                  Estimated delivery: {shippingEst.min_days}–{shippingEst.max_days} days{shippingEst.fee > 0 ? ` · Shipping: ${formatKoboToNaira(shippingEst.fee)}` : ' · Free shipping'}
+                </div>
+              )}
+              {shippingLoading && <div style={{ fontSize: '12px', color: '#9ca3af', marginTop: '4px' }}>Estimating shipping…</div>}
+            </div>
+
+            {/* Customer info */}
+            <div style={{ marginBottom: '12px' }}>
+              <label style={lbl}>Email <span style={{ color: '#dc2626' }}>*</span></label>
+              <input type="email" placeholder="you@example.com" value={ckEmail} onChange={e => { setCkEmail(e.target.value); setCkError(''); }} style={inp} />
+              <label style={lbl}>Phone (optional)</label>
+              <input type="tel" placeholder="08012345678" value={ckPhone} onChange={e => setCkPhone(e.target.value)} style={inp} />
+            </div>
+
+            {/* Delivery address */}
+            <div style={{ backgroundColor: '#f9fafb', borderRadius: '8px', padding: '12px', marginBottom: '12px' }}>
+              <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Delivery Address <span style={{ color: '#6b7280', fontWeight: 400 }}>(optional)</span></div>
+              <label style={lbl}>State</label>
+              <select value={ckState} onChange={e => { setCkState(e.target.value); setCkLga(''); }} style={{ ...inp, backgroundColor: '#fff' }}>
+                <option value="">— Select State —</option>
+                {NIGERIAN_STATES.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <label style={lbl}>LGA / Area</label>
+              {ckState && STATE_LGAS[ckState] ? (
+                <select value={ckLga} onChange={e => setCkLga(e.target.value)} style={{ ...inp, backgroundColor: '#fff' }}>
+                  <option value="">— Select LGA —</option>
+                  {STATE_LGAS[ckState].map(l => <option key={l} value={l}>{l}</option>)}
+                </select>
+              ) : (
+                <input type="text" placeholder="e.g. Ikeja" value={ckLga} onChange={e => setCkLga(e.target.value)} style={inp} />
+              )}
+              <label style={lbl}>Street Address</label>
+              <input type="text" placeholder="e.g. 12 Allen Avenue" value={ckStreet} onChange={e => setCkStreet(e.target.value)} style={inp} />
+            </div>
+
+            {/* NDPR consent */}
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: '16px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={ckNdpr}
+                onChange={e => { setCkNdpr(e.target.checked); setCkError(''); }}
+                style={{ marginTop: '2px', width: '16px', height: '16px', flexShrink: 0 }}
+              />
+              <span style={{ fontSize: '12px', color: '#4b5563', lineHeight: '1.5' }}>
+                I consent to the processing of my personal data (email, phone, address) for order fulfillment in accordance with the <strong>Nigeria Data Protection Regulation (NDPR)</strong>. My data will not be shared with third parties beyond vendors fulfilling my order.
+              </span>
+            </label>
+
+            {ckError && (
+              <div style={{ padding: '10px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '12px' }}>
+                {ckError}
+              </div>
+            )}
+
+            <button
+              onClick={() => {
+                if (!isOnline) { setCkError('You are offline. Please reconnect to the internet to place your order.'); return; }
+                handleCheckout();
+              }}
+              disabled={ckLoading}
+              style={{ width: '100%', padding: '13px', backgroundColor: (!isOnline || ckLoading) ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: ckLoading ? 'not-allowed' : 'pointer', marginBottom: '10px' }}
+            >
+              {!isOnline ? '📶 Offline — Tap for details' : ckLoading ? 'Placing Order…' : `Place Order · ${formatKoboToNaira(mvCartTotal)}`}
+            </button>
+            <button
+              onClick={() => { setShowCheckout(false); setShowCart(true); }}
+              style={{ width: '100%', padding: '10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
+            >
+              Back to Cart
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Cart bottom-sheet ────────────────────────────────────────────────── */}
+      {showCart && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+          <div style={{ backgroundColor: '#fff', borderRadius: '20px 20px 0 0', width: '100%', maxWidth: '600px', padding: '20px', maxHeight: '85vh', overflowY: 'auto' }}>
+            <div style={{ width: '40px', height: '4px', backgroundColor: '#e5e7eb', borderRadius: '2px', margin: '0 auto 16px' }} />
+            <div style={{ fontWeight: 700, fontSize: '18px', marginBottom: '16px' }}>Your Cart ({mvCartCount})</div>
+            {mvCart.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#9ca3af', padding: '32px 0', fontSize: '14px' }}>Your cart is empty.</div>
+            ) : (
+              <>
+                {mvCart.map(item => {
+                  const badge = vendorBadgeColor(item.vendor_slug);
+                  return (
+                    <div key={item.product_id} style={{ display: 'flex', gap: '10px', padding: '10px 0', borderBottom: '1px solid #f3f4f6', alignItems: 'center' }}>
+                      <div style={{ width: '48px', height: '48px', borderRadius: '8px', backgroundColor: '#fef9c3', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px', flexShrink: 0, overflow: 'hidden' }}>
+                        {item.image_url ? <img src={item.image_url} alt={item.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : '🛍️'}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '13px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</div>
+                        <span style={{ display: 'inline-block', fontSize: '10px', backgroundColor: badge.bg, color: badge.text, borderRadius: '3px', padding: '1px 4px', marginTop: '2px' }}>@{item.vendor_slug}</span>
+                        <div style={{ fontSize: '13px', fontWeight: 700, color: '#16a34a', marginTop: '2px' }}>{formatKoboToNaira(item.price * item.quantity)}</div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0', border: '1px solid #e5e7eb', borderRadius: '8px', overflow: 'hidden', flexShrink: 0 }}>
+                        <button onClick={() => adjustMvCartQty(item.product_id, -1)} style={{ padding: '6px 10px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '14px', fontWeight: 700 }}>−</button>
+                        <span style={{ padding: '6px 10px', fontSize: '13px', fontWeight: 700 }}>{item.quantity}</span>
+                        <button onClick={() => adjustMvCartQty(item.product_id, 1)} style={{ padding: '6px 10px', border: 'none', backgroundColor: '#f9fafb', cursor: 'pointer', fontSize: '14px', fontWeight: 700 }}>+</button>
+                      </div>
+                      <button onClick={() => removeFromMvCart(item.product_id)} style={{ border: 'none', background: 'none', color: '#dc2626', cursor: 'pointer', fontSize: '18px', padding: '4px', flexShrink: 0 }}>×</button>
+                    </div>
+                  );
+                })}
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '16px', padding: '12px 0 4px', borderTop: '2px solid #e5e7eb' }}>
+                  <span>Total</span>
+                  <span style={{ color: '#16a34a' }}>{formatKoboToNaira(mvCartTotal)}</span>
+                </div>
+                <button
+                  onClick={() => { setShowCart(false); setShowCheckout(true); }}
+                  disabled={!isOnline}
+                  style={{ width: '100%', padding: '13px', backgroundColor: !isOnline ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: 700, fontSize: '15px', cursor: !isOnline ? 'not-allowed' : 'pointer', marginTop: '12px', marginBottom: '8px' }}
+                >
+                  {!isOnline ? 'Offline — Cannot Checkout' : 'Proceed to Checkout'}
+                </button>
+              </>
+            )}
+            <button
+              onClick={() => setShowCart(false)}
+              style={{ width: '100%', padding: '10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}
+            >
+              Continue Shopping
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Tabs */}
       <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', padding: '0 12px' }}>
         {tabs.map(tab => (
@@ -1433,6 +2499,15 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             {tab.label}
           </button>
         ))}
+        {/* Cart button */}
+        {mvCartCount > 0 && (
+          <button
+            onClick={() => setShowCart(true)}
+            style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 12px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 700, margin: '6px 0 6px auto' }}
+          >
+            🛒 {mvCartCount}
+          </button>
+        )}
       </div>
 
       {/* ── BROWSE TAB — live catalog, search, infinite scroll ────────────── */}
@@ -1472,23 +2547,50 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             )}
           </div>
 
-          {/* Category filter pills */}
-          {['', 'fashion', 'electronics', 'food', 'beauty', 'home'].map(cat => (
-            <button
-              key={cat}
-              onClick={() => { setCategory(cat); setProducts([]); }}
-              style={{
-                margin: cat === '' ? '8px 0 8px 12px' : '8px 4px 8px 0',
-                padding: '4px 10px', borderRadius: '20px',
-                border: `1px solid ${category === cat ? '#16a34a' : '#e5e7eb'}`,
-                backgroundColor: category === cat ? '#dcfce7' : '#fff',
-                color: category === cat ? '#15803d' : '#6b7280',
-                fontSize: '11px', cursor: 'pointer',
-              }}
-            >
-              {cat === '' ? 'All' : cat.charAt(0).toUpperCase() + cat.slice(1)}
-            </button>
-          ))}
+          {/* Category filter pills — derived from loaded catalog data */}
+          <div style={{ padding: '8px 12px 0', display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+            {(['', ...allCategories] as string[]).map(cat => (
+              <button
+                key={cat}
+                onClick={() => { setCategory(cat); setProducts([]); setAllCategories([]); }}
+                style={{
+                  padding: '4px 10px', borderRadius: '20px',
+                  border: `1px solid ${category === cat && !vendorFilter ? '#16a34a' : '#e5e7eb'}`,
+                  backgroundColor: category === cat && !vendorFilter ? '#dcfce7' : '#fff',
+                  color: category === cat && !vendorFilter ? '#15803d' : '#6b7280',
+                  fontSize: '11px', cursor: 'pointer',
+                }}
+              >
+                {cat === '' ? 'All' : cat.charAt(0).toUpperCase() + cat.slice(1)}
+              </button>
+            ))}
+          </div>
+
+          {/* Vendor filter pills */}
+          {vendors.length > 0 && (
+            <div style={{ padding: '6px 12px 0', display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
+              <span style={{ fontSize: '10px', color: '#9ca3af', fontWeight: 600, marginRight: '2px' }}>Vendor:</span>
+              <button
+                onClick={() => { setVendorFilter(''); setProducts([]); }}
+                style={{ padding: '3px 8px', borderRadius: '20px', border: `1px solid ${!vendorFilter ? '#6d28d9' : '#e5e7eb'}`, backgroundColor: !vendorFilter ? '#ede9fe' : '#fff', color: !vendorFilter ? '#6d28d9' : '#6b7280', fontSize: '10px', cursor: 'pointer' }}
+              >
+                All Vendors
+              </button>
+              {vendors.map(v => {
+                const badge = vendorBadgeColor(v.slug);
+                const isActive = vendorFilter === v.id;
+                return (
+                  <button
+                    key={v.id}
+                    onClick={() => { setVendorFilter(isActive ? '' : v.id); setCategory(''); setProducts([]); }}
+                    style={{ padding: '3px 8px', borderRadius: '20px', border: `1px solid ${isActive ? badge.text : '#e5e7eb'}`, backgroundColor: isActive ? badge.bg : '#fff', color: isActive ? badge.text : '#6b7280', fontSize: '10px', cursor: 'pointer', fontWeight: isActive ? 600 : 400 }}
+                  >
+                    @{v.slug}
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
           {/* Product grid */}
           {catalogError && (
@@ -1500,69 +2602,80 @@ function MarketplaceModule({ tenantId, t }: { tenantId: string; t: ReturnType<ty
             </div>
           )}
 
-          <div style={{ padding: '12px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(155px, 1fr))', gap: '12px' }}>
-            {products.map(p => {
-              const badge = vendorBadgeColor(p.vendor_slug);
-              return (
-                <div
-                  key={p.id}
-                  style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', display: 'flex', flexDirection: 'column' }}
-                >
-                  {/* Product image or placeholder */}
-                  {p.image_url ? (
-                    <img
-                      src={p.image_url}
-                      alt={p.name}
-                      style={{ height: '80px', objectFit: 'cover', width: '100%' }}
-                    />
-                  ) : (
-                    <div style={{ backgroundColor: '#fef9c3', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px' }}>
-                      🛍️
-                    </div>
-                  )}
-
-                  <div style={{ padding: '8px 10px', flex: 1, display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                    {/* Vendor badge */}
-                    <span style={{
-                      display: 'inline-block', fontSize: '10px', fontWeight: 600,
-                      backgroundColor: badge.bg, color: badge.text,
-                      borderRadius: '4px', padding: '1px 5px',
-                      maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    }}>
-                      @{p.vendor_slug}
-                    </span>
-                    {p.category && (
-                      <span style={{ fontSize: '10px', color: '#9ca3af' }}>{p.category}</span>
-                    )}
-                    <div style={{ fontSize: '13px', fontWeight: 600, lineHeight: 1.3 }}>{p.name}</div>
-                    <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginTop: 'auto' }}>
-                      {formatKoboToNaira(p.price)}
-                    </div>
-                    {p.rating_avg != null && (
-                      <div style={{ fontSize: '10px', color: '#f59e0b' }}>
-                        {'★'.repeat(Math.round(p.rating_avg))}{'☆'.repeat(5 - Math.round(p.rating_avg))}
-                        <span style={{ color: '#9ca3af', marginLeft: '3px' }}>({p.rating_count})</span>
-                      </div>
-                    )}
+          {/* Virtualized 2-column grid */}
+          <div
+            ref={mvGridRef}
+            style={{ overflowY: 'auto', height: 'calc(100vh - 240px)', position: 'relative' }}
+          >
+            <div style={{ height: `${mvRowVirtualizer.getTotalSize()}px`, position: 'relative' }}>
+              {mvRowVirtualizer.getVirtualItems().map(vRow => {
+                const rowStart = vRow.index * MV_GRID_COLS;
+                const rowProducts = products.slice(rowStart, rowStart + MV_GRID_COLS);
+                return (
+                  <div
+                    key={vRow.key}
+                    style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${vRow.start}px)`, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', padding: '0 12px 12px' }}
+                  >
+                    {rowProducts.map(p => {
+                      const badge = vendorBadgeColor(p.vendor_slug);
+                      const cartItem = mvCart.find(i => i.product_id === p.id);
+                      return (
+                        <div
+                          key={p.id}
+                          onClick={() => openProductModal(p)}
+                          style={{ border: '1px solid #e5e7eb', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#fff', display: 'flex', flexDirection: 'column', cursor: 'pointer', position: 'relative' }}
+                        >
+                          {/* Cart badge */}
+                          {cartItem && (
+                            <div style={{ position: 'absolute', top: '6px', right: '6px', backgroundColor: '#16a34a', color: '#fff', borderRadius: '50%', width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', fontWeight: 700, zIndex: 1 }}>
+                              {cartItem.quantity}
+                            </div>
+                          )}
+                          {/* Product image or placeholder */}
+                          {p.image_url ? (
+                            <img src={p.image_url} alt={p.name} style={{ height: '80px', objectFit: 'cover', width: '100%' }} />
+                          ) : (
+                            <div style={{ backgroundColor: '#fef9c3', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px' }}>🛍️</div>
+                          )}
+                          <div style={{ padding: '8px 10px', flex: 1, display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                            <span style={{ display: 'inline-block', fontSize: '10px', fontWeight: 600, backgroundColor: badge.bg, color: badge.text, borderRadius: '4px', padding: '1px 5px', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              @{p.vendor_slug}
+                            </span>
+                            {p.category && <span style={{ fontSize: '10px', color: '#9ca3af' }}>{p.category}</span>}
+                            <div style={{ fontSize: '13px', fontWeight: 600, lineHeight: 1.3 }}>{p.name}</div>
+                            <div style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a', marginTop: 'auto' }}>{formatKoboToNaira(p.price)}</div>
+                            {p.rating_avg != null && (
+                              <div style={{ fontSize: '10px', color: '#f59e0b' }}>
+                                {'★'.repeat(Math.round(p.rating_avg))}{'☆'.repeat(5 - Math.round(p.rating_avg))}
+                                <span style={{ color: '#9ca3af', marginLeft: '3px' }}>({p.rating_count})</span>
+                              </div>
+                            )}
+                            <button
+                              onClick={e => { e.stopPropagation(); addToMvCart(p); }}
+                              disabled={p.quantity === 0}
+                              style={{ marginTop: '6px', padding: '5px', borderRadius: '6px', border: 'none', backgroundColor: p.quantity === 0 ? '#d1d5db' : '#16a34a', color: '#fff', fontSize: '11px', cursor: p.quantity === 0 ? 'not-allowed' : 'pointer', fontWeight: 600 }}
+                            >
+                              {p.quantity === 0 ? 'Out of Stock' : '+ Add'}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+
+            {/* Infinite scroll sentinel */}
+            <div ref={loadMoreRef} style={{ height: '1px' }} />
+
+            {catalogLoading && (
+              <div style={{ padding: '12px', textAlign: 'center', color: '#9ca3af', fontSize: '13px' }}>Loading…</div>
+            )}
+            {!hasMore && products.length > 0 && (
+              <div style={{ padding: '8px', textAlign: 'center', color: '#d1d5db', fontSize: '11px' }}>— End of catalog —</div>
+            )}
           </div>
-
-          {/* Infinite scroll sentinel */}
-          <div ref={loadMoreRef} style={{ height: '1px' }} />
-
-          {catalogLoading && (
-            <div style={{ padding: '12px', textAlign: 'center', color: '#9ca3af', fontSize: '13px' }}>
-              Loading…
-            </div>
-          )}
-          {!hasMore && products.length > 0 && (
-            <div style={{ padding: '8px', textAlign: 'center', color: '#d1d5db', fontSize: '11px' }}>
-              — End of catalog —
-            </div>
-          )}
         </div>
       )}
 
@@ -1626,7 +2739,27 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   const [vendorName, setVendorName] = useState<string | null>(() =>
     sessionStorage.getItem(`ww_vname_${tenantId}`)
   );
-  const [activeTab, setActiveTab] = useState<'overview' | 'orders' | 'kyc' | 'payouts'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'kyc' | 'payouts'>('overview');
+
+  // ── Vendor product management state ─────────────────────────────────────
+  const [vendorProducts, setVendorProducts] = useState<Array<{
+    id: string; sku: string; name: string; description: string | null; category: string | null;
+    price: number; quantity: number; image_url: string | null;
+  }>>([]);
+  const [vpLoading, setVpLoading] = useState(false);
+  const [showAddProduct, setShowAddProduct] = useState(false);
+  const [addProdForm, setAddProdForm] = useState({ sku: '', name: '', price: '', quantity: '', category: '', description: '', image_url: '' });
+  const [addProdSubmitting, setAddProdSubmitting] = useState(false);
+  const [addProdError, setAddProdError] = useState('');
+  const [addProdSuccess, setAddProdSuccess] = useState('');
+  // Edit product state
+  const [editingProductId, setEditingProductId] = useState<string | null>(null);
+  const [editProdForm, setEditProdForm] = useState({ name: '', price: '', quantity: '', category: '', description: '', image_url: '' });
+  const [editProdSubmitting, setEditProdSubmitting] = useState(false);
+  const [editProdError, setEditProdError] = useState('');
+  // Delete product state
+  const [deletingProductId, setDeletingProductId] = useState<string | null>(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
   const [otpStep, setOtpStep] = useState<'phone' | 'code'>('phone');
   const [otpPhone, setOtpPhone] = useState('');
@@ -1715,14 +2848,111 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
   };
 
   useEffect(() => {
+    if (!authToken || !vendorId || activeTab !== 'products') return;
+    setVpLoading(true);
+    fetch(`/api/multi-vendor/vendors/${vendorId}/products`, { headers: apiHeaders() })
+      .then(r => r.json() as Promise<{ success: boolean; data: typeof vendorProducts }>)
+      .then(d => { if (d.success) setVendorProducts(d.data ?? []); })
+      .catch(() => {})
+      .finally(() => setVpLoading(false));
+  }, [authToken, vendorId, activeTab, apiHeaders]);
+
+  const handleAddProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!vendorId || !authToken) return;
+    const priceKobo = Math.round(parseFloat(addProdForm.price) * 100);
+    const qty = parseInt(addProdForm.quantity, 10);
+    if (!addProdForm.sku.trim() || !addProdForm.name.trim()) { setAddProdError('SKU and Name are required'); return; }
+    if (!Number.isFinite(priceKobo) || priceKobo <= 0) { setAddProdError('Price must be a positive number'); return; }
+    if (!Number.isInteger(qty) || qty < 0) { setAddProdError('Quantity must be a non-negative whole number'); return; }
+    setAddProdSubmitting(true); setAddProdError(''); setAddProdSuccess('');
+    try {
+      const body: Record<string, unknown> = {
+        sku: addProdForm.sku.trim(), name: addProdForm.name.trim(),
+        price: priceKobo, quantity: qty,
+      };
+      if (addProdForm.category.trim()) body.category = addProdForm.category.trim();
+      if (addProdForm.description.trim()) body.description = addProdForm.description.trim();
+      if (addProdForm.image_url.trim()) body.image_url = addProdForm.image_url.trim();
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/products`, {
+        method: 'POST', headers: apiHeaders(), body: JSON.stringify(body),
+      });
+      const d = await res.json() as { success: boolean; data?: { id: string; name: string }; error?: string };
+      if (d.success && d.data) {
+        setAddProdSuccess(`"${d.data.name}" added successfully!`);
+        setAddProdForm({ sku: '', name: '', price: '', quantity: '', category: '', description: '', image_url: '' });
+        setShowAddProduct(false);
+        // Refresh product list
+        const refetch = await fetch(`/api/multi-vendor/vendors/${vendorId}/products`, { headers: apiHeaders() });
+        const rd = await refetch.json() as { success: boolean; data: typeof vendorProducts };
+        if (rd.success) setVendorProducts(rd.data ?? []);
+      } else setAddProdError(d.error ?? 'Failed to add product');
+    } catch { setAddProdError('Network error. Try again.'); }
+    finally { setAddProdSubmitting(false); }
+  };
+
+  const refreshVendorProducts = async () => {
+    if (!vendorId) return;
+    const refetch = await fetch(`/api/multi-vendor/vendors/${vendorId}/products`, { headers: apiHeaders() });
+    const rd = await refetch.json() as { success: boolean; data: typeof vendorProducts };
+    if (rd.success) setVendorProducts(rd.data ?? []);
+  };
+
+  const handleEditProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!vendorId || !authToken || !editingProductId) return;
+    const priceKobo = Math.round(parseFloat(editProdForm.price) * 100);
+    const qty = parseInt(editProdForm.quantity, 10);
+    if (!editProdForm.name.trim()) { setEditProdError('Name is required'); return; }
+    if (!Number.isFinite(priceKobo) || priceKobo <= 0) { setEditProdError('Price must be a positive number'); return; }
+    if (!Number.isInteger(qty) || qty < 0) { setEditProdError('Quantity must be a non-negative whole number'); return; }
+    setEditProdSubmitting(true); setEditProdError('');
+    try {
+      const body: Record<string, unknown> = {
+        name: editProdForm.name.trim(), price: priceKobo, quantity: qty,
+        category: editProdForm.category.trim() || null,
+        description: editProdForm.description.trim() || null,
+        image_url: editProdForm.image_url.trim() || null,
+      };
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/products/${editingProductId}`, {
+        method: 'PATCH', headers: apiHeaders(), body: JSON.stringify(body),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) {
+        setAddProdSuccess('Product updated successfully!');
+        setEditingProductId(null);
+        await refreshVendorProducts();
+      } else setEditProdError(d.error ?? 'Failed to update product');
+    } catch { setEditProdError('Network error. Try again.'); }
+    finally { setEditProdSubmitting(false); }
+  };
+
+  const handleDeleteProduct = async (productId: string) => {
+    if (!vendorId || !authToken) return;
+    setDeletingProductId(productId);
+    try {
+      const res = await fetch(`/api/multi-vendor/vendors/${vendorId}/products/${productId}`, {
+        method: 'DELETE', headers: apiHeaders(),
+      });
+      const d = await res.json() as { success: boolean; error?: string };
+      if (d.success) {
+        setAddProdSuccess('Product removed successfully.');
+        setDeleteConfirmId(null);
+        await refreshVendorProducts();
+      } else setAddProdError(d.error ?? 'Failed to delete product');
+    } catch { setAddProdError('Network error. Try again.'); }
+    finally { setDeletingProductId(null); }
+  };
+
+  useEffect(() => {
     if (!authToken || !vendorId || activeTab !== 'overview') return;
     fetch('/api/multi-vendor/ledger', { headers: apiHeaders() })
-      .then(r => r.json() as Promise<{ success: boolean; data: Array<{ account_type: string; amount: number; type: string }> }>)
+      .then(r => r.json() as Promise<{ success: boolean; data: Array<{ account_type: string; amount: number; type: string; order_id?: string }> }>)
       .then(d => {
         if (!d.success) return;
         const revenue = d.data.filter(e => e.account_type === 'revenue' && e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
         const commission = d.data.filter(e => e.account_type === 'commission' && e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
-        const totalOrders = new Set(d.data.filter(e => e.account_type === 'revenue').map((e: { order_id?: string }) => e.order_id)).size;
+        const totalOrders = new Set(d.data.filter(e => e.account_type === 'revenue').map(e => e.order_id)).size;
         setOverview({ total_revenue: revenue, total_orders: totalOrders, pending_payout: revenue - commission });
       })
       .catch(() => {});
@@ -1869,13 +3099,17 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
           <div style={{ fontWeight: 700, fontSize: '15px' }}>{vendorName ?? 'My Store'}</div>
           <div style={{ fontSize: '11px', color: '#6b7280' }}>{vendorId}</div>
         </div>
-        <button onClick={handleLogout} style={{ padding: '6px 10px', border: '1px solid #fecaca', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '12px', cursor: 'pointer', fontWeight: 600 }}>
-          Sign Out
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <ConflictResolver tenantId={tenantId} />
+          <button onClick={handleLogout} style={{ padding: '6px 10px', border: '1px solid #fecaca', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '12px', cursor: 'pointer', fontWeight: 600 }}>
+            Sign Out
+          </button>
+        </div>
       </div>
 
-      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb' }}>
+      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb', overflowX: 'auto' }}>
         <button style={S.tab(activeTab === 'overview')} onClick={() => setActiveTab('overview')}>📊 Overview</button>
+        <button style={S.tab(activeTab === 'products')} onClick={() => setActiveTab('products')}>🛒 Products</button>
         <button style={S.tab(activeTab === 'orders')} onClick={() => setActiveTab('orders')}>📦 Orders</button>
         <button style={S.tab(activeTab === 'kyc')} onClick={() => setActiveTab('kyc')}>🔖 KYC</button>
         <button style={S.tab(activeTab === 'payouts')} onClick={() => setActiveTab('payouts')}>💸 Payouts</button>
@@ -1904,6 +3138,137 @@ function MarketplaceVendorDashboard({ tenantId }: { tenantId: string }) {
           ) : (
             <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280' }}>Loading overview…</div>
           )
+        )}
+
+        {activeTab === 'products' && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <div style={{ fontWeight: 700, fontSize: '15px' }}>My Products</div>
+              <button
+                onClick={() => { setShowAddProduct(true); setAddProdError(''); setAddProdSuccess(''); }}
+                style={{ padding: '8px 14px', backgroundColor: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}
+              >
+                + Add Product
+              </button>
+            </div>
+            {addProdSuccess && <div style={{ padding: '10px 12px', backgroundColor: '#dcfce7', border: '1px solid #bbf7d0', borderRadius: '8px', color: '#15803d', fontSize: '13px', marginBottom: '12px' }}>{addProdSuccess}</div>}
+            {showAddProduct && (
+              <div style={{ backgroundColor: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: '10px', padding: '16px', marginBottom: '16px' }}>
+                <div style={{ fontWeight: 700, fontSize: '14px', marginBottom: '12px' }}>Add New Product</div>
+                <form onSubmit={handleAddProduct}>
+                  <label style={S.label}>SKU <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="text" placeholder="e.g. FAB-001" value={addProdForm.sku} onChange={e => setAddProdForm(f => ({ ...f, sku: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Product Name <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="text" placeholder="e.g. Ankara Fabric" value={addProdForm.name} onChange={e => setAddProdForm(f => ({ ...f, name: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Price (₦) <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="number" placeholder="e.g. 5000" min="0.01" step="0.01" value={addProdForm.price} onChange={e => setAddProdForm(f => ({ ...f, price: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Quantity <span style={{ color: '#dc2626' }}>*</span></label>
+                  <input type="number" placeholder="e.g. 50" min="0" step="1" value={addProdForm.quantity} onChange={e => setAddProdForm(f => ({ ...f, quantity: e.target.value }))} style={S.input} required />
+                  <label style={S.label}>Category</label>
+                  <input type="text" placeholder="e.g. fashion" value={addProdForm.category} onChange={e => setAddProdForm(f => ({ ...f, category: e.target.value }))} style={S.input} />
+                  <label style={S.label}>Description</label>
+                  <input type="text" placeholder="Short description" value={addProdForm.description} onChange={e => setAddProdForm(f => ({ ...f, description: e.target.value }))} style={S.input} />
+                  <label style={S.label}>Image URL (optional)</label>
+                  <input type="url" placeholder="https://..." value={addProdForm.image_url} onChange={e => setAddProdForm(f => ({ ...f, image_url: e.target.value }))} style={S.input} />
+                  {addProdError && <div style={{ padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '10px' }}>{addProdError}</div>}
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button type="submit" disabled={addProdSubmitting} style={{ flex: 1, padding: '11px', backgroundColor: addProdSubmitting ? '#d1d5db' : '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: addProdSubmitting ? 'wait' : 'pointer', fontSize: '14px' }}>
+                      {addProdSubmitting ? 'Adding…' : 'Add Product'}
+                    </button>
+                    <button type="button" onClick={() => setShowAddProduct(false)} style={{ padding: '11px 16px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}>Cancel</button>
+                  </div>
+                </form>
+              </div>
+            )}
+            {vpLoading ? (
+              <div style={{ textAlign: 'center', padding: '24px', color: '#9ca3af', fontSize: '13px' }}>Loading products…</div>
+            ) : vendorProducts.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '32px', color: '#6b7280', fontSize: '13px' }}>No products yet. Add your first product above.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {vendorProducts.map(p => (
+                  <div key={p.id} style={{ ...S.card, marginBottom: 0 }}>
+                    {/* Product summary row */}
+                    <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                      {p.image_url ? (
+                        <img src={p.image_url} alt={p.name} style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+                      ) : (
+                        <div style={{ width: '52px', height: '52px', backgroundColor: '#fef9c3', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', flexShrink: 0 }}>🛍️</div>
+                      )}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '14px', fontWeight: 700, marginBottom: '2px' }}>{p.name}</div>
+                        <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>SKU: {p.sku}{p.category ? ` · ${p.category}` : ''}</div>
+                        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                          <span style={{ fontSize: '15px', fontWeight: 700, color: '#16a34a' }}>{formatKoboToNaira(p.price)}</span>
+                          <span style={{ fontSize: '12px', color: p.quantity > 0 ? '#16a34a' : '#dc2626', fontWeight: 600 }}>{p.quantity} in stock</span>
+                        </div>
+                        {p.description && <div style={{ fontSize: '12px', color: '#4b5563', marginTop: '4px', lineHeight: 1.4 }}>{p.description}</div>}
+                      </div>
+                    </div>
+                    {/* Action buttons */}
+                    {editingProductId !== p.id && (
+                      <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                        <button
+                          onClick={() => {
+                            setEditingProductId(p.id);
+                            setEditProdForm({ name: p.name, price: String(p.price / 100), quantity: String(p.quantity), category: p.category ?? '', description: p.description ?? '', image_url: p.image_url ?? '' });
+                            setEditProdError(''); setAddProdSuccess('');
+                          }}
+                          style={{ flex: 1, padding: '7px', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+                        >
+                          Edit
+                        </button>
+                        {deleteConfirmId === p.id ? (
+                          <>
+                            <button
+                              onClick={() => handleDeleteProduct(p.id)}
+                              disabled={deletingProductId === p.id}
+                              style={{ flex: 1, padding: '7px', backgroundColor: '#dc2626', color: '#fff', border: 'none', borderRadius: '6px', fontSize: '12px', fontWeight: 700, cursor: deletingProductId === p.id ? 'wait' : 'pointer' }}
+                            >
+                              {deletingProductId === p.id ? '…' : 'Confirm Delete'}
+                            </button>
+                            <button onClick={() => setDeleteConfirmId(null)} style={{ padding: '7px 10px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '6px', fontSize: '12px', cursor: 'pointer' }}>Cancel</button>
+                          </>
+                        ) : (
+                          <button
+                            onClick={() => setDeleteConfirmId(p.id)}
+                            style={{ padding: '7px 12px', backgroundColor: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {/* Inline edit form */}
+                    {editingProductId === p.id && (
+                      <form onSubmit={handleEditProduct} style={{ marginTop: '12px', borderTop: '1px solid #e5e7eb', paddingTop: '12px' }}>
+                        <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px', color: '#111827' }}>Edit Product</div>
+                        <label style={S.label}>Name <span style={{ color: '#dc2626' }}>*</span></label>
+                        <input type="text" value={editProdForm.name} onChange={e => setEditProdForm(f => ({ ...f, name: e.target.value }))} style={S.input} required />
+                        <label style={S.label}>Price (₦) <span style={{ color: '#dc2626' }}>*</span></label>
+                        <input type="number" min="0.01" step="0.01" value={editProdForm.price} onChange={e => setEditProdForm(f => ({ ...f, price: e.target.value }))} style={S.input} required />
+                        <label style={S.label}>Quantity <span style={{ color: '#dc2626' }}>*</span></label>
+                        <input type="number" min="0" step="1" value={editProdForm.quantity} onChange={e => setEditProdForm(f => ({ ...f, quantity: e.target.value }))} style={S.input} required />
+                        <label style={S.label}>Category</label>
+                        <input type="text" value={editProdForm.category} onChange={e => setEditProdForm(f => ({ ...f, category: e.target.value }))} style={S.input} />
+                        <label style={S.label}>Description</label>
+                        <input type="text" value={editProdForm.description} onChange={e => setEditProdForm(f => ({ ...f, description: e.target.value }))} style={S.input} />
+                        <label style={S.label}>Image URL</label>
+                        <input type="url" value={editProdForm.image_url} onChange={e => setEditProdForm(f => ({ ...f, image_url: e.target.value }))} style={S.input} />
+                        {editProdError && <div style={{ padding: '8px 12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', color: '#dc2626', fontSize: '13px', marginBottom: '10px' }}>{editProdError}</div>}
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <button type="submit" disabled={editProdSubmitting} style={{ flex: 1, padding: '10px', backgroundColor: editProdSubmitting ? '#d1d5db' : '#1d4ed8', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 700, cursor: editProdSubmitting ? 'wait' : 'pointer', fontSize: '13px' }}>
+                            {editProdSubmitting ? 'Saving…' : 'Save Changes'}
+                          </button>
+                          <button type="button" onClick={() => setEditingProductId(null)} style={{ padding: '10px 14px', backgroundColor: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: '8px', cursor: 'pointer', fontSize: '12px' }}>Cancel</button>
+                        </div>
+                      </form>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         )}
 
         {activeTab === 'orders' && (
@@ -2122,7 +3487,20 @@ export function CommerceApp() {
   const pendingCount = usePendingSync(tenantId);
   const [activeModule, setActiveModule] = useState<Module>('pos');
 
+  const [userContextValue] = useState<UserContextValue>(() => {
+    const jwt = sessionStorage.getItem('ww_user_jwt');
+    if (!jwt) return { userId: '', role: 'STAFF', tenantId };
+    const claims = decodeJwtPayload(jwt);
+    if (!claims) return { userId: '', role: 'STAFF', tenantId };
+    return {
+      userId: String(claims['sub'] ?? claims['user_id'] ?? ''),
+      role: String(claims['role'] ?? 'STAFF'),
+      tenantId: String(claims['tenant_id'] ?? tenantId),
+    };
+  });
+
   return (
+    <UserContext.Provider value={userContextValue}>
     <div
       data-testid="commerce-app"
       style={{
@@ -2131,7 +3509,12 @@ export function CommerceApp() {
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
       }}>
       {/* Status Bar */}
-      <StatusBar isOnline={isOnline} pendingCount={pendingCount} lang={lang} onChangeLang={changeLang} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <StatusBar isOnline={isOnline} pendingCount={pendingCount} lang={lang} onChangeLang={changeLang} />
+        <div style={{ paddingRight: '8px' }}>
+          <ConflictResolver tenantId={tenantId} />
+        </div>
+      </div>
 
       {/* Header */}
       <header style={{
@@ -2162,6 +3545,7 @@ export function CommerceApp() {
       {/* Bottom Navigation */}
       <BottomNav activeModule={activeModule} onSelect={setActiveModule} t={t} />
     </div>
+    </UserContext.Provider>
   );
 }
 

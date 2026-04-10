@@ -1,0 +1,53 @@
+You are implementing Phase P08 of the WebWaka platform implementation plan in the @webwaka/core package.
+
+This phase implements concrete KYC verification provider adapters. Phase P01 created the IKycProvider interface; this phase creates the real implementations using Smile Identity (BVN/NIN) and Prembly (CAC).
+
+Read packages/webwaka-core/src/kyc.ts fully before starting.
+
+## Tasks:
+
+### TASK 1 — Smile Identity BVN Verification
+In packages/webwaka-core/src/kyc.ts, add class SmileIdentityProvider implementing IKycProvider:
+
+Properties: partnerId, apiKey, environment ('sandbox'|'production')
+Base URLs: production = 'https://api.smileidentity.com/v1', sandbox = 'https://testapi.smileidentity.com/v1'
+
+Implement verifyBvn(bvnHash, firstName, lastName, dob):
+- POST to /id_verification
+- Body: { partner_id, api_key, id_type: 'BVN', id_number: bvnHash, first_name: firstName, last_name: lastName, dob, country: 'NG' }
+- Parse response: success if ResultCode === '1012'
+- Return KycVerificationResult with verified, matchScore (from ConfidenceValue), reason (from ResultText), provider: 'smile_identity'
+- Handle network errors gracefully: return { verified: false, reason: 'provider_error', provider: 'smile_identity' }
+
+### TASK 2 — Smile Identity NIN Verification
+Implement verifyNin(ninHash, firstName, lastName) on SmileIdentityProvider:
+- Same pattern as verifyBvn but id_type: 'NIN'
+- NIN does not have dob — omit that field
+
+### TASK 3 — Prembly CAC Verification
+Implement verifyCac(rcNumber, businessName) on SmileIdentityProvider (using Prembly API, accessed via the same provider class for simplicity):
+- POST to https://api.prembly.com/identitypass/verification/cac
+- Headers: x-api-key (Prembly API key), app-id (Prembly App ID)
+- Body: { rc_number: rcNumber }
+- Parse response: check data.company_name for businessName match (case-insensitive contains check)
+- Return KycVerificationResult with verified, reason, provider: 'prembly'
+
+Note: SmileIdentityProvider needs both Smile Identity AND Prembly credentials. Extend the constructor to accept both, or create a separate PremblyCacProvider class and compose them.
+
+### TASK 4 — Factory Function
+Add factory function: createKycProvider(smilePartnerId: string, smileApiKey: string, premblyApiKey: string, premblyAppId: string, environment?: 'sandbox'|'production'): IKycProvider
+Returns a SmileIdentityProvider (or composite) that handles all three verification types.
+
+### TASK 5 — Export Updates
+Export from packages/webwaka-core/src/index.ts:
+- SmileIdentityProvider
+- createKycProvider (if not already exported)
+
+Bump version to 1.3.0 in package.json.
+
+## Verification
+1. npx tsc --noEmit
+2. Unit test with sandbox credentials: verifyBvn returns { verified: true } for known test BVN
+3. Unit test: verifyCac returns { verified: false, reason: 'provider_error' } when API key is invalid (graceful failure)
+4. Unit test: verifyNin sandbox round-trip
+```

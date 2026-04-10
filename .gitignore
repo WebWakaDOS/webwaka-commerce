@@ -5,3 +5,8 @@ build/
 .env.local
 *.log
 .DS_Store
+# Cloudflare Wrangler temp files
+.wrangler/
+
+# Local secrets — never commit
+.dev.vars

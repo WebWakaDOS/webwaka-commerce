@@ -84,7 +84,7 @@ describe('COM-4: Retail Extensions', () => {
       retailRegistry.createModule(tenantId, 'gas', 'Test Station');
 
       expect(callback).toHaveBeenCalled();
-      expect(callback.mock.calls[0][0].type).toBe('gas');
+      expect(callback.mock.calls[0]![0].type).toBe('gas');
     });
 
     it('should get a module by ID', () => {
@@ -138,7 +138,7 @@ describe('COM-4: Retail Extensions', () => {
       retailRegistry.updateModule(result.id!, { name: 'Updated' });
 
       expect(callback).toHaveBeenCalled();
-      expect(callback.mock.calls[0][0].name).toBe('Updated');
+      expect(callback.mock.calls[0]![0].name).toBe('Updated');
     });
   });
 
@@ -180,10 +180,10 @@ describe('COM-4: Retail Extensions', () => {
       );
 
       expect(callback).toHaveBeenCalled();
-      expect(callback.mock.calls[0][0].name).toBe('Premium Motor Spirit');
+      expect(callback.mock.calls[0]![0].name).toBe('Premium Motor Spirit');
     });
 
-    it('should get module products', () => {
+    it('should get module cmrc_products', () => {
       retailRegistry.addProduct(
         moduleId,
         'PMS001',
@@ -201,10 +201,10 @@ describe('COM-4: Retail Extensions', () => {
         800
       );
 
-      const products = retailRegistry.getModuleProducts(moduleId);
+      const cmrc_products = retailRegistry.getModuleProducts(moduleId);
 
-      expect(products.length).toBe(2);
-      expect(products.every(p => p.moduleId === moduleId)).toBe(true);
+      expect(cmrc_products.length).toBe(2);
+      expect(cmrc_products.every(p => p.moduleId === moduleId)).toBe(true);
     });
 
     it('should get a product by ID', () => {
@@ -257,7 +257,7 @@ describe('COM-4: Retail Extensions', () => {
       retailRegistry.updateProductQuantity(result.id!, 900);
 
       expect(callback).toHaveBeenCalled();
-      expect(callback.mock.calls[0][0].quantity).toBe(900);
+      expect(callback.mock.calls[0]![0].quantity).toBe(900);
     });
   });
 
@@ -305,7 +305,7 @@ describe('COM-4: Retail Extensions', () => {
       ], 'cash');
 
       expect(callback).toHaveBeenCalled();
-      expect(callback.mock.calls[0][0].total).toBe(6500);
+      expect(callback.mock.calls[0]![0].total).toBe(6500);
     });
 
     it('should get module transactions', () => {
@@ -356,7 +356,7 @@ describe('COM-4: Retail Extensions', () => {
       retailRegistry.completeTransaction(result.id!);
 
       expect(callback).toHaveBeenCalled();
-      expect(callback.mock.calls[0][0].status).toBe('completed');
+      expect(callback.mock.calls[0]![0].status).toBe('completed');
     });
 
     it('should cancel a transaction', () => {
@@ -383,7 +383,7 @@ describe('COM-4: Retail Extensions', () => {
       retailRegistry.cancelTransaction(result.id!);
 
       expect(callback).toHaveBeenCalled();
-      expect(callback.mock.calls[0][0].status).toBe('cancelled');
+      expect(callback.mock.calls[0]![0].status).toBe('cancelled');
     });
 
     it('should filter transactions by status', () => {
@@ -462,8 +462,8 @@ describe('COM-4: Retail Extensions', () => {
 
       expect(tenant1Modules.length).toBe(1);
       expect(tenant2Modules.length).toBe(1);
-      expect(tenant1Modules[0].id).toBe(result1.id);
-      expect(tenant2Modules[0].id).toBe(result2.id);
+      expect(tenant1Modules[0]!.id).toBe(result1.id);
+      expect(tenant2Modules[0]!.id).toBe(result2.id);
     });
   });
 });

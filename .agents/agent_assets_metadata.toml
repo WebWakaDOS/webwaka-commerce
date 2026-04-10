@@ -1,0 +1,38 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "zwfowSek-eNbsRRIBlzmk"
+uri = "file://docs/COMMERCE_ENHANCEMENT_RESEARCH.md"
+type = "text"
+title = "WebWaka Commerce Suite — Deep Research & Enhancement Plan"
+
+[[outputs]]
+id = "WDOzmg2ibI-Wu9J5tQzab"
+uri = "file://docs/IMPLEMENTATION_PLAN.md"
+type = "text"
+title = "WebWaka Commerce — Implementation Plan (Full Technical Detail)"
+
+[[outputs]]
+id = "d1PR3tyOYMZciJTyIi8j9"
+uri = "file://docs/IMPLEMENTATION_PROMPTS.md"
+type = "text"
+title = "WebWaka Commerce — Implementation Prompts (Copy-Paste Per Phase)"
+
+[[outputs]]
+id = "yOX9VyK3ZDUxC-7xmf7P0"
+uri = "file://docs/QA_PROMPTS.md"
+type = "text"
+title = "WebWaka Commerce — QA Verification Prompts (Copy-Paste Per Phase)"
+
+[[outputs]]
+id = "7_C54qaifr0n7hQAfd-ge"
+uri = "file://docs/WebWaka_Commerce_P14_Research_Report.md"
+type = "text"
+title = "WebWaka Commerce P14 — Deep Research Report (Architecture · Nigeria Market · 60 Enhancements)"
+
+[[outputs]]
+id = "tpxHQE3bRpwYgOROn9auX"
+uri = "file://WEBWAKA-COMMERCE-DEEP-RESEARCH-TASKBOOK.md"
+type = "text"
+title = "WEBWAKA-COMMERCE Deep Research + Enhancement Taskbook"

@@ -1,0 +1,137 @@
+
+You are the Replit agent responsible for **commerce** within a **multi-repo platform**. This repository is **not a standalone app**; it is one modular component in a larger ecosystem, and you must continuously account for how it connects to other repos and shared platform capabilities.
+
+## Mission
+
+Perform **very comprehensive deep research** into:
+
+1. The entire codebase in this repo.
+2. The broader platform architecture and how this repo integrates with other repos.
+3. The Nigerian commerce ecosystem in depth, including market realities, user behavior, operational constraints, regulatory expectations, payments, logistics, and competitive patterns.
+4. The most valuable enhancements for:
+   - Point of Sale (POS)
+   - Single-Vendor Marketplace
+   - Multi-Vendor Marketplace
+
+Your output must be based on actual research, not assumptions.
+
+## Core Requirements
+
+### 1) Deep codebase research
+Inspect the codebase thoroughly and identify:
+- Current architecture.
+- Existing modules, abstractions, and shared patterns.
+- Gaps, duplication, and missing capabilities.
+- Dependencies on other repos or shared services.
+- Reusable components that support the **build once, use everywhere** principle.
+- Areas where functionality should be integrated rather than rebuilt.
+
+### 2) Nigerian market research
+Research the Nigerian market deeply and specifically for commerce, including:
+- Payment behavior and expectations.
+- POS usage patterns.
+- Marketplace adoption patterns.
+- Merchant pain points.
+- Customer expectations.
+- Logistics realities.
+- Trust and fraud concerns.
+- Compliance considerations relevant to Nigeria.
+- Common integrations and ecosystem norms.
+
+### 3) Enhancement generation
+From the codebase research and Nigeria market research, produce the **top 20 enhancements for each** of the following:
+
+- POS
+- Single-Vendor Marketplace
+- Multi-Vendor Marketplace
+
+For each enhancement, include:
+- Enhancement name.
+- Why it matters.
+- What problem it solves.
+- Whether it should be built in this repo, integrated from another repo, or exposed via shared platform services.
+- Dependency or integration notes.
+- Priority level.
+
+### 4) Multi-repo awareness
+You must explicitly account for the fact that:
+- This repo is **not the full application**.
+- The platform is **multi-repo**.
+- Some capabilities already exist elsewhere and should be integrated, not duplicated.
+- Shared logic must be designed according to **build once, use everywhere**.
+
+### 5) Logistics boundary
+Pay special attention to logistics-related features:
+- There is a dedicated logistics repo/module.
+- That logistics repo already contains submodules such as delivery, warehouse, and related logistics capabilities.
+- Merchants may need to onboard their own delivery agents or use logistics capabilities already available in that dedicated repo.
+- Do **not** rebuild logistics features here if they already exist elsewhere.
+- Instead, identify where integration is sufficient.
+- Enhancements may include integration with external delivery APIs, but only where platform architecture requires it.
+
+### 6) Platform principles
+Your recommendations must respect all of the following:
+
+- **Thoroughness Over Speed**: depth, validation, and completeness are non-negotiable.
+- **Zero Skipping Policy**: no phase skipping, no task skipping, no batching shortcuts; every task must produce concrete deliverables.
+- **Governance-Driven Execution**: no assumptions; consult governance documents deeply each time for full clarity and compliance.
+- **CI/CD Native Development**: everything must be designed, built, and validated through GitHub-based pipelines.
+- **Cloudflare-First Deployment**: optimize architecture and services primarily for Cloudflare environments.
+- **Multi-Repo Platform Architecture**: treat this repo as one part of an integrated ecosystem, not a complete product.
+- **Nigeria-First, Africa-Ready**: optimize for Nigeria first, with readiness for broader African expansion.
+- **Build Once, Use Everywhere**: avoid duplicating logic; prefer shared abstractions, reusable packages, and platform services.
+- **Mobile/PWA/Offline First**: where relevant, support offline-friendly behavior and PWA readiness.
+- **Vendor Neutral AI**: if AI appears in any enhancement, use OpenRouter abstraction only.
+- **Event-Driven Architecture**: do not use direct inter-database access; use events and integrations.
+
+## Deliverables
+
+Provide the following outputs:
+
+1. **Codebase architecture report**
+   - Major modules.
+   - Integration points.
+   - Shared components.
+   - Reuse opportunities.
+   - Duplication risks.
+
+2. **Nigeria market research summary**
+   - Key commercial patterns.
+   - Merchant/customer needs.
+   - Competitive and ecosystem insights.
+   - Commerce-specific implications for product design.
+
+3. **Top 20 POS enhancements**
+4. **Top 20 Single-Vendor Marketplace enhancements**
+5. **Top 20 Multi-Vendor Marketplace enhancements**
+
+For each enhancement, include:
+- Title.
+- Description.
+- Why it matters.
+- Implementation approach.
+- Reuse/integration notes.
+- Dependencies.
+- Priority.
+
+6. **Cross-repo integration map**
+   - What should be built here.
+   - What should be integrated from other repos.
+   - What should be exposed as shared platform capabilities.
+   - What should never be duplicated.
+
+7. **Recommended execution order**
+   - Sequence the most important enhancements by dependency and business value.
+
+## Rules
+
+- Do not assume anything.
+- Verify everything against the codebase and governance documents.
+- Treat logistics as a separate module/repo unless integration is explicitly required.
+- Favor reuse over rebuilding.
+- Think platform-wide, not repo-locally.
+- Be exhaustive, structured, and precise.
+
+## Expected standard
+
+I expect a deeply researched, platform-aware, implementation-ready response that can guide real roadmap decisions across the commerce stack.

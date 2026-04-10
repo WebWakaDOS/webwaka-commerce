@@ -3,36 +3,91 @@
  * L2 QA Layer: Unit tests for inventory synchronization and conflict resolution
  * Invariants: Offline-First (sync), Nigeria-First (kobo), Build Once Use Infinitely
  *
- * NOTE: These tests directly invoke the service method to avoid Vitest ESM module
- * singleton isolation issues with the event bus. The event bus integration is
- * verified at the integration layer (L3).
+ * Refactored: service now takes D1Database in constructor (no in-memory Map).
+ * Tests mock D1 prepare/bind/first/run to verify D1 UPDATE/INSERT calls.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
-import { db, InventoryItem } from '../db/schema';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { InventorySyncService } from './inventory-service';
+import type { InventoryItem } from './inventory-service';
 import { WebWakaEvent } from '../event-bus';
 
-// Create a fresh service instance per test suite to avoid singleton pollution
+// ── Mock D1 ──────────────────────────────────────────────────────────────────
+const mockRun = vi.fn().mockResolvedValue({ success: true });
+const mockBind = vi.fn();
+const mockFirst = vi.fn().mockResolvedValue(null);
+const mockPrepare = vi.fn();
+
+const mockDb = {
+  prepare: mockPrepare,
+  bind: mockBind,
+  first: mockFirst,
+  run: mockRun,
+} as unknown as D1Database;
+
+// Sync prefs config for tnt_123 (mirrors old hardcoded getTenantConfig mock)
+const TNT_123_PREFS = JSON.stringify({
+  inventorySyncPreferences: {
+    sync_pos_to_single_vendor: true,
+    sync_pos_to_multi_vendor: false,
+    sync_single_vendor_to_multi_vendor: false,
+    conflict_resolution: 'last_write_wins',
+  },
+});
+
 let service: InventorySyncService;
 
 describe('Shared Commerce Foundation - Inventory Sync', () => {
   beforeEach(() => {
-    db.inventory.clear();
-    service = new InventorySyncService();
+    vi.clearAllMocks();
+
+    // Default chain: prepare().bind().first() → null (no existing product)
+    // prepare().bind().run() → success
+    const chainObj = {
+      bind: vi.fn().mockReturnThis(),
+      first: vi.fn().mockResolvedValue(null),
+      run: mockRun,
+    };
+    mockPrepare.mockReturnValue(chainObj);
+
+    service = new InventorySyncService(mockDb);
   });
 
   it('should sync POS inventory to Single Vendor Storefront based on preferences', async () => {
+    // First prepare() → tenants query → return sync prefs for tnt_123
+    // Second prepare() → cmrc_products INSERT
+    let callCount = 0;
+    mockPrepare.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        // _getSyncPrefs: SELECT sync_config FROM tenants WHERE id = ?
+        return {
+          bind: vi.fn().mockReturnThis(),
+          first: vi.fn().mockResolvedValue({ sync_config: TNT_123_PREFS }),
+          run: mockRun,
+        };
+      }
+      // applySync: SELECT from cmrc_products (no existing row)
+      if (callCount === 2) {
+        return {
+          bind: vi.fn().mockReturnThis(),
+          first: vi.fn().mockResolvedValue(null),
+          run: mockRun,
+        };
+      }
+      // applySync: INSERT OR IGNORE INTO cmrc_products
+      return {
+        bind: vi.fn().mockReturnThis(),
+        first: vi.fn().mockResolvedValue(null),
+        run: mockRun,
+      };
+    });
+
     const item: InventoryItem = {
       id: 'item_1',
       tenantId: 'tnt_123',
       sku: 'SKU-001',
-      name: 'Test Product',
       quantity: 10,
-      price: 10000, // 100.00 NGN in kobo — Nigeria-First monetary invariant
       version: 1,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      deletedAt: null,
     };
 
     const event: WebWakaEvent<{ item: InventoryItem }> = {
@@ -44,44 +99,50 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
       payload: { item },
     };
 
-    // Directly invoke the handler to bypass ESM singleton isolation
     await service.handleInventoryUpdate(event);
 
-    // Verify item was synced to DB
-    const syncedItem = db.inventory.get('item_1');
-    expect(syncedItem).toBeDefined();
-    expect(syncedItem?.quantity).toBe(10);
-    expect(syncedItem?.tenantId).toBe('tnt_123');
-    expect(syncedItem?.price).toBe(10000); // Kobo integer — monetary invariant
+    // Verify D1 prepare was called (at least once for tenants query + once for cmrc_products)
+    expect(mockPrepare).toHaveBeenCalledTimes(3);
+
+    // Verify the INSERT statement was built for the product
+    const insertCall = mockPrepare.mock.calls[2]![0] as string;
+    expect(insertCall).toMatch(/INSERT INTO cmrc_products/i);
   });
 
   it('should apply last_write_wins conflict resolution', async () => {
-    // Initial state: item exists with version 2
-    db.inventory.set('item_2', {
-      id: 'item_2',
-      tenantId: 'tnt_123',
-      sku: 'SKU-002',
-      name: 'Product 2',
-      quantity: 5,
-      price: 5000,
-      version: 2,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      deletedAt: null,
+    let callCount = 0;
+    mockPrepare.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        // _getSyncPrefs
+        return {
+          bind: vi.fn().mockReturnThis(),
+          first: vi.fn().mockResolvedValue({ sync_config: TNT_123_PREFS }),
+          run: mockRun,
+        };
+      }
+      if (callCount === 2) {
+        // applySync: SELECT — existing product with version 2
+        return {
+          bind: vi.fn().mockReturnThis(),
+          first: vi.fn().mockResolvedValue({ id: 'item_2', version: 2 }),
+          run: mockRun,
+        };
+      }
+      // applySync: UPDATE (last_write_wins — overwrites regardless of version)
+      return {
+        bind: vi.fn().mockReturnThis(),
+        first: vi.fn().mockResolvedValue(null),
+        run: mockRun,
+      };
     });
 
-    // Incoming update with lower version (conflict scenario)
     const incomingItem: InventoryItem = {
       id: 'item_2',
       tenantId: 'tnt_123',
       sku: 'SKU-002',
-      name: 'Product 2',
       quantity: 20,
-      price: 5000,
-      version: 1, // Lower version — triggers conflict resolution
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      deletedAt: null,
+      version: 1, // Lower version — last_write_wins ignores this
     };
 
     const event: WebWakaEvent<{ item: InventoryItem }> = {
@@ -95,23 +156,37 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
 
     await service.handleInventoryUpdate(event);
 
-    // last_write_wins: should overwrite regardless of version
-    const syncedItem = db.inventory.get('item_2');
-    expect(syncedItem?.quantity).toBe(20);
+    // Verify UPDATE was issued (last_write_wins: overwrite regardless of version)
+    expect(mockPrepare).toHaveBeenCalledTimes(3);
+    const updateCall = mockPrepare.mock.calls[2]![0] as string;
+    expect(updateCall).toMatch(/UPDATE cmrc_products/i);
+
+    // Verify quantity=20 was passed to bind
+    const bindArgs = (mockPrepare.mock.results[2]!.value as { bind: ReturnType<typeof vi.fn> }).bind.mock.calls;
+    expect(bindArgs[0]).toContain(20); // quantity = 20
   });
 
   it('should not sync when tenant config is not found', async () => {
+    let callCount = 0;
+    mockPrepare.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        // _getSyncPrefs: no row for this tenant
+        return {
+          bind: vi.fn().mockReturnThis(),
+          first: vi.fn().mockResolvedValue(null),
+          run: mockRun,
+        };
+      }
+      return { bind: vi.fn().mockReturnThis(), first: vi.fn().mockResolvedValue(null), run: mockRun };
+    });
+
     const item: InventoryItem = {
       id: 'item_unknown',
-      tenantId: 'tnt_unknown', // No config for this tenant
+      tenantId: 'tnt_unknown',
       sku: 'SKU-999',
-      name: 'Unknown Product',
       quantity: 5,
-      price: 1000,
       version: 1,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      deletedAt: null,
     };
 
     const event: WebWakaEvent<{ item: InventoryItem }> = {
@@ -125,40 +200,53 @@ describe('Shared Commerce Foundation - Inventory Sync', () => {
 
     await service.handleInventoryUpdate(event);
 
-    // Should not sync — no tenant config
-    const syncedItem = db.inventory.get('item_unknown');
-    expect(syncedItem).toBeUndefined();
+    // Only the tenants query should run — no cmrc_products UPDATE/INSERT
+    expect(mockPrepare).toHaveBeenCalledTimes(1);
+    const tenantsCall = mockPrepare.mock.calls[0]![0] as string;
+    expect(tenantsCall).toMatch(/FROM tenants/i);
   });
 
   it('should not sync when module sync preferences are disabled', async () => {
-    // tnt_123 has sync_pos_to_multi_vendor: false
+    const disabledPrefs = JSON.stringify({
+      inventorySyncPreferences: {
+        sync_pos_to_single_vendor: false,
+        sync_pos_to_multi_vendor: false,
+        sync_single_vendor_to_multi_vendor: false,
+        conflict_resolution: 'last_write_wins',
+      },
+    });
+
+    let callCount = 0;
+    mockPrepare.mockImplementation(() => {
+      callCount++;
+      return {
+        bind: vi.fn().mockReturnThis(),
+        first: vi.fn().mockResolvedValue(callCount === 1 ? { sync_config: disabledPrefs } : null),
+        run: mockRun,
+      };
+    });
+
     const item: InventoryItem = {
       id: 'item_no_sync',
       tenantId: 'tnt_123',
       sku: 'SKU-003',
-      name: 'No Sync Product',
       quantity: 7,
-      price: 3000,
       version: 1,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      deletedAt: null,
     };
 
     const event: WebWakaEvent<{ item: InventoryItem }> = {
       id: 'evt_4',
       tenantId: 'tnt_123',
       type: 'inventory.updated',
-      sourceModule: 'multi_vendor_marketplace', // Not configured to sync
+      sourceModule: 'multi_vendor_marketplace', // Not configured to sync outward
       timestamp: Date.now(),
       payload: { item },
     };
 
-    // This source module has no outgoing sync configured
-    await service.handleInventoryUpdate(event);
-    // Item should not appear in db from this source
-    // (it won't be set because shouldSync remains false for this source)
-    // The test verifies the service doesn't crash and handles gracefully
-    expect(true).toBe(true); // No error thrown
+    // Should not throw — graceful no-op
+    await expect(service.handleInventoryUpdate(event)).resolves.toBeUndefined();
+
+    // Only the tenants lookup + (potentially) cmrc_products SELECT — no UPDATE
+    expect(mockPrepare.mock.calls.length).toBeLessThanOrEqual(2);
   });
 });

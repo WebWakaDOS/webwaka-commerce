@@ -8,35 +8,92 @@
  * SV-3 additions:
  *   SEARCH-1: GET /catalog/search?q= via FTS5 MATCH
  *   PAGE-1:   GET /catalog → cursor pagination (?after=<id>&per_page=24)
- *   ORDER-1:  GET /orders/:id → full order with parsed items
- *   VAR-1:    GET /products/:id/variants → variant list
+ *   ORDER-1:  GET /cmrc_orders/:id → full order with parsed items
+ *   VAR-1:    GET /cmrc_products/:id/variants → variant list
  */
 import { Hono } from 'hono';
+import {
+  getTenantId, requireRole, signJWT, verifyJWT, sendTermiiSms,
+  createPaymentProvider, createSmsProvider, updateWithVersionLock, CommerceEvents,
+  createTaxEngine, checkRateLimit as kvCheckRateLimit,
+} from '@webwaka/core';
+import { publishEvent } from '../../core/event-bus';
+import { ndprConsentMiddleware } from '../../middleware/ndpr';
+import { getJwtSecret } from '../../utils/jwt-secret';
+import { _createRateLimitStore, checkRateLimit } from '../../utils/rate-limit';
+import type { RateLimitStore } from '../../utils/rate-limit';
 import type { Env } from '../../worker';
+import { DEFAULT_LOYALTY_CONFIG, type LoyaltyConfig } from '../../core/tenant/index';
+import { getEffectiveBranding, syncBrandingToUIConfigKV } from '../../core/ui-config-branding'; // COM-5
 
-const VAT_RATE = 0.075;
+function evaluateLoyaltyTier(points: number, cfg: LoyaltyConfig): string {
+  const sorted = [...cfg.tiers].sort((a, b) => b.minPoints - a.minPoints);
+  return sorted.find((t) => points >= t.minPoints)?.name ?? 'BRONZE';
+}
+
+/**
+ * Haversine great-circle distance between two WGS-84 coordinates.
+ * Returns distance in kilometres. Cloudflare Workers compatible (Math only).
+ * Used for micro-hub outlet routing (T-COM-01).
+ */
+export function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify';
 const DEFAULT_PAGE_SIZE = 24;
 const MAX_PAGE_SIZE = 100;
 
 const app = new Hono<{ Bindings: Env }>();
 
+// ── Rate-limit stores ─────────────────────────────────────────────────────────
+// OTP: 5 requests per phone per 15 min (SMS abuse prevention)
+const otpRateLimitStore = _createRateLimitStore();
+// Checkout: 10 requests per phone/IP per minute (order flood prevention)
+const checkoutRateLimitStore = _createRateLimitStore();
+// Search: 60 requests per IP per minute (crawler/scraper mitigation)
+const searchRateLimitStore = _createRateLimitStore();
+
+// KV-backed rate limiter — uses SESSIONS_KV in production; falls back to in-memory store in tests.
+async function kvCheckRL(
+  kv: KVNamespace | undefined,
+  store: RateLimitStore,
+  key: string,
+  maxRequests: number,
+  windowMs: number,
+): Promise<boolean> {
+  if (kv) {
+    const r = await kvCheckRateLimit({ kv, key, maxRequests, windowSeconds: Math.ceil(windowMs / 1000) });
+    return r.allowed;
+  }
+  return checkRateLimit(store, key, maxRequests, windowMs);
+}
+
 // ── Tenant middleware ─────────────────────────────────────────────────────────
 app.use('*', async (c, next) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   if (!tenantId) return c.json({ success: false, error: 'Missing x-tenant-id header' }, 400);
+  c.set('tenantId' as never, tenantId);
   await next();
 });
 
 // ── GET / — Storefront root catalog (legacy, no pagination) ──────────────────
 app.get('/', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
+      'SELECT * FROM cmrc_products WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL ORDER BY name ASC'
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: [], message: 'DB not yet initialized' });
   }
 });
@@ -44,11 +101,16 @@ app.get('/', async (c) => {
 // ── GET /catalog/search — FTS5 full-text search (SEARCH-1) ────────────────────
 // Must be declared BEFORE /catalog to avoid :param match
 app.get('/catalog/search', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const q = c.req.query('q')?.trim();
   const perPage = Math.min(Number(c.req.query('per_page') ?? DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
 
   if (!q) return c.json({ success: false, error: 'Search query (q) is required' }, 400);
+
+  const searchRlKey = `rl:search:${c.req.header('cf-connecting-ip') ?? 'anon'}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, searchRlKey, 60, 60_000))) {
+    return c.json({ success: false, error: 'Too many search requests. Please slow down.' }, 429);
+  }
 
   try {
     // FTS5 MATCH with JOIN to apply tenant + active filters
@@ -56,7 +118,7 @@ app.get('/catalog/search', async (c) => {
       `SELECT p.id, p.name, p.description, p.price, p.quantity, p.category,
               p.image_url, p.sku, p.has_variants
        FROM products_fts fts
-       JOIN products p ON p.id = fts.product_id
+       JOIN cmrc_products p ON p.id = fts.product_id
        WHERE fts MATCH ?
          AND fts.tenant_id = ?
          AND p.is_active = 1
@@ -65,27 +127,29 @@ app.get('/catalog/search', async (c) => {
        LIMIT ?`
     ).bind(sanitizeFts(q), tenantId, perPage).all();
 
-    return c.json({ success: true, data: { products: results, query: q, count: results.length } });
-  } catch {
+    return c.json({ success: true, data: { cmrc_products: results, query: q, count: results.length } });
+  } catch (ftsErr) {
     // FTS table may not exist in early envs — graceful fallback with LIKE
+    console.warn('[SV][catalog/search] FTS5 query failed, falling back to LIKE:', ftsErr);
     try {
       const { results } = await c.env.DB.prepare(
         `SELECT id, name, description, price, quantity, category, image_url, sku, has_variants
-         FROM products
+         FROM cmrc_products
          WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
            AND (name LIKE ? OR description LIKE ? OR category LIKE ? OR sku LIKE ?)
          ORDER BY name ASC LIMIT ?`
       ).bind(tenantId, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, perPage).all();
-      return c.json({ success: true, data: { products: results, query: q, count: results.length } });
-    } catch {
-      return c.json({ success: true, data: { products: [], query: q, count: 0 } });
+      return c.json({ success: true, data: { cmrc_products: results, query: q, count: results.length } });
+    } catch (err) {
+      console.error('[SV] route error:', err);
+      return c.json({ success: true, data: { cmrc_products: [], query: q, count: 0 } });
     }
   }
 });
 
 // ── GET /catalog — Paginated public product catalog (PAGE-1 + KV cache 60s) ──
 app.get('/catalog', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const category = c.req.query('category') ?? '';
   const after = c.req.query('after') ?? '';
   const perPage = Math.min(Number(c.req.query('per_page') ?? DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
@@ -95,7 +159,7 @@ app.get('/catalog', async (c) => {
   if (c.env.CATALOG_CACHE) {
     const cached = await c.env.CATALOG_CACHE.get(cacheKey);
     if (cached) {
-      const parsed = JSON.parse(cached) as { products: unknown[]; next_cursor: string | null; has_more: boolean };
+      const parsed = JSON.parse(cached) as { cmrc_products: unknown[]; next_cursor: string | null; has_more: boolean };
       return c.json({ success: true, data: parsed, cached: true });
     }
   }
@@ -104,7 +168,7 @@ app.get('/catalog', async (c) => {
     const params: (string | number)[] = [tenantId!];
     let query =
       `SELECT id, name, description, price, quantity, category, image_url, sku, has_variants
-       FROM products
+       FROM cmrc_products
        WHERE tenant_id = ? AND is_active = 1 AND deleted_at IS NULL`;
 
     if (after) { query += ' AND id > ?'; params.push(after); }
@@ -124,7 +188,7 @@ app.get('/catalog', async (c) => {
 
     // ── Cloudflare Images URL transform (optional — CF_IMAGES_ACCOUNT_HASH) ──
     const cfHash = c.env.CF_IMAGES_ACCOUNT_HASH;
-    const products = cfHash
+    const cmrc_products = cfHash
       ? rawProducts.map(p => ({
           ...p,
           image_url: p.image_url
@@ -133,7 +197,7 @@ app.get('/catalog', async (c) => {
         }))
       : rawProducts;
 
-    const payload = { products, next_cursor: nextCursor, has_more: hasMore };
+    const payload = { cmrc_products, next_cursor: nextCursor, has_more: hasMore };
 
     // Write to KV cache (non-blocking, 60s TTL)
     if (c.env.CATALOG_CACHE) {
@@ -143,31 +207,53 @@ app.get('/catalog', async (c) => {
     }
 
     return c.json({ success: true, data: payload });
-  } catch {
-    return c.json({ success: true, data: { products: [], next_cursor: null, has_more: false } });
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: true, data: { cmrc_products: [], next_cursor: null, has_more: false } });
   }
 });
 
-// ── GET /products/:id/variants — Product variants (VAR-1) ────────────────────
-app.get('/products/:id/variants', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+// ── GET /cmrc_products/by-slug/:slug — Product detail by URL slug ─────────────────
+// Must be BEFORE /cmrc_products/:id/variants to avoid :id capturing "by-slug"
+app.get('/cmrc_products/by-slug/:slug', async (c) => {
+  const tenantId = getTenantId(c);
+  const slug = c.req.param('slug');
+  try {
+    const product = await c.env.DB.prepare(
+      `SELECT id, name, description, price, quantity, category, image_url, sku,
+              has_variants, slug
+       FROM cmrc_products
+       WHERE tenant_id = ? AND slug = ? AND is_active = 1 AND deleted_at IS NULL`,
+    ).bind(tenantId, slug).first();
+    if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+    return c.json({ success: true, data: product });
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Product not found' }, 404);
+  }
+});
+
+// ── GET /cmrc_products/:id/variants — Product variants (VAR-1) ────────────────────
+app.get('/cmrc_products/:id/variants', async (c) => {
+  const tenantId = getTenantId(c);
   const productId = c.req.param('id');
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, product_id, option_name, option_value, sku, price_delta, quantity
-       FROM product_variants
+       FROM cmrc_product_variants
        WHERE product_id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL
        ORDER BY option_name ASC, option_value ASC`
     ).bind(productId, tenantId).all();
     return c.json({ success: true, data: { variants: results } });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { variants: [] } });
   }
 });
 
 // ── POST /cart — Create or update cart session ────────────────────────────────
 app.post('/cart', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     session_token?: string;
     items: Array<{ product_id: string; quantity: number; variant_id?: string }>;
@@ -178,47 +264,50 @@ app.post('/cart', async (c) => {
   const expiresAt = now + 3600000;
   try {
     await c.env.DB.prepare(
-      `INSERT INTO cart_sessions (id, tenant_id, session_token, items_json, expires_at, created_at, updated_at)
+      `INSERT INTO cmrc_cart_sessions (id, tenant_id, session_token, items_json, expires_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET items_json = excluded.items_json, updated_at = excluded.updated_at`
     ).bind(id, tenantId, token, JSON.stringify(body.items), expiresAt, now, now).run();
     return c.json({ success: true, data: { id, session_token: token, items: body.items, expires_at: expiresAt } }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 // ── GET /cart/:token ──────────────────────────────────────────────────────────
 app.get('/cart/:token', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const token = c.req.param('token');
   try {
     const cart = await c.env.DB.prepare(
-      'SELECT * FROM cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?'
+      'SELECT * FROM cmrc_cart_sessions WHERE session_token = ? AND tenant_id = ? AND expires_at > ?'
     ).bind(token, tenantId, Date.now()).first();
     if (!cart) return c.json({ success: false, error: 'Cart not found or expired' }, 404);
     return c.json({ success: true, data: cart });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Cart not found' }, 404);
   }
 });
 
 // ── POST /promo/validate ──────────────────────────────────────────────────────
 app.post('/promo/validate', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ code: string; subtotal_kobo: number }>();
   if (!body.code || body.code.trim() === '') return c.json({ success: false, error: 'Promo code is required' }, 400);
 
   try {
     interface PromoRow {
       id: string; code: string; discount_type: string; discount_value: number;
+      discountCap: number | null;
       min_order_kobo: number; max_uses: number; current_uses: number;
       expires_at: number | null; is_active: number; description: string | null;
     }
     const promo = await c.env.DB.prepare(
-      `SELECT id, code, discount_type, discount_value, min_order_kobo, max_uses, current_uses,
+      `SELECT id, code, discount_type, discount_value, discountCap, min_order_kobo, max_uses, current_uses,
               expires_at, is_active, description
-       FROM promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
+       FROM cmrc_promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
     ).bind(tenantId, body.code.toUpperCase().trim()).first<PromoRow>();
 
     if (!promo) return c.json({ success: false, error: 'Promo code not found' }, 404);
@@ -227,16 +316,17 @@ app.post('/promo/validate', async (c) => {
     if (promo.max_uses > 0 && promo.current_uses >= promo.max_uses) return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
     if (body.subtotal_kobo < promo.min_order_kobo) return c.json({ success: false, error: `Minimum order of ₦${(promo.min_order_kobo / 100).toFixed(2)} required for this code` }, 422);
 
-    const discountKobo = computeDiscount(promo.discount_type, promo.discount_value, body.subtotal_kobo);
+    const discountKobo = computeDiscount(promo.discount_type, promo.discount_value, body.subtotal_kobo, promo.discountCap);
     return c.json({ success: true, data: { code: promo.code, discount_type: promo.discount_type, discount_value: promo.discount_value, discount_kobo: discountKobo, description: promo.description } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 // ── POST /checkout — SV Phase 2 hardened (PAY-1, PROMO-1, VAT-1, ADDR-1) ─────
-app.post('/checkout', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+app.post('/checkout', ndprConsentMiddleware, async (c) => {
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{
     items: Array<{ product_id: string; quantity: number; price: number; name: string; variant_id?: string }>;
     customer_email?: string;
@@ -246,23 +336,28 @@ app.post('/checkout', async (c) => {
     ndpr_consent: boolean;
     promo_code?: string;
     delivery_address?: { state: string; lga: string; street: string };
+    delivery_lat?: number;
+    delivery_lng?: number;
     session_token?: string;
   }>();
 
-  if (!body.ndpr_consent) return c.json({ success: false, error: 'NDPR consent required for checkout' }, 400);
   if (!body.items || body.items.length === 0) return c.json({ success: false, error: 'Cart is empty' }, 400);
   if (!body.customer_email && !body.customer_phone) return c.json({ success: false, error: 'customer_email or customer_phone required' }, 400);
   if (!body.paystack_reference || body.paystack_reference.trim() === '') return c.json({ success: false, error: 'paystack_reference is required' }, 400);
+  const rlPhone = body.customer_phone ?? body.customer_email ?? 'anon';
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, checkoutRateLimitStore, `rl:checkout:${rlPhone}`, 10, 60_000))) {
+    return c.json({ success: false, error: 'Too many checkout attempts. Please wait before retrying.' }, 429);
+  }
   for (const item of body.items) {
     if (!item.product_id || item.quantity <= 0) return c.json({ success: false, error: 'Invalid item: product_id required and quantity must be > 0' }, 400);
   }
 
   try {
-    interface DbProduct { id: string; name: string; price: number; quantity: number }
+    interface DbProduct { id: string; name: string; price: number; quantity: number; version: number }
     const dbProducts: Array<DbProduct | null> = await Promise.all(
       body.items.map(item =>
         c.env.DB.prepare(
-          'SELECT id, name, price, quantity FROM products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL'
+          'SELECT id, name, price, quantity, version FROM cmrc_products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL'
         ).bind(item.product_id, tenantId).first<DbProduct>()
       )
     );
@@ -278,27 +373,107 @@ app.post('/checkout', async (c) => {
     const subtotal = body.items.reduce((s, item, idx) => s + dbProducts[idx]!.price * item.quantity, 0);
 
     let discountKobo = 0;
-    let promoRow: { id: string; discount_type: string; discount_value: number } | null = null;
+    let freeShipping = false;
+    interface SvPromoRow { id: string; discount_type: string; discount_value: number; promoType: string | null }
+    let promoRow: SvPromoRow | null = null;
+    // Hoisted so the pre-flight cap-claim can reference them after the promo block
+    let promoCapForClaim: number | null = null;   // null = uncapped
+    let bogoFreeProductId: string | null = null;  // populated for BOGO promo usage records
 
     if (body.promo_code && body.promo_code.trim() !== '') {
-      interface PromoRow { id: string; code: string; discount_type: string; discount_value: number; min_order_kobo: number; max_uses: number; current_uses: number; expires_at: number | null; is_active: number }
+      interface EnhancedPromoRow {
+        id: string; code: string; discount_type: string; discount_value: number;
+        discountCap: number | null;
+        min_order_kobo: number; max_uses: number; current_uses: number;
+        expires_at: number | null; is_active: number;
+        promoType: string | null; minOrderValueKobo: number | null;
+        maxUsesTotal: number | null; maxUsesPerCustomer: number | null;
+        validFrom: string | null; validUntil: string | null;
+        productScope: string | null; usedCount: number;
+      }
       const promo = await c.env.DB.prepare(
-        `SELECT id, code, discount_type, discount_value, min_order_kobo, max_uses, current_uses, expires_at, is_active
-         FROM promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
-      ).bind(tenantId, body.promo_code.toUpperCase().trim()).first<PromoRow>();
+        `SELECT id, code, discount_type, discount_value, discountCap, min_order_kobo, max_uses, current_uses, expires_at, is_active,
+                promoType, minOrderValueKobo, maxUsesTotal, maxUsesPerCustomer, validFrom, validUntil, productScope, usedCount
+         FROM cmrc_promo_codes WHERE tenant_id = ? AND code = ? AND deleted_at IS NULL`
+      ).bind(tenantId, body.promo_code.toUpperCase().trim()).first<EnhancedPromoRow>();
 
       if (!promo) return c.json({ success: false, error: 'Promo code not found' }, 422);
       if (!promo.is_active) return c.json({ success: false, error: 'Promo code is not active' }, 422);
-      if (promo.expires_at && promo.expires_at < Date.now()) return c.json({ success: false, error: 'Promo code has expired' }, 422);
-      if (promo.max_uses > 0 && promo.current_uses >= promo.max_uses) return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
-      if (subtotal < promo.min_order_kobo) return c.json({ success: false, error: 'Minimum order required for this promo code' }, 422);
 
-      discountKobo = computeDiscount(promo.discount_type, promo.discount_value, subtotal);
-      promoRow = { id: promo.id, discount_type: promo.discount_type, discount_value: promo.discount_value };
+      // 1. Date window check (validFrom / validUntil)
+      const nowIso = new Date(Date.now()).toISOString();
+      if (promo.validFrom && nowIso < promo.validFrom) return c.json({ success: false, error: 'promo_not_yet_active' }, 422);
+      if (promo.validUntil && nowIso > promo.validUntil) return c.json({ success: false, error: 'promo_expired' }, 422);
+      if (promo.expires_at && promo.expires_at < Date.now()) return c.json({ success: false, error: 'promo_expired' }, 422);
+
+      // 2. Minimum order value
+      const minOrder = promo.minOrderValueKobo ?? promo.min_order_kobo;
+      if (subtotal < minOrder) return c.json({ success: false, error: `Minimum order of ₦${(minOrder / 100).toFixed(2)} required for this promo code` }, 422);
+
+      // 3. Total usage cap
+      const usageCap = promo.maxUsesTotal ?? (promo.max_uses > 0 ? promo.max_uses : null);
+      const usedSoFar = promo.usedCount > 0 ? promo.usedCount : promo.current_uses;
+      if (usageCap !== null && usedSoFar >= usageCap) return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
+      promoCapForClaim = usageCap; // hoist for the post-Paystack pre-flight claim
+
+      // 4. Per-customer usage cap
+      if (promo.maxUsesPerCustomer !== null && promo.maxUsesPerCustomer > 0) {
+        const promoCustomerKey = body.customer_phone ?? body.customer_email ?? '';
+        if (promoCustomerKey) {
+          const usageRow = await c.env.DB.prepare(
+            'SELECT COUNT(*) as cnt FROM cmrc_promo_usage WHERE promoId = ? AND customerId = ? AND tenantId = ?'
+          ).bind(promo.id, promoCustomerKey, tenantId).first<{ cnt: number }>();
+          if ((usageRow?.cnt ?? 0) >= promo.maxUsesPerCustomer) {
+            return c.json({ success: false, error: 'promo_already_used' }, 422);
+          }
+        }
+      }
+
+      // 5 & 6. Compute discount by promoType (extended types + backward compat)
+      const effectiveType = promo.promoType ?? promo.discount_type;
+
+      if (effectiveType === 'FREE_SHIPPING') {
+        freeShipping = true;
+        discountKobo = 0;
+      } else if (effectiveType === 'BOGO') {
+        // For each qualifying item pair, the cheaper unit is free (unit price × floor(qty/2))
+        let bogoScope: string[] | null = null;
+        try { bogoScope = promo.productScope ? (JSON.parse(promo.productScope) as string[]) : null; } catch { /* no-op */ }
+        let bogoDiscount = 0;
+        let bogoTopContrib = 0;
+        for (let i = 0; i < body.items.length; i++) {
+          const item = body.items[i]!;
+          if (bogoScope && !bogoScope.includes(item.product_id)) continue;
+          const pairsQty = Math.floor(item.quantity / 2);
+          const contrib = pairsQty * (dbProducts[i]?.price ?? item.price);
+          bogoDiscount += contrib;
+          if (contrib > bogoTopContrib) { bogoTopContrib = contrib; bogoFreeProductId = item.product_id; }
+        }
+        discountKobo = Math.min(bogoDiscount, subtotal);
+      } else {
+        // Scope-filtered discount (PERCENTAGE / FIXED / pct / flat)
+        let applicableAmount = subtotal;
+        if (promo.productScope) {
+          let scopeIds: string[] = [];
+          try { scopeIds = JSON.parse(promo.productScope) as string[]; } catch { /* no-op */ }
+          applicableAmount = body.items.reduce((s, item, idx) =>
+            scopeIds.includes(item.product_id) ? s + (dbProducts[idx]?.price ?? item.price) * item.quantity : s, 0);
+        }
+        discountKobo = computeDiscount(effectiveType, promo.discount_value, applicableAmount, promo.discountCap);
+      }
+
+      promoRow = { id: promo.id, discount_type: promo.discount_type, discount_value: promo.discount_value, promoType: effectiveType };
     }
 
     const afterDiscount = Math.max(0, subtotal - discountKobo);
-    const vatKobo = Math.round(afterDiscount * VAT_RATE);
+    const svTaxConfig = (c.get('tenantConfig' as never) as { taxConfig?: { vatRate: number; vatRegistered: boolean; exemptCategories: string[] } } | undefined)?.taxConfig
+      ?? { vatRate: 0.075, vatRegistered: true, exemptCategories: [] };
+    const { vatKobo } = createTaxEngine(svTaxConfig).compute(
+      body.items.map((item, idx) => ({
+        category: (dbProducts[idx] as { category?: string } | null)?.category ?? 'general',
+        amountKobo: dbProducts[idx]!.price * item.quantity,
+      })).map(li => ({ ...li, amountKobo: Math.round(li.amountKobo * (subtotal > 0 ? afterDiscount / subtotal : 1)) })),
+    );
     const totalAmount = afterDiscount + vatKobo;
 
     const paystackSecret = c.env.PAYSTACK_SECRET ?? '';
@@ -325,9 +500,92 @@ app.post('/checkout', async (c) => {
     const contactName = body.customer_email ?? body.customer_phone ?? 'Guest';
     const deliveryJson = body.delivery_address ? JSON.stringify(body.delivery_address) : null;
 
+    // ── TASK SV-E02: Deduct stock atomically with optimistic locking ─────────
+    // Run before order insertion so that a version conflict triggers a refund
+    // rather than an orphaned order.
+    for (let i = 0; i < body.items.length; i++) {
+      const item = body.items[i]!;
+      const dbProd = dbProducts[i]!;
+      const newQty = dbProd.quantity - item.quantity;
+
+      const lockResult = await updateWithVersionLock(
+        c.env.DB,
+        'cmrc_products',
+        { quantity: newQty },
+        { id: item.product_id, tenantId: tenantId!, expectedVersion: dbProd.version },
+      );
+
+      if (lockResult.conflict) {
+        // Payment already captured — initiate automatic refund (SV-E01)
+        try {
+          const paymentProvider = createPaymentProvider(c.env.PAYSTACK_SECRET ?? '');
+          await paymentProvider.initiateRefund(body.paystack_reference);
+
+          // Publish PAYMENT_REFUNDED event via CF Queues (or in-memory fallback in dev)
+          await publishEvent(c.env.COMMERCE_EVENTS, {
+            id: `evt_ref_${Date.now()}`,
+            tenantId: tenantId!,
+            type: CommerceEvents.PAYMENT_REFUNDED,
+            sourceModule: 'single_vendor_storefront',
+            timestamp: Date.now(),
+            payload: {
+              reference: body.paystack_reference,
+              reason: 'stock_unavailable',
+            },
+          });
+
+          // Notify customer via WhatsApp
+          const smsProvider = createSmsProvider(c.env.TERMII_API_KEY ?? '');
+          const customerPhone = body.customer_phone ?? '';
+          if (customerPhone) {
+            await smsProvider.sendOtp(
+              customerPhone,
+              'Your order could not be fulfilled due to stock unavailability. A full refund has been initiated.',
+              'whatsapp',
+            );
+          }
+        } catch {
+          // Refund attempt failure must not suppress the 409 — operations team
+          // can reconcile via Paystack dashboard.
+        }
+
+        return c.json({
+          success: false,
+          error: 'stock_unavailable',
+          refundInitiated: true,
+        }, 409);
+      }
+    }
+
+    // ── Pre-flight promo usage claim (TOCTOU-safe for capped promos) ─────────
+    // Problem: we read usedCount/current_uses above and then verify Paystack
+    // (~200 ms). Two concurrent requests can both pass the cap check, both
+    // verify, and both increment — exceeding the cap.
+    // Fix: run a conditional UPDATE *before* inserting the order. If another
+    // concurrent request already exhausted the cap, changes===0 and we reject.
+    let promoPreClaimed = false;
+    if (promoRow && promoCapForClaim !== null) {
+      const claimResult = await c.env.DB.prepare(
+        `UPDATE cmrc_promo_codes
+           SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ?
+         WHERE id = ? AND tenant_id = ?
+           AND (
+             (maxUsesTotal IS NOT NULL AND usedCount < maxUsesTotal)
+             OR (maxUsesTotal IS NULL AND max_uses > 0 AND current_uses < max_uses)
+           )`,
+      ).bind(now, promoRow.id, tenantId).run();
+
+      if (claimResult.meta.changes === 0) {
+        // Cap was hit by a concurrent request between our read and this write
+        return c.json({ success: false, error: 'Promo code has reached its maximum uses' }, 422);
+      }
+      promoPreClaimed = true;
+    }
+
+    // ── Insert order + customer + promo atomically ────────────────────────────
     const stmts = [
       c.env.DB.prepare(
-        `INSERT INTO orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal,
+        `INSERT INTO cmrc_orders (id, tenant_id, customer_email, customer_phone, items_json, subtotal,
                              discount, discount_kobo, vat_kobo, total_amount, payment_method,
                              payment_status, order_status, channel, payment_reference,
                              paystack_reference, delivery_address_json, promo_code,
@@ -342,49 +600,281 @@ app.post('/checkout', async (c) => {
         deliveryJson, body.promo_code?.toUpperCase().trim() ?? null,
         now, now,
       ),
-      ...body.items.map(item =>
-        c.env.DB.prepare(
-          'UPDATE products SET quantity = quantity - ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND quantity >= ?'
-        ).bind(item.quantity, now, item.product_id, tenantId, item.quantity)
-      ),
       c.env.DB.prepare(
-        `INSERT OR IGNORE INTO customers (id, tenant_id, name, email, phone, ndpr_consent, ndpr_consent_at, created_at, updated_at)
+        `INSERT OR IGNORE INTO cmrc_customers (id, tenant_id, name, email, phone, ndpr_consent, ndpr_consent_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`
       ).bind(custId, tenantId, contactName, body.customer_email ?? null, body.customer_phone ?? null, now, now, now),
     ];
 
-    if (promoRow) {
+    if (promoRow && !promoPreClaimed) {
+      // Uncapped promos are incremented here (inside the atomic batch)
       stmts.push(
         c.env.DB.prepare(
-          'UPDATE promo_codes SET current_uses = current_uses + 1, updated_at = ? WHERE id = ? AND tenant_id = ?'
+          'UPDATE cmrc_promo_codes SET current_uses = current_uses + 1, usedCount = usedCount + 1, updated_at = ? WHERE id = ? AND tenant_id = ?'
         ).bind(now, promoRow.id, tenantId)
       );
     }
 
-    const results = await c.env.DB.batch(stmts);
-
-    for (let i = 1; i <= body.items.length; i++) {
-      if ((results[i]?.meta?.changes ?? 0) < 1) {
-        return c.json({ success: false, error: `Stock race condition on "${body.items[i - 1]!.name}". Please try again.` }, 409);
+    // Track per-customer promo usage atomically with the order (not fire-and-forget)
+    if (promoRow) {
+      const promoCustomerKey = body.customer_phone ?? body.customer_email ?? '';
+      if (promoCustomerKey) {
+        const puId = `pu_${now}_${Math.random().toString(36).slice(2, 9)}`;
+        stmts.push(
+          c.env.DB.prepare(
+            `INSERT INTO cmrc_promo_usage (id, promoId, customerId, tenantId, usedAt, freeProductId)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          ).bind(puId, promoRow.id, promoCustomerKey, tenantId, new Date(now).toISOString(), bogoFreeProductId)
+        );
       }
     }
 
+    try {
+      await c.env.DB.batch(stmts);
+    } catch (batchErr: unknown) {
+      // Compensating decrement: if the pre-flight promo slot claim already committed
+      // but the order batch failed (DB error, duplicate orderId, etc.), we must roll
+      // back the usage counter so the promo can be legitimately used in a retry.
+      if (promoPreClaimed && promoRow) {
+        await c.env.DB.prepare(
+          'UPDATE cmrc_promo_codes SET current_uses = current_uses - 1, usedCount = usedCount - 1, updated_at = ? WHERE id = ? AND tenant_id = ?',
+        ).bind(now, promoRow.id, tenantId).run().catch(() => {
+          // Compensation failure is non-fatal from the user's perspective —
+          // operations can reconcile the counter via the admin dashboard.
+          console.error('[SV][checkout] promo compensation decrement failed', batchErr);
+        });
+      }
+      throw batchErr;
+    }
+
+    // ── Micro-Hub Fulfillment Routing (T-COM-01) ──────────────────────────────
+    // If featureFlags.micro_hub_routing is enabled for this tenant, route the
+    // new storefront order to the nearest active POS outlet so cashiers can
+    // pick/pack locally instead of shipping from a central warehouse.
+    // [EVT] We assign and notify here; Commerce never does dispatch/rider logic.
+    // [MTT] All queries are scoped to tenantId.
+    (() => {
+      const tenantCfg = c.get('tenantConfig' as never) as { featureFlags?: Record<string, boolean> } | undefined;
+      if (!tenantCfg?.featureFlags?.micro_hub_routing) return;
+      (async () => {
+        try {
+          interface OutletRow { id: string; name: string; address: string | null; lat: number | null; lng: number | null }
+          const { results: outlets } = await c.env.DB.prepare(
+            `SELECT id, name, address, lat, lng FROM cmrc_pos_outlets WHERE tenant_id = ? AND active = 1`
+          ).bind(tenantId).all<OutletRow>();
+          if (!outlets || outlets.length === 0) return;
+
+          let nearestId: string | null = null;
+          let nearestName: string | null = null;
+
+          const deliveryLat = typeof body.delivery_lat === 'number' ? body.delivery_lat : null;
+          const deliveryLng = typeof body.delivery_lng === 'number' ? body.delivery_lng : null;
+
+          if (deliveryLat !== null && deliveryLng !== null) {
+            // Choose nearest outlet by Haversine distance (requires lat/lng on outlet)
+            let minDist = Infinity;
+            for (const outlet of outlets) {
+              if (outlet.lat === null || outlet.lng === null) continue;
+              const dist = haversineDistanceKm(deliveryLat, deliveryLng, outlet.lat, outlet.lng);
+              if (dist < minDist) { minDist = dist; nearestId = outlet.id; nearestName = outlet.name; }
+            }
+            // Fallback: if no outlets have coordinates, take first active one
+            if (!nearestId && outlets[0]) { nearestId = outlets[0].id; nearestName = outlets[0].name; }
+          } else {
+            // No customer coordinates provided — assign to first active outlet (round-robin can be added later)
+            nearestId = outlets[0]!.id;
+            nearestName = outlets[0]!.name;
+          }
+
+          if (!nearestId) return;
+          const assignedAt = new Date().toISOString();
+          await c.env.DB.prepare(
+            `UPDATE cmrc_orders SET fulfillment_outlet_id = ?, fulfillment_status = 'assigned',
+             fulfillment_assigned_at = ?, updated_at = ?
+             WHERE id = ? AND tenant_id = ?`
+          ).bind(nearestId, assignedAt, assignedAt, orderId, tenantId).run();
+
+          // [EVT] Notify the outlet that a new pick-pack job has been assigned
+          await publishEvent(c.env.COMMERCE_EVENTS, {
+            id: `evt_fla_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            tenantId: tenantId!,
+            type: CommerceEvents.ORDER_READY_DELIVERY,
+            sourceModule: 'single-vendor',
+            timestamp: Date.now(),
+            payload: {
+              orderId,
+              tenantId,
+              outletId: nearestId,
+              outletName: nearestName,
+              itemCount: body.items.length,
+              assignedAt,
+            },
+          }).catch(() => { /* non-fatal */ });
+        } catch { /* non-fatal: routing failure must not block order confirmation */ }
+      })();
+    })();
+
+    // ── Award loyalty points in cmrc_customer_loyalty table (POS-E10, non-blocking) ─
+    void (async () => {
+      try {
+        const svLoyaltyCfg = (c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty ?? DEFAULT_LOYALTY_CONFIG;
+        const svLoyaltyEarned = Math.floor(totalAmount / 10000) * svLoyaltyCfg.pointsPerHundredKobo;
+        if (svLoyaltyEarned <= 0) return;
+        const phone = body.customer_phone ?? '';
+        if (!phone) return;
+        const custRow = await c.env.DB.prepare(
+          'SELECT id FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+        ).bind(tenantId, phone).first<{ id: string }>();
+        if (!custRow) return;
+        const existing = await c.env.DB.prepare(
+          'SELECT id, points FROM cmrc_customer_loyalty WHERE tenantId = ? AND customerId = ?'
+        ).bind(tenantId, custRow.id).first<{ id: string; points: number }>();
+        const prevPts = existing?.points ?? 0;
+        const newPts = prevPts + svLoyaltyEarned;
+        const newTier = evaluateLoyaltyTier(newPts, svLoyaltyCfg);
+        if (existing) {
+          await c.env.DB.prepare(
+            'UPDATE cmrc_customer_loyalty SET points = ?, tier = ?, updatedAt = ? WHERE tenantId = ? AND customerId = ?'
+          ).bind(newPts, newTier, new Date(now).toISOString(), tenantId, custRow.id).run();
+        } else {
+          const lid = `loy_sv_${now}_${Math.random().toString(36).slice(2, 9)}`;
+          await c.env.DB.prepare(
+            'INSERT OR IGNORE INTO cmrc_customer_loyalty (id, tenantId, customerId, points, tier, updatedAt) VALUES (?, ?, ?, ?, ?, ?)'
+          ).bind(lid, tenantId, custRow.id, svLoyaltyEarned, evaluateLoyaltyTier(svLoyaltyEarned, svLoyaltyCfg), new Date(now).toISOString()).run();
+        }
+      } catch { /* non-fatal */ }
+    })();
+
+    // ── Publish delivery request via CF Queues (P05-T1) ───────────────────
+    const svTenantCfg = c.get('tenantConfig' as never) as { storeAddress?: unknown } | undefined;
+    await publishEvent(c.env.COMMERCE_EVENTS, {
+      id: `evt_dlv_${Date.now()}`,
+      tenantId: tenantId!,
+      type: CommerceEvents.ORDER_READY_DELIVERY,
+      sourceModule: 'single-vendor',
+      timestamp: Date.now(),
+      payload: {
+        orderId,
+        tenantId,
+        sourceModule: 'single-vendor',
+        pickupAddress: svTenantCfg?.storeAddress ?? null,
+        deliveryAddress: body.delivery_address ?? null,
+        itemsSummary: `${body.items.length} item(s)`,
+        weightKg: undefined,
+      },
+    }).catch(() => { /* non-fatal: logistics system retries on CF Queues */ });
+
+    const svLoyaltyEarnedFinal = Math.floor(totalAmount / 10000) * ((c.get('tenantConfig' as never) as { loyalty?: typeof DEFAULT_LOYALTY_CONFIG } | undefined)?.loyalty?.pointsPerHundredKobo ?? DEFAULT_LOYALTY_CONFIG.pointsPerHundredKobo);
     return c.json({
       success: true,
       data: {
         id: orderId, subtotal, discount_kobo: discountKobo, vat_kobo: vatKobo,
         total_amount: totalAmount, payment_reference: body.paystack_reference,
         payment_status: 'paid', order_status: 'confirmed', items_count: body.items.length,
+        ...(freeShipping ? { free_shipping: true } : {}),
+        loyalty_earned: svLoyaltyEarnedFinal,
       },
     }, 201);
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
-// ── GET /orders/:id — Full order detail (ORDER-1) ─────────────────────────────
-app.get('/orders/:id', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+// ── GET /cmrc_orders/:id/delivery-options — Return logistics quotes from KV (P05-T2) ─
+// Must be BEFORE /cmrc_orders/:id to prevent ":id" from matching sub-paths
+app.get('/cmrc_orders/:id/delivery-options', async (c) => {
+  const orderId = c.req.param('id');
+  try {
+    const raw = c.env.CATALOG_CACHE
+      ? await c.env.CATALOG_CACHE.get(`delivery_options:${orderId}`)
+      : null;
+    if (!raw) {
+      return c.json({ success: true, data: { quotes: [], pending: true } });
+    }
+    const quotes = JSON.parse(raw) as unknown;
+    return c.json({ success: true, data: { quotes, pending: false } });
+  } catch {
+    return c.json({ success: true, data: { quotes: [], pending: true } });
+  }
+});
+
+// ── GET /cmrc_orders/:id/track — T-CVC-02: Redirect to Logistics tracking portal ───
+// Must be BEFORE /cmrc_orders/:id to prevent ":id" from matching the track path.
+// Obtains a signed tracking token from Logistics via Service Binding, then
+// redirects the customer to the Logistics tracking portal URL.
+app.get('/cmrc_orders/:id/track', async (c) => {
+  const tenantId = getTenantId(c);
+  const orderId = c.req.param('id');
+
+  // Verify order exists and belongs to this tenant before issuing a token
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
+    ).bind(orderId, tenantId).first<{ id: string }>();
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Order not found' }, 404);
+  }
+
+  // Delegate to Logistics for a signed tracking token (T-CVC-02)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const resp = await logisticsWorker.fetch(
+        new Request('https://logistics.internal/internal/tracking-token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${c.env.INTER_SERVICE_SECRET ?? ''}`,
+          },
+          body: JSON.stringify({ orderId, tenantId, sourceModule: 'single-vendor' }),
+        }),
+      );
+      if (resp.ok) {
+        const json = await resp.json<{ success: boolean; data?: { trackingUrl?: string } }>();
+        if (json.success && json.data?.trackingUrl) {
+          return c.redirect(json.data.trackingUrl, 302);
+        }
+      }
+    } catch (err) {
+      console.error('[SV] Logistics tracking-token fetch failed:', err);
+    }
+  }
+
+  // Fallback: return basic Commerce-side status when Logistics is unavailable
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id, order_status, payment_status, created_at, updated_at
+       FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`,
+    ).bind(orderId, tenantId).first<{
+      id: string; order_status: string; payment_status: string;
+      created_at: number; updated_at: number;
+    }>();
+    if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
+    const STATUS_SEQUENCE = ['confirmed', 'processing', 'shipped', 'delivered'];
+    const currentIdx = STATUS_SEQUENCE.indexOf(order.order_status);
+    const timeline = STATUS_SEQUENCE.map((status, i) => ({
+      status,
+      label: status.charAt(0).toUpperCase() + status.slice(1),
+      completed: currentIdx === -1 ? false : i <= currentIdx,
+      current: i === currentIdx,
+    }));
+    return c.json({
+      success: true,
+      data: { id: order.id, order_status: order.order_status, payment_status: order.payment_status, timeline, placed_at: order.created_at, updated_at: order.updated_at },
+      note: 'logistics_unavailable',
+    });
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Order not found' }, 404);
+  }
+});
+
+// ── GET /cmrc_orders/:id — Full order detail (ORDER-1) ─────────────────────────────
+app.get('/cmrc_orders/:id', async (c) => {
+  const tenantId = getTenantId(c);
   const orderId = c.req.param('id');
   try {
     interface OrderRow {
@@ -396,7 +886,7 @@ app.get('/orders/:id', async (c) => {
       created_at: number; updated_at: number;
     }
     const order = await c.env.DB.prepare(
-      `SELECT * FROM orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`
+      `SELECT * FROM cmrc_orders WHERE id = ? AND tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL`
     ).bind(orderId, tenantId).first<OrderRow>();
 
     if (!order) return c.json({ success: false, error: 'Order not found' }, 404);
@@ -417,40 +907,126 @@ app.get('/orders/:id', async (c) => {
         delivery_address_json: undefined,
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Order not found' }, 404);
   }
 });
 
-// ── GET /orders — List storefront orders ──────────────────────────────────────
-app.get('/orders', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+// ── GET /cmrc_orders — List storefront cmrc_orders ──────────────────────────────────────
+app.get('/cmrc_orders', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      "SELECT * FROM orders WHERE tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
+      "SELECT * FROM cmrc_orders WHERE tenant_id = ? AND channel = 'storefront' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100"
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: [] });
   }
 });
 
-// ── GET /customers ────────────────────────────────────────────────────────────
-app.get('/customers', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+// ── GET /cmrc_customers ────────────────────────────────────────────────────────────
+app.get('/cmrc_customers', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT id, name, email, phone, loyalty_points, total_spend, ndpr_consent, created_at FROM customers WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
+      'SELECT id, name, email, phone, loyalty_points, total_spend, ndpr_consent, created_at FROM cmrc_customers WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
     ).bind(tenantId).all();
     return c.json({ success: true, data: results });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: [] });
+  }
+});
+
+// ── POST /auth/login — WhatsApp MFA login with trusted-device bypass ──────────
+// Flow: (1) check trusted device in KV → issue JWT directly;
+//       (2) otherwise generate OTP, store in KV, send via WhatsApp, return 202.
+app.post('/auth/login', async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{ phone: string; deviceId?: string }>();
+
+  const phone = body.phone?.trim();
+  if (!phone) return c.json({ success: false, error: 'phone is required' }, 400);
+  if (!/^\+234[0-9]{10}$/.test(phone) && !/^0[0-9]{10}$/.test(phone)) {
+    return c.json({ success: false, error: 'Invalid Nigerian phone number. Use E.164 (+234...) or local (0...)' }, 400);
+  }
+
+  const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+  const deviceId = body.deviceId?.trim();
+
+  // ── Trusted device bypass ──────────────────────────────────────────────────
+  if (deviceId && c.env.SESSIONS_KV) {
+    const trustedKey = `trusted_device:sv:${e164}:${deviceId}`;
+    const trusted = await c.env.SESSIONS_KV.get(trustedKey);
+    if (trusted) {
+      // Fetch or create customer record, then issue JWT directly
+      try {
+        const now = Date.now();
+        interface CustomerRow { id: string; loyalty_points: number }
+        let customer = await c.env.DB.prepare(
+          'SELECT id, loyalty_points FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+        ).bind(tenantId, e164).first<CustomerRow>();
+
+        if (!customer) {
+          const cid = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+          await c.env.DB.prepare(
+            `INSERT INTO cmrc_customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
+          ).bind(cid, tenantId, e164, e164, now, now, now).run();
+          customer = { id: cid, loyalty_points: 0 };
+        }
+
+        const token = await signJWT(
+          { sub: customer.id, tenantId, role: 'customer', permissions: [], email: e164 },
+          getJwtSecret(c.env),
+          7 * 86400,
+        );
+        c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
+        return c.json({ success: true, data: { token, customer_id: customer.id, phone: e164, trusted_device: true } });
+      } catch (err) {
+        console.error('[SV] trusted device login error:', err);
+        return c.json({ success: false, error: 'Internal server error' }, 500);
+      }
+    }
+  }
+
+  // ── Rate limit: 5 OTP requests per phone per 60 minutes ───────────────────
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 60 * 60 * 1000))) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 60 minutes before trying again.' }, 429);
+  }
+
+  const otpCode = String(Math.floor(Math.random() * 900000) + 100000);
+  const otpHash = await hashOtp(otpCode);
+  const otpTtlSec = 10 * 60; // 10 minutes
+
+  try {
+    if (c.env.SESSIONS_KV) {
+      await c.env.SESSIONS_KV.put(`otp:sv:${e164}`, JSON.stringify({ hash: otpHash, createdAt: Date.now() }), { expirationTtl: otpTtlSec });
+    }
+
+    if (c.env.TERMII_API_KEY) {
+      const sms = createSmsProvider(c.env.TERMII_API_KEY);
+      await sms.sendOtp(
+        e164,
+        `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
+        'whatsapp',
+      );
+    }
+
+    return c.json({ success: true, data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: otpTtlSec, channel: 'whatsapp' } }, 202);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 // ── POST /auth/request-otp — Send 6-digit OTP via Termii (NDPR: phone only) ──
 app.post('/auth/request-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const body = await c.req.json<{ phone: string }>();
 
   const phone = body.phone?.trim();
@@ -460,6 +1036,13 @@ app.post('/auth/request-otp', async (c) => {
   }
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+
+  // Rate limit: 5 OTP requests per phone per 15 minutes
+  const rlKey = `rl:otp:${e164}`;
+  if (!(await kvCheckRL(c.env.SESSIONS_KV, otpRateLimitStore, rlKey, 5, 15 * 60 * 1000))) {
+    return c.json({ success: false, error: 'Too many OTP requests. Please wait 15 minutes before trying again.' }, 429);
+  }
+
   const otpCode = String(Math.floor(Math.random() * 900000) + 100000);
   const otpHash = await hashOtp(otpCode);
   const now = Date.now();
@@ -468,36 +1051,28 @@ app.post('/auth/request-otp', async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
+      `INSERT INTO cmrc_customer_otps (id, tenant_id, phone, otp_hash, is_used, attempts, expires_at, created_at)
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).bind(otpId, tenantId, e164, otpHash, expiresAt, now).run();
 
-    const termiiApiKey = c.env.TERMII_API_KEY ?? '';
-    if (termiiApiKey) {
-      await fetch('https://api.ng.termii.com/api/sms/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: termiiApiKey,
-          to: e164,
-          from: 'WebWaka',
-          sms: `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
-          type: 'plain',
-          channel: 'dnd',
-        }),
-      });
-    }
+    await sendTermiiSms(
+      e164,
+      `Your WebWaka verification code is: ${otpCode}. Valid for 10 minutes. Do not share this code.`,
+      c.env.TERMII_API_KEY ?? '',
+    );
 
     return c.json({ success: true, data: { message: `OTP sent to ${e164.slice(0, 6)}****${e164.slice(-4)}`, expires_in: 600 } });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 // ── POST /auth/verify-otp — Verify OTP → JWT cookie (SV-AUTH) ────────────────
+// Checks KV-based OTP (from /auth/login) first, then falls through to D1 (from /auth/request-otp).
 app.post('/auth/verify-otp', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
-  const body = await c.req.json<{ phone: string; otp: string; cart_token?: string }>();
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{ phone: string; otp: string; cart_token?: string; deviceId?: string }>();
 
   const phone = body.phone?.trim();
   const otp = body.otp?.trim();
@@ -505,12 +1080,75 @@ app.post('/auth/verify-otp', async (c) => {
   if (!/^\d{6}$/.test(otp)) return c.json({ success: false, error: 'OTP must be 6 digits' }, 400);
 
   const e164 = phone.startsWith('+') ? phone : `+234${phone.slice(1)}`;
+  const deviceId = body.deviceId?.trim();
+
+  // ── KV OTP path (from /auth/login → WhatsApp MFA flow) ───────────────────
+  // When SESSIONS_KV is configured, the /auth/login flow stores OTPs in KV.
+  // If KV is present but key is not found, the OTP has expired — return otp_expired.
+  // Only fall through to D1 when SESSIONS_KV is not configured (legacy /auth/request-otp env).
+  if (c.env.SESSIONS_KV) {
+    const kvOtpRaw = await c.env.SESSIONS_KV.get(`otp:sv:${e164}`);
+
+    if (!kvOtpRaw) {
+      // KV configured but key absent — OTP has expired or was never issued via /auth/login
+      return c.json({ success: false, error: 'otp_expired' }, 401);
+    }
+
+    try {
+      const kvOtp = JSON.parse(kvOtpRaw) as { hash: string; createdAt: number };
+      const inputHash = await hashOtp(otp);
+
+      if (inputHash !== kvOtp.hash) {
+        return c.json({ success: false, error: 'invalid_otp' }, 401);
+      }
+
+      // Valid OTP — delete from KV immediately to prevent replay attacks
+      await c.env.SESSIONS_KV.delete(`otp:sv:${e164}`);
+
+        const now = Date.now();
+        interface CustomerRow { id: string; loyalty_points: number }
+        let customer = await c.env.DB.prepare(
+          'SELECT id, loyalty_points FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL',
+        ).bind(tenantId, e164).first<CustomerRow>();
+
+        if (!customer) {
+          const cid = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+          await c.env.DB.prepare(
+            `INSERT INTO cmrc_customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`,
+          ).bind(cid, tenantId, e164, e164, now, now, now).run();
+          customer = { id: cid, loyalty_points: 0 };
+        }
+
+        const token = await signJWT(
+          { sub: customer.id, tenantId, role: 'customer', permissions: [], email: e164 },
+          getJwtSecret(c.env),
+          7 * 86400,
+        );
+
+        // Store trusted device in KV (30-day TTL)
+        if (deviceId) {
+          await c.env.SESSIONS_KV.put(
+            `trusted_device:sv:${e164}:${deviceId}`,
+            JSON.stringify({ customerId: customer.id, createdAt: now }),
+            { expirationTtl: 30 * 24 * 3600 },
+          );
+        }
+
+        c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
+        return c.json({ success: true, data: { token, customer_id: customer.id, phone: e164, loyalty_points: customer.loyalty_points } });
+    } catch (err) {
+      console.error('[SV] KV OTP verify error:', err);
+      return c.json({ success: false, error: 'Internal server error' }, 500);
+    }
+  }
+  // ── D1 OTP path (from /auth/request-otp) — only reached when SESSIONS_KV is not configured ──
 
   try {
     interface OtpRow { id: string; otp_hash: string; is_used: number; attempts: number; expires_at: number }
     const otpRow = await c.env.DB.prepare(
       `SELECT id, otp_hash, is_used, attempts, expires_at
-       FROM customer_otps
+       FROM cmrc_customer_otps
        WHERE tenant_id = ? AND phone = ? AND is_used = 0
        ORDER BY created_at DESC LIMIT 1`
     ).bind(tenantId, e164).first<OtpRow>();
@@ -521,31 +1159,32 @@ app.post('/auth/verify-otp', async (c) => {
 
     const inputHash = await hashOtp(otp);
     if (inputHash !== otpRow.otp_hash) {
-      await c.env.DB.prepare('UPDATE customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
+      await c.env.DB.prepare('UPDATE cmrc_customer_otps SET attempts = attempts + 1 WHERE id = ?').bind(otpRow.id).run();
       return c.json({ success: false, error: 'Incorrect OTP' }, 401);
     }
 
-    await c.env.DB.prepare('UPDATE customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
+    await c.env.DB.prepare('UPDATE cmrc_customer_otps SET is_used = 1 WHERE id = ?').bind(otpRow.id).run();
 
     const now = Date.now();
     const customerId = `cust_sv_${now}_${Math.random().toString(36).slice(2, 8)}`;
 
     interface CustomerRow { id: string; loyalty_points: number }
     let customer = await c.env.DB.prepare(
-      'SELECT id, loyalty_points FROM customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
+      'SELECT id, loyalty_points FROM cmrc_customers WHERE tenant_id = ? AND phone = ? AND deleted_at IS NULL'
     ).bind(tenantId, e164).first<CustomerRow>();
 
     if (!customer) {
       await c.env.DB.prepare(
-        `INSERT INTO customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
+        `INSERT INTO cmrc_customers (id, tenant_id, name, phone, ndpr_consent, ndpr_consent_at, loyalty_points, total_spend, created_at, updated_at)
          VALUES (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)`
       ).bind(customerId, tenantId, e164, e164, now, now, now).run();
       customer = { id: customerId, loyalty_points: 0 };
     }
 
-    const token = await signJwt(
-      { sub: customer.id, tenant: tenantId, phone: e164, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 7 * 86400 },
-      c.env.JWT_SECRET ?? 'dev-secret-change-me'
+    const token = await signJWT(
+      { sub: customer.id, tenantId, role: 'customer', permissions: [], email: e164 },
+      getJwtSecret(c.env),
+      7 * 86400,
     );
 
     c.header('Set-Cookie', `sv_auth=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/single-vendor; Max-Age=604800`);
@@ -554,14 +1193,15 @@ app.post('/auth/verify-otp', async (c) => {
       success: true,
       data: { token, customer_id: customer.id, phone: e164, loyalty_points: customer.loyalty_points },
     });
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
 // ── GET /wishlist — Customer's wishlist (auth required) ───────────────────────
 app.get('/wishlist', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -569,20 +1209,21 @@ app.get('/wishlist', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT w.id, w.product_id, w.added_at,
               p.name, p.price, p.image_url, p.category, p.quantity, p.is_active
-       FROM wishlists w
-       LEFT JOIN products p ON p.id = w.product_id AND p.tenant_id = w.tenant_id
+       FROM cmrc_wishlists w
+       LEFT JOIN cmrc_products p ON p.id = w.product_id AND p.tenant_id = w.tenant_id
        WHERE w.tenant_id = ? AND w.customer_id = ?
        ORDER BY w.added_at DESC`
     ).bind(tenantId, customer.customerId).all();
     return c.json({ success: true, data: { items: results, count: results.length } });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: true, data: { items: [], count: 0 } });
   }
 });
 
-// ── POST /wishlist — Add or remove product (toggles) ─────────────────────────
+// ── POST /wishlist — Add product (INSERT OR IGNORE — duplicate-safe) ──────────
 app.post('/wishlist', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -590,29 +1231,40 @@ app.post('/wishlist', async (c) => {
   if (!body.product_id) return c.json({ success: false, error: 'product_id is required' }, 400);
 
   try {
-    const existing = await c.env.DB.prepare(
-      'SELECT id FROM wishlists WHERE tenant_id = ? AND customer_id = ? AND product_id = ?'
-    ).bind(tenantId, customer.customerId, body.product_id).first<{ id: string }>();
-
     const now = Date.now();
-    if (existing) {
-      await c.env.DB.prepare('DELETE FROM wishlists WHERE id = ?').bind(existing.id).run();
-      return c.json({ success: true, data: { action: 'removed', product_id: body.product_id } });
-    } else {
-      const wlId = `wl_${now}_${Math.random().toString(36).slice(2, 8)}`;
-      await c.env.DB.prepare(
-        'INSERT INTO wishlists (id, tenant_id, customer_id, product_id, added_at) VALUES (?, ?, ?, ?, ?)'
-      ).bind(wlId, tenantId, customer.customerId, body.product_id, now).run();
-      return c.json({ success: true, data: { action: 'added', product_id: body.product_id } }, 201);
-    }
-  } catch (e) {
-    return c.json({ success: false, error: String(e) }, 500);
+    const wlId = `wl_${now}_${Math.random().toString(36).slice(2, 8)}`;
+    await c.env.DB.prepare(
+      'INSERT OR IGNORE INTO cmrc_wishlists (id, tenant_id, customer_id, product_id, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind(wlId, tenantId, customer.customerId, body.product_id, now).run();
+    return c.json({ success: true, data: { action: 'added', product_id: body.product_id } }, 201);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
-// ── GET /account/orders — Customer's own orders, paginated ───────────────────
-app.get('/account/orders', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+// ── DELETE /wishlist/:productId — Remove product from wishlist ────────────────
+app.delete('/wishlist/:productId', async (c) => {
+  const tenantId = getTenantId(c);
+  const customer = await authenticateCustomer(c);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const productId = c.req.param('productId');
+  try {
+    await c.env.DB.prepare(
+      'DELETE FROM cmrc_wishlists WHERE tenant_id = ? AND customer_id = ? AND product_id = ?'
+    ).bind(tenantId, customer.customerId, productId).run();
+    return c.json({ success: true, data: { action: 'removed', product_id: productId } });
+  } catch (err) {
+    console.error('[SV][wishlist DELETE] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /account/cmrc_orders — Customer's own cmrc_orders, paginated ───────────────────
+app.get('/account/cmrc_orders', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({ success: false, error: 'Missing tenant ID' }, 400);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
@@ -625,7 +1277,7 @@ app.get('/account/orders', async (c) => {
       `SELECT id, subtotal, discount_kobo, vat_kobo, total_amount, payment_status,
               order_status, payment_method, items_json, delivery_address_json,
               promo_code, created_at
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND customer_phone = ?
          AND channel = 'storefront' AND deleted_at IS NULL`;
 
@@ -641,7 +1293,7 @@ app.get('/account/orders', async (c) => {
     }>();
 
     const hasMore = results.length > perPage;
-    const orders = (hasMore ? results.slice(0, perPage) : results).map(o => ({
+    const cmrc_orders = (hasMore ? results.slice(0, perPage) : results).map(o => ({
       ...o,
       items: (() => { try { return JSON.parse(o.items_json ?? '[]'); } catch { return []; } })(),
       delivery_address: (() => { try { return o.delivery_address_json ? JSON.parse(o.delivery_address_json) : null; } catch { return null; } })(),
@@ -649,40 +1301,43 @@ app.get('/account/orders', async (c) => {
       delivery_address_json: undefined,
     }));
 
-    const nextCursor = hasMore ? orders[orders.length - 1]?.id ?? null : null;
+    const nextCursor = hasMore ? cmrc_orders[cmrc_orders.length - 1]?.id ?? null : null;
 
-    return c.json({ success: true, data: { orders, next_cursor: nextCursor, has_more: hasMore } });
-  } catch {
-    return c.json({ success: true, data: { orders: [], next_cursor: null, has_more: false } });
+    return c.json({ success: true, data: { cmrc_orders, next_cursor: nextCursor, has_more: hasMore } });
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: true, data: { cmrc_orders: [], next_cursor: null, has_more: false } });
   }
 });
 
 // ── GET /account/profile — Customer loyalty points + profile ─────────────────
 app.get('/account/profile', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = getTenantId(c);
   const customer = await authenticateCustomer(c);
   if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
 
   try {
     interface CustomerRow { id: string; name: string | null; phone: string; loyalty_points: number; total_spend: number; created_at: number }
     const profile = await c.env.DB.prepare(
-      'SELECT id, name, phone, loyalty_points, total_spend, created_at FROM customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
+      'SELECT id, name, phone, loyalty_points, total_spend, created_at FROM cmrc_customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
     ).bind(customer.customerId, tenantId).first<CustomerRow>();
 
     if (!profile) return c.json({ success: false, error: 'Customer not found' }, 404);
     return c.json({ success: true, data: profile });
-  } catch {
+  } catch (err) {
+    console.error('[SV] route error:', err);
     return c.json({ success: false, error: 'Profile not found' }, 404);
   }
 });
 
-// ── GET /analytics — Today/week revenue, conversion %, top products (ANLT-1) ─
-app.get('/analytics', async (c) => {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
-
-  // Require admin token (x-admin-key header or staff JWT)
+// ── GET /analytics — Today/week revenue, conversion %, top cmrc_products (ANLT-1) ─
+app.get('/analytics', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
   const adminKey = c.req.header('x-admin-key');
-  if (!adminKey) return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
 
   const now = Date.now();
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
@@ -690,14 +1345,14 @@ app.get('/analytics', async (c) => {
   const weekMs = now - 7 * 24 * 60 * 60 * 1000;
 
   try {
-    // Today and week revenue from paid orders (storefront channel)
+    // Today and week revenue from paid cmrc_orders (storefront channel)
     const revenueRow = await c.env.DB.prepare(
       `SELECT
          SUM(CASE WHEN created_at >= ? THEN total_amount ELSE 0 END) AS today_revenue_kobo,
          SUM(CASE WHEN created_at >= ? THEN total_amount ELSE 0 END) AS week_revenue_kobo,
          COUNT(CASE WHEN created_at >= ? THEN 1 END)                  AS today_orders,
          COUNT(CASE WHEN created_at >= ? THEN 1 END)                  AS week_orders
-       FROM orders
+       FROM cmrc_orders
        WHERE tenant_id = ? AND payment_status = 'paid' AND channel = 'storefront'`
     ).bind(todayMs, weekMs, todayMs, weekMs, tenantId).first<{
       today_revenue_kobo: number; week_revenue_kobo: number;
@@ -706,16 +1361,16 @@ app.get('/analytics', async (c) => {
 
     // Cart sessions created this week (for conversion denominator)
     const cartRow = await c.env.DB.prepare(
-      `SELECT COUNT(*) AS cart_count FROM cart_sessions WHERE tenant_id = ? AND created_at >= ?`
+      `SELECT COUNT(*) AS cart_count FROM cmrc_cart_sessions WHERE tenant_id = ? AND created_at >= ?`
     ).bind(tenantId, weekMs).first<{ cart_count: number }>();
 
-    // Top 5 products by revenue this week
+    // Top 5 cmrc_products by revenue this week
     const { results: topProducts } = await c.env.DB.prepare(
       `SELECT oi.product_id, oi.product_name AS name,
               SUM(oi.quantity)               AS units_sold,
               SUM(oi.total_price)            AS revenue_kobo
        FROM order_items oi
-       JOIN orders o ON o.id = oi.order_id
+       JOIN cmrc_orders o ON o.id = oi.order_id
        WHERE o.tenant_id = ? AND o.payment_status = 'paid'
          AND o.channel = 'storefront' AND o.created_at >= ?
        GROUP BY oi.product_id, oi.product_name
@@ -734,12 +1389,12 @@ app.get('/analytics', async (c) => {
       data: {
         today: {
           revenue_kobo: revenueRow?.today_revenue_kobo ?? 0,
-          orders: revenueRow?.today_orders ?? 0,
+          cmrc_orders: revenueRow?.today_orders ?? 0,
         },
         week: {
           revenue_kobo: revenueRow?.week_revenue_kobo ?? 0,
-          orders: weekOrders,
-          cart_sessions: cartCount,
+          cmrc_orders: weekOrders,
+          cmrc_cart_sessions: cartCount,
           conversion_pct: conversionPct,
         },
         top_products: topProducts,
@@ -747,14 +1402,479 @@ app.get('/analytics', async (c) => {
       },
     });
   } catch (err) {
-    return c.json({ success: false, error: String(err) }, 500);
+    console.error('[SV][analytics] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 
-export function computeDiscount(discountType: string, discountValue: number, subtotalKobo: number): number {
-  if (discountType === 'flat') return Math.min(discountValue, subtotalKobo);
-  if (discountType === 'pct') return Math.round((subtotalKobo * discountValue) / 100);
-  return 0;
+// ── GET /delivery-zones — REMOVED (T-CVC-01) ─────────────────────────────────
+// Delivery zone management has been extracted to webwaka-logistics.
+// Use the Logistics API: GET /api/delivery-zones?state=&vendor_id=
+// This stub returns a 410 Gone to prevent silent breakage.
+app.get('/delivery-zones', (c) => c.json({
+  success: false,
+  error: 'Delivery zones have been moved to the Logistics service. Use GET /api/delivery-zones on the Logistics worker.',
+  moved_to: 'webwaka-logistics /api/delivery-zones',
+}, 410));
+
+// ── POST /delivery-zones — REMOVED (T-CVC-01) ────────────────────────────────
+// Use the Logistics API: POST /api/delivery-zones
+app.post('/delivery-zones', (c) => c.json({
+  success: false,
+  error: 'Delivery zone management has been moved to the Logistics service. Use POST /api/delivery-zones on the Logistics worker.',
+  moved_to: 'webwaka-logistics /api/delivery-zones',
+}, 410));
+
+// ── GET /shipping/estimate — Delegates to Logistics API (T-CVC-01) ───────────
+// Proxies to webwaka-logistics GET /api/delivery-zones/estimate via Service Binding.
+// Falls back gracefully if LOGISTICS_WORKER binding is not configured.
+app.get('/shipping/estimate', async (c) => {
+  const tenantId = getTenantId(c);
+  const state = c.req.query('state')?.trim();
+  const lga = c.req.query('lga')?.trim();
+  const orderValue = c.req.query('order_value') ?? '0';
+  const weightKg = c.req.query('weight_kg') ?? '0';
+  if (!state) return c.json({ success: false, error: 'state is required' }, 400);
+  // Delegate to Logistics worker via Service Binding (T-CVC-01)
+  const logisticsWorker = (c.env as unknown as Record<string, Fetcher | undefined>).LOGISTICS_WORKER;
+  if (logisticsWorker) {
+    try {
+      const params = new URLSearchParams({ state, order_value: orderValue, weight_kg: weightKg });
+      if (lga) params.set('lga', lga);
+      const resp = await logisticsWorker.fetch(
+        `http://internal/api/delivery-zones/estimate?${params.toString()}`,
+        { headers: { 'x-tenant-id': tenantId ?? '' } },
+      );
+      const data = await resp.json<{ success: boolean; data: Record<string, unknown> }>();
+      if (data.success && data.data) {
+        // Normalise response: map base_fee -> fee_kobo for backward compatibility
+        // Forward note field when no zone is configured for the region (T-CVC-01 QA)
+        const responseData: Record<string, unknown> = {
+          state, lga: lga ?? null,
+          fee_kobo: (data.data.total_fee as number) ?? 0,
+          base_fee: (data.data.base_fee as number) ?? 0,
+          per_kg_fee: (data.data.per_kg_fee as number) ?? 0,
+          weight_fee: (data.data.weight_fee as number) ?? 0,
+          is_free: (data.data.is_free as boolean) ?? false,
+          estimated_days_min: (data.data.estimated_days_min as number) ?? 1,
+          estimated_days_max: (data.data.estimated_days_max as number) ?? 7,
+          is_estimate: true,
+          source: 'logistics',
+        };
+        if (data.data.note) responseData.note = data.data.note;
+        return c.json({ success: true, data: responseData });
+      }
+    } catch (err) {
+      console.error('[SV] Logistics Service Binding error:', err);
+    }
+  }
+  // Graceful fallback: return zero-fee estimate if Logistics binding unavailable
+  return c.json({
+    success: true,
+    data: { state, lga: lga ?? null, fee_kobo: 0, estimated_days_min: 1, estimated_days_max: 7, is_estimate: true, source: 'fallback' },
+  });
+});
+
+// ── GET /cmrc_products/:id/reviews — Public product reviews (APPROVED only, paginated) ─
+app.get('/cmrc_products/:id/reviews', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const page = Math.max(1, Number(c.req.query('page') ?? 1));
+  const limit = Math.min(Number(c.req.query('limit') ?? 20), 100);
+  const offset = (page - 1) * limit;
+  try {
+    const statsRow = await c.env.DB.prepare(
+      `SELECT AVG(rating) AS avgRating, COUNT(*) AS totalReviews
+       FROM cmrc_product_reviews
+       WHERE product_id = ? AND tenant_id = ? AND status = 'APPROVED' AND deleted_at IS NULL`,
+    ).bind(productId, tenantId).first<{ avgRating: number | null; totalReviews: number }>();
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, rating, body, review_text, verified_purchase, customer_phone, created_at
+       FROM cmrc_product_reviews
+       WHERE product_id = ? AND tenant_id = ? AND status = 'APPROVED' AND deleted_at IS NULL
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`,
+    ).bind(productId, tenantId, limit, offset).all<{
+      id: string; rating: number; body: string | null; review_text: string | null;
+      verified_purchase: number; customer_phone: string | null; created_at: number;
+    }>();
+
+    return c.json({
+      success: true,
+      data: {
+        reviews: results.map(r => ({
+          ...r,
+          customer_phone: r.customer_phone
+            ? r.customer_phone.slice(0, 4) + '****' + r.customer_phone.slice(-3)
+            : null,
+        })),
+        avgRating: statsRow?.avgRating != null ? Math.round(statsRow.avgRating * 10) / 10 : 0,
+        totalReviews: statsRow?.totalReviews ?? 0,
+        page,
+        limit,
+      },
+    });
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: true, data: { reviews: [], avgRating: 0, totalReviews: 0, page, limit } });
+  }
+});
+
+// ── POST /reviews — Authenticated customer submits review (SV-E07) ─────────────
+app.post('/reviews', async (c) => {
+  const tenantId = getTenantId(c);
+  const customer = await authenticateCustomer(c as Parameters<typeof authenticateCustomer>[0]);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const body = await c.req.json<{ orderId: string; productId: string; rating: number; body?: string }>();
+  if (!body.orderId) return c.json({ success: false, error: 'orderId is required' }, 400);
+  if (!body.productId) return c.json({ success: false, error: 'productId is required' }, 400);
+  if (!body.rating || body.rating < 1 || body.rating > 5) {
+    return c.json({ success: false, error: 'rating must be an integer between 1 and 5' }, 400);
+  }
+
+  const now = Date.now();
+  const id = `rev_${now}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    const order = await c.env.DB.prepare(
+      `SELECT id, order_status FROM cmrc_orders
+       WHERE id = ? AND tenant_id = ? AND customer_phone = ?`,
+    ).bind(body.orderId, tenantId, customer.phone).first<{ id: string; order_status: string }>();
+
+    if (!order) return c.json({ success: false, error: 'Order not found or does not belong to you' }, 404);
+    if (order.order_status !== 'DELIVERED') {
+      return c.json({ success: false, error: 'Reviews can only be submitted for delivered cmrc_orders' }, 422);
+    }
+
+    const existingReview = await c.env.DB.prepare(
+      `SELECT id FROM cmrc_product_reviews WHERE order_id = ? AND product_id = ? AND tenant_id = ?`,
+    ).bind(body.orderId, body.productId, tenantId).first();
+    if (existingReview) {
+      return c.json({ success: false, error: 'You have already reviewed this product for this order' }, 409);
+    }
+
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_product_reviews
+         (id, tenant_id, product_id, customer_id, customer_phone, order_id, rating, body, review_text, verified_purchase, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING', ?, ?)`,
+    ).bind(
+      id, tenantId, body.productId, customer.customerId, customer.phone,
+      body.orderId, body.rating, body.body?.trim() ?? null, body.body?.trim() ?? null,
+      now, now,
+    ).run();
+
+    return c.json({ success: true, data: { reviewId: id, status: 'PENDING' } }, 201);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── POST /cmrc_products/:id/reviews — Legacy per-product review (existing cmrc_customers) ─
+app.post('/cmrc_products/:id/reviews', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const customer = await authenticateCustomer(c as Parameters<typeof authenticateCustomer>[0]);
+  if (!customer) return c.json({ success: false, error: 'Authentication required' }, 401);
+
+  const body = await c.req.json<{ rating: number; review_text?: string }>();
+  if (!body.rating || body.rating < 1 || body.rating > 5) {
+    return c.json({ success: false, error: 'rating must be an integer between 1 and 5' }, 400);
+  }
+
+  const now = Date.now();
+  const id = `rev_${now}_${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    const purchaseCheck = await c.env.DB.prepare(
+      `SELECT id FROM cmrc_orders
+       WHERE tenant_id = ? AND customer_phone = ? AND channel = 'storefront'
+         AND payment_status = 'paid' AND items_json LIKE ? LIMIT 1`,
+    ).bind(tenantId, customer.phone, `%"${productId}"%`).first();
+
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_product_reviews
+         (id, tenant_id, product_id, customer_id, customer_phone, rating, review_text, body, verified_purchase, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`,
+    ).bind(
+      id, tenantId, productId, customer.customerId, customer.phone,
+      body.rating, body.review_text?.trim() ?? null, body.review_text?.trim() ?? null,
+      purchaseCheck ? 1 : 0, now, now,
+    ).run();
+
+    return c.json({
+      success: true,
+      data: { reviewId: id, status: 'PENDING' },
+    }, 201);
+  } catch (err) {
+    console.error('[SV] route error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /admin/reviews — Admin: list reviews by status (SV-E07) ──────────────
+app.get('/admin/reviews', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const status = c.req.query('status') ?? 'PENDING';
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, product_id, order_id, customer_phone, rating, body, review_text, status, created_at
+       FROM cmrc_product_reviews
+       WHERE tenant_id = ? AND status = ? AND deleted_at IS NULL
+       ORDER BY created_at DESC LIMIT 100`,
+    ).bind(tenantId, status).all();
+    return c.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[SV] admin/reviews GET error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── PATCH /admin/reviews/:id — Admin: approve or reject a review (SV-E07) ──────
+app.patch('/admin/reviews/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  const expectedKey = c.env.ADMIN_API_KEY;
+  if (!adminKey || !expectedKey || adminKey !== expectedKey) {
+    return c.json({ success: false, error: 'Admin authentication required' }, 401);
+  }
+  const tenantId = getTenantId(c);
+  const reviewId = c.req.param('id');
+  const body = await c.req.json<{ status: 'APPROVED' | 'REJECTED' }>();
+  if (!body.status || !['APPROVED', 'REJECTED'].includes(body.status)) {
+    return c.json({ success: false, error: 'status must be APPROVED or REJECTED' }, 400);
+  }
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE cmrc_product_reviews SET status = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+    ).bind(body.status, Date.now(), reviewId, tenantId).run();
+    if (result.meta.changes === 0) return c.json({ success: false, error: 'Review not found' }, 404);
+    return c.json({ success: true, data: { id: reviewId, status: body.status } });
+  } catch (err) {
+    console.error('[SV] admin/reviews error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── T-COM-03: Admin Promo CRUD ────────────────────────────────────────────────
+// Invariants: [MTT] tenant_id on every read/write; [TXN] atomic updates.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /admin/promos — list promo codes for tenant with optional type/status filter
+app.get('/admin/promos', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const promoType = c.req.query('type');
+  const status = c.req.query('status'); // 'active' | 'inactive' | 'all'
+  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10), 200);
+  const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10), 0);
+
+  let where = 'tenant_id = ? AND deleted_at IS NULL';
+  const bindings: unknown[] = [tenantId];
+
+  if (promoType) { where += ' AND promoType = ?'; bindings.push(promoType.toUpperCase()); }
+  if (status === 'active') { where += ' AND is_active = 1'; }
+  else if (status === 'inactive') { where += ' AND is_active = 0'; }
+
+  bindings.push(limit, offset);
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, code, description, promoType, discount_type, discount_value, discountCap,
+              min_order_kobo, minOrderValueKobo, max_uses, current_uses, usedCount,
+              maxUsesTotal, maxUsesPerCustomer, expires_at, validFrom, validUntil,
+              productScope, stackable, is_active, created_at, updated_at
+       FROM cmrc_promo_codes
+       WHERE ${where}
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`,
+    ).bind(...bindings).all<Record<string, unknown>>();
+
+    return c.json({ success: true, data: results, meta: { limit, offset, count: results.length } });
+  } catch (err) {
+    console.error('[SV][admin/promos] GET error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// POST /admin/promos — create a new promo code
+app.post('/admin/promos', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+
+  interface CreatePromoBody {
+    code: string;
+    description?: string;
+    promoType: 'PERCENTAGE' | 'FIXED' | 'FREE_SHIPPING' | 'BOGO';
+    discountValue?: number;
+    discountCap?: number;
+    minOrderValueKobo?: number;
+    maxUsesTotal?: number;
+    maxUsesPerCustomer?: number;
+    validFrom?: string;
+    validUntil?: string;
+    productScope?: string[];
+    stackable?: boolean;
+  }
+
+  let body: CreatePromoBody;
+  try { body = await c.req.json(); }
+  catch { return c.json({ success: false, error: 'Invalid JSON body' }, 400); }
+
+  if (!body.code?.trim()) return c.json({ success: false, error: 'code is required' }, 400);
+
+  const validTypes = ['PERCENTAGE', 'FIXED', 'FREE_SHIPPING', 'BOGO'];
+  if (!body.promoType || !validTypes.includes(body.promoType)) {
+    return c.json({ success: false, error: `promoType must be one of: ${validTypes.join(', ')}` }, 400);
+  }
+
+  if ((body.promoType === 'PERCENTAGE' || body.promoType === 'FIXED') && (!body.discountValue || body.discountValue <= 0)) {
+    return c.json({ success: false, error: 'discountValue must be a positive number for PERCENTAGE/FIXED promos' }, 400);
+  }
+
+  if (body.promoType === 'PERCENTAGE' && body.discountValue! > 100) {
+    return c.json({ success: false, error: 'PERCENTAGE discountValue cannot exceed 100' }, 400);
+  }
+
+  const code = body.code.toUpperCase().trim();
+  const now = Date.now();
+  const id = `promo_${now}_${Math.random().toString(36).slice(2, 9)}`;
+
+  const discountType = body.promoType === 'PERCENTAGE' ? 'pct'
+    : body.promoType === 'FIXED' ? 'flat'
+    : body.promoType; // FREE_SHIPPING / BOGO kept as-is
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_promo_codes
+         (id, tenant_id, code, description, promoType, discount_type, discount_value,
+          discountCap, min_order_kobo, minOrderValueKobo, max_uses, current_uses, usedCount,
+          maxUsesTotal, maxUsesPerCustomer, validFrom, validUntil, productScope,
+          stackable, is_active, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?,?,1,?,?)`,
+    ).bind(
+      id, tenantId, code,
+      body.description ?? null,
+      body.promoType,
+      discountType,
+      body.discountValue ?? 0,
+      body.discountCap ?? null,
+      body.minOrderValueKobo ?? 0,
+      body.minOrderValueKobo ?? null,
+      body.maxUsesTotal ?? null,
+      body.maxUsesPerCustomer ?? null,
+      body.validFrom ?? null,
+      body.validUntil ?? null,
+      body.productScope ? JSON.stringify(body.productScope) : null,
+      body.stackable ? 1 : 0,
+      now, now,
+    ).run();
+
+    return c.json({ success: true, data: { id, code, promoType: body.promoType } }, 201);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('UNIQUE') || msg.includes('unique')) {
+      return c.json({ success: false, error: `Promo code '${code}' already exists for this tenant` }, 409);
+    }
+    console.error('[SV][admin/promos] POST error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// PATCH /admin/promos/:id — update an existing promo code
+app.patch('/admin/promos/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const promoId = c.req.param('id');
+
+  interface UpdatePromoBody {
+    description?: string;
+    discountValue?: number;
+    discountCap?: number | null;
+    minOrderValueKobo?: number;
+    maxUsesTotal?: number | null;
+    maxUsesPerCustomer?: number | null;
+    validFrom?: string | null;
+    validUntil?: string | null;
+    productScope?: string[] | null;
+    stackable?: boolean;
+    is_active?: boolean;
+  }
+
+  let body: UpdatePromoBody;
+  try { body = await c.req.json(); }
+  catch { return c.json({ success: false, error: 'Invalid JSON body' }, 400); }
+
+  const existing = await c.env.DB.prepare(
+    'SELECT id FROM cmrc_promo_codes WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL',
+  ).bind(promoId, tenantId).first<{ id: string }>();
+
+  if (!existing) return c.json({ success: false, error: 'Promo code not found' }, 404);
+
+  const updates: string[] = [];
+  const values: unknown[] = [];
+
+  if (body.description !== undefined) { updates.push('description = ?'); values.push(body.description); }
+  if (body.discountValue !== undefined) { updates.push('discount_value = ?'); values.push(body.discountValue); }
+  if ('discountCap' in body) { updates.push('discountCap = ?'); values.push(body.discountCap ?? null); }
+  if (body.minOrderValueKobo !== undefined) {
+    updates.push('min_order_kobo = ?', 'minOrderValueKobo = ?');
+    values.push(body.minOrderValueKobo, body.minOrderValueKobo);
+  }
+  if ('maxUsesTotal' in body) { updates.push('max_uses = ?', 'maxUsesTotal = ?'); values.push(body.maxUsesTotal ?? 0, body.maxUsesTotal ?? null); }
+  if ('maxUsesPerCustomer' in body) { updates.push('maxUsesPerCustomer = ?'); values.push(body.maxUsesPerCustomer ?? null); }
+  if ('validFrom' in body) { updates.push('validFrom = ?'); values.push(body.validFrom ?? null); }
+  if ('validUntil' in body) { updates.push('validUntil = ?'); values.push(body.validUntil ?? null); }
+  if ('productScope' in body) { updates.push('productScope = ?'); values.push(body.productScope ? JSON.stringify(body.productScope) : null); }
+  if (body.stackable !== undefined) { updates.push('stackable = ?'); values.push(body.stackable ? 1 : 0); }
+  if (body.is_active !== undefined) { updates.push('is_active = ?'); values.push(body.is_active ? 1 : 0); }
+
+  if (updates.length === 0) return c.json({ success: false, error: 'No fields to update' }, 400);
+
+  updates.push('updated_at = ?');
+  values.push(Date.now(), promoId, tenantId);
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE cmrc_promo_codes SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?`,
+    ).bind(...values).run();
+
+    return c.json({ success: true, data: { id: promoId } });
+  } catch (err) {
+    console.error('[SV][admin/promos] PATCH error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// DELETE /admin/promos/:id — soft-delete a promo code (idempotent)
+app.delete('/admin/promos/:id', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const promoId = c.req.param('id');
+  const now = Date.now();
+
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE cmrc_promo_codes SET deleted_at = ?, is_active = 0, updated_at = ?
+       WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+    ).bind(now, now, promoId, tenantId).run();
+
+    if (result.meta.changes === 0) return c.json({ success: false, error: 'Promo code not found or already deleted' }, 404);
+    return c.json({ success: true, data: { id: promoId, deleted: true } });
+  } catch (err) {
+    console.error('[SV][admin/promos] DELETE error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+export function computeDiscount(discountType: string, discountValue: number, subtotalKobo: number, discountCap?: number | null): number {
+  let raw = 0;
+  if (discountType === 'flat' || discountType === 'FIXED') raw = Math.min(discountValue, subtotalKobo);
+  else if (discountType === 'pct' || discountType === 'PERCENTAGE') raw = Math.round((subtotalKobo * discountValue) / 100);
+  // FREE_SHIPPING and BOGO are handled at checkout level with full item context
+  if (discountCap != null && discountCap > 0) raw = Math.min(raw, discountCap);
+  return Math.min(raw, subtotalKobo);
 }
 
 /** Sanitise FTS5 query — escape special chars, trim */
@@ -768,46 +1888,11 @@ async function hashOtp(otp: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Minimal HS256 JWT sign using Web Crypto */
-async function signJwt(payload: Record<string, unknown>, secret: string): Promise<string> {
-  const enc = (obj: object) =>
-    btoa(JSON.stringify(obj)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const header = enc({ alg: 'HS256', typ: 'JWT' });
-  const body = enc(payload);
-  const data = `${header}.${body}`;
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  return `${data}.${sig}`;
-}
-
-/** Verify HS256 JWT and return claims, or null if invalid/expired */
-export async function verifyJwt(token: string, secret: string): Promise<Record<string, unknown> | null> {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [header, payloadB64, sigB64] = parts as [string, string, string];
-  try {
-    const data = `${header}.${payloadB64}`;
-    const key = await crypto.subtle.importKey(
-      'raw', new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
-    );
-    const sigBuf = Uint8Array.from(atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    const valid = await crypto.subtle.verify('HMAC', key, sigBuf, new TextEncoder().encode(data));
-    if (!valid) return null;
-    const claims = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
-    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null;
-    return claims;
-  } catch { return null; }
-}
+// signJWT and verifyJWT imported from @webwaka/core (P0-T03)
 
 /** Extract and verify customer from Authorization Bearer or sv_auth cookie */
 async function authenticateCustomer(c: { req: { header: (h: string) => string | undefined }; env: { JWT_SECRET?: string } }): Promise<{ customerId: string; phone: string } | null> {
-  const tenantId = c.req.header('x-tenant-id') || c.req.header('X-Tenant-ID');
+  const tenantId = c.req.header('x-tenant-id') ?? c.req.header('X-Tenant-ID') ?? '';
   const auth = c.req.header('Authorization');
   let token: string | null = null;
 
@@ -820,10 +1905,462 @@ async function authenticateCustomer(c: { req: { header: (h: string) => string | 
   }
 
   if (!token) return null;
-  const claims = await verifyJwt(token, c.env.JWT_SECRET ?? 'dev-secret-change-me');
-  if (!claims || claims.tenant !== tenantId) return null;
-  return { customerId: String(claims.sub), phone: String(claims.phone) };
+  const claims = await verifyJWT(token, getJwtSecret(c.env));
+  if (!claims || claims.tenantId !== tenantId) return null;
+  return { customerId: String(claims.sub), phone: String(claims.email ?? '') };
 }
 
+// ── POST /paystack/webhook — SV HMAC-SHA512 payment event handler ─────────────
+app.post('/paystack/webhook', async (c) => {
+  if (!c.env.PAYSTACK_SECRET) {
+    console.error('[SV][paystack/webhook] PAYSTACK_SECRET is not configured');
+    return c.json({ success: false, error: 'Webhook handler not configured' }, 500);
+  }
+  const signature = c.req.header('x-paystack-signature');
+  if (!signature) {
+    return c.json({ success: false, error: 'Missing x-paystack-signature header' }, 400);
+  }
+
+  const rawBody = await c.req.text();
+
+  try {
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw', enc.encode(c.env.PAYSTACK_SECRET),
+      { name: 'HMAC', hash: 'SHA-512' }, false, ['sign'],
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(rawBody));
+    const hex = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    if (hex !== signature) {
+      return c.json({ success: false, error: 'Invalid signature' }, 401);
+    }
+  } catch (err) {
+    console.error('[SV][paystack/webhook] signature verification error:', err);
+    return c.json({ success: false, error: 'Signature verification error' }, 401);
+  }
+
+  let payload: { event: string; data: Record<string, unknown> };
+  try {
+    payload = JSON.parse(rawBody) as { event: string; data: Record<string, unknown> };
+  } catch (err) {
+    console.error('[SV][paystack/webhook] invalid JSON body:', err);
+    return c.json({ success: false, error: 'Invalid JSON body' }, 400);
+  }
+
+  const { event, data } = payload;
+  const reference = (data.reference ?? '') as string;
+  const tenantId = (data.metadata as Record<string, unknown> | undefined)?.tenant_id as string | undefined;
+  const now = Date.now();
+  const logId = `pwl_${event.replace('.', '_')}_${reference}`;
+
+  const existing = await c.env.DB.prepare(
+    `SELECT id, processed FROM cmrc_paystack_webhook_log WHERE id = ?`
+  ).bind(logId).first<{ id: string; processed: number }>();
+
+  if (existing?.processed) {
+    return c.json({ success: true, message: 'Already processed' });
+  }
+
+  await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO cmrc_paystack_webhook_log
+       (id, event, reference, tenant_id, raw_json, processed, received_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?)`
+  ).bind(logId, event, reference, tenantId ?? null, rawBody, now).run();
+
+  try {
+    if (event === 'charge.success' && tenantId && reference) {
+      await c.env.DB.prepare(
+        `UPDATE cmrc_orders SET payment_status = 'paid', updated_at = ?
+         WHERE payment_reference = ? AND tenant_id = ?`
+      ).bind(now, reference, tenantId).run();
+
+      await c.env.DB.prepare(
+        `UPDATE cmrc_settlements SET status = 'eligible', updated_at = ?
+         WHERE tenant_id = ? AND payment_reference = ? AND status = 'held' AND hold_until <= ?`
+      ).bind(now, tenantId, reference, now).run();
+    }
+
+    await c.env.DB.prepare(
+      `UPDATE cmrc_paystack_webhook_log SET processed = 1 WHERE id = ?`
+    ).bind(logId).run();
+
+    return c.json({ success: true });
+  } catch (e) {
+    await c.env.DB.prepare(
+      `UPDATE cmrc_paystack_webhook_log SET error = ? WHERE id = ?`
+    ).bind(String(e), logId).run();
+    console.error('[SV][paystack/webhook] handler error:', e);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// P12 — PRODUCT DISCOVERY & BRANDING (SV-E06, SV-E11, SV-E09, SV-E19)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /config — Public tenant config (branding, features) ──────────────────
+app.get('/config', async (c) => {
+  const tenantId = getTenantId(c);
+  try {
+    const config = await c.env.TENANT_CONFIG.get(`tenant:${tenantId}`, 'json') as Record<string, unknown> | null;
+    const localBranding = (config?.branding as Record<string, unknown> | null) ?? {};
+    // COM-5: read from canonical UI_CONFIG_KV first (set by webwaka-ui-builder), fall back to local D1 config
+    const effectiveBranding = c.env.UI_CONFIG_KV && tenantId
+      ? await getEffectiveBranding(tenantId, c.env.UI_CONFIG_KV, {
+          primaryColor: (localBranding.primaryColor as string) ?? '#2563eb',
+          accentColor: (localBranding.accentColor as string) ?? '#16a34a',
+          fontFamily: (localBranding.fontFamily as string) ?? 'Inter, system-ui, sans-serif',
+          logoUrl: (localBranding.logoUrl as string) ?? undefined,
+          heroImageUrl: (localBranding.heroImageUrl as string) ?? undefined,
+          announcementBar: (localBranding.announcementBar as string) ?? undefined,
+        })
+      : {
+          primaryColor: (localBranding.primaryColor as string) ?? '#2563eb',
+          accentColor: (localBranding.accentColor as string) ?? '#16a34a',
+          fontFamily: (localBranding.fontFamily as string) ?? 'Inter, system-ui, sans-serif',
+          logoUrl: (localBranding.logoUrl as string) ?? null,
+          heroImageUrl: (localBranding.heroImageUrl as string) ?? null,
+          announcementBar: (localBranding.announcementBar as string) ?? null,
+        };
+    return c.json({
+      success: true,
+      data: {
+        tenantId,
+        branding: {
+          primaryColor: effectiveBranding.primaryColor ?? '#2563eb',
+          accentColor: effectiveBranding.accentColor ?? '#16a34a',
+          fontFamily: effectiveBranding.fontFamily ?? 'Inter, system-ui, sans-serif',
+          logoUrl: effectiveBranding.logoUrl ?? null,
+          heroImageUrl: effectiveBranding.heroImageUrl ?? null,
+          announcementBar: effectiveBranding.announcementBar ?? null,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[SV][config] error:', err);
+    return c.json({ success: true, data: { tenantId, branding: { primaryColor: '#2563eb', accentColor: '#16a34a', fontFamily: 'Inter, system-ui, sans-serif', logoUrl: null, heroImageUrl: null, announcementBar: null } } });
+  }
+});
+
+// ── GET /cmrc_products/:id — Product detail with attributes (P12-T01) ──────────────
+app.get('/cmrc_products/:id', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  try {
+    const product = await c.env.DB.prepare(
+      `SELECT id, name, description, price, quantity, category, image_url, sku,
+              has_variants, slug, is_active
+       FROM cmrc_products
+       WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL`
+    ).bind(productId, tenantId).first<Record<string, unknown>>();
+
+    if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+    // Include attribute values
+    const { results: attrs } = await c.env.DB.prepare(
+      'SELECT attributeName, attributeValue FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+    ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
+
+    return c.json({ success: true, data: { ...product, attributes: attrs ?? [] } });
+  } catch (err) {
+    console.error('[SV][cmrc_products/:id] error:', err);
+    return c.json({ success: false, error: 'Product not found' }, 404);
+  }
+});
+
+// ── GET /search/suggest — Autocomplete suggestions (SV-E19) ──────────────────
+// Must be declared BEFORE /search/:id routes to avoid param capture
+app.get('/search/suggest', async (c) => {
+  const tenantId = getTenantId(c);
+  const q = c.req.query('q')?.trim();
+  if (!q || q.length < 2) return c.json({ success: true, data: { suggestions: [] } });
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT DISTINCT name FROM cmrc_products
+       WHERE tenant_id = ? AND name LIKE ? AND deleted_at IS NULL AND is_active = 1
+       LIMIT 5`
+    ).bind(tenantId, `${q}%`).all<{ name: string }>();
+    return c.json({ success: true, data: { suggestions: (results ?? []).map((r) => r.name) } });
+  } catch (err) {
+    console.error('[SV][search/suggest] error:', err);
+    return c.json({ success: true, data: { suggestions: [] } });
+  }
+});
+
+// ── POST /cmrc_products/:id/attributes — Add/update attribute (SV-E06) ─────────────
+app.post('/cmrc_products/:id/attributes', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+  const body = await c.req.json<{ attributeName: string; attributeValue: string }>();
+
+  if (!body.attributeName?.trim()) return c.json({ success: false, error: 'attributeName is required' }, 400);
+  if (!body.attributeValue?.trim()) return c.json({ success: false, error: 'attributeValue is required' }, 400);
+
+  const now = new Date().toISOString();
+  const id = `attr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO cmrc_product_attributes (id, tenantId, productId, attributeName, attributeValue, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tenantId, productId, attributeName)
+       DO UPDATE SET attributeValue = excluded.attributeValue`
+    ).bind(id, tenantId, productId, body.attributeName.trim(), body.attributeValue.trim(), now).run();
+
+    // Re-index FTS5: append attribute values to the product's description field
+    try {
+      const { results: attrs } = await c.env.DB.prepare(
+        'SELECT attributeName, attributeValue FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ?'
+      ).bind(tenantId, productId).all<{ attributeName: string; attributeValue: string }>();
+
+      const attrText = attrs.map((a) => `${a.attributeName}: ${a.attributeValue}`).join(' ');
+
+      const product = await c.env.DB.prepare(
+        'SELECT rowid, name, description, category, sku FROM cmrc_products WHERE id = ? AND tenant_id = ?'
+      ).bind(productId, tenantId).first<{ rowid: number; name: string; description: string | null; category: string | null; sku: string }>();
+
+      if (product) {
+        const fullDesc = [product.description, attrText].filter(Boolean).join(' ');
+        await c.env.DB.batch([
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(products_fts, rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES ('delete', ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, product.description ?? '', product.category ?? '', product.sku),
+          c.env.DB.prepare(
+            `INSERT INTO products_fts(rowid, product_id, tenant_id, name, description, category, sku)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(product.rowid, productId, tenantId, product.name, fullDesc, product.category ?? '', product.sku),
+        ]);
+      }
+    } catch {
+      // FTS re-index is non-fatal
+    }
+
+    return c.json({ success: true, data: { id, productId, attributeName: body.attributeName.trim(), attributeValue: body.attributeValue.trim() } }, 201);
+  } catch (err) {
+    console.error('[SV][cmrc_products/attributes] POST error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── GET /cmrc_products/:id/attributes — List product attributes (SV-E06) ───────────
+app.get('/cmrc_products/:id/attributes', async (c) => {
+  const tenantId = getTenantId(c);
+  const productId = c.req.param('id');
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, attributeName, attributeValue, createdAt FROM cmrc_product_attributes WHERE tenantId = ? AND productId = ? ORDER BY createdAt ASC'
+    ).bind(tenantId, productId).all<{ id: string; attributeName: string; attributeValue: string; createdAt: string }>();
+
+    return c.json({ success: true, data: { productId, attributes: results ?? [] } });
+  } catch (err) {
+    console.error('[SV][cmrc_products/attributes] GET error:', err);
+    return c.json({ success: true, data: { productId, attributes: [] } });
+  }
+});
+
+// ── PUT /admin/tenant/branding — Save storefront theme (SV-E09) ───────────────
+app.put('/admin/tenant/branding', requireRole(['SUPER_ADMIN', 'TENANT_ADMIN']), async (c) => {
+  const adminKey = c.req.header('x-admin-key');
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ success: false, error: 'Invalid admin key' }, 403);
+  }
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{
+    primaryColor?: string;
+    accentColor?: string;
+    fontFamily?: string;
+    heroImageUrl?: string;
+    announcementBar?: string;
+  }>();
+
+  try {
+    const existing = await c.env.TENANT_CONFIG.get(`tenant:${tenantId}`, 'json') as Record<string, unknown> | null;
+    if (!existing) return c.json({ success: false, error: 'Tenant not found' }, 404);
+
+    const currentBranding = (existing.branding as Record<string, unknown>) ?? {};
+    const updatedBranding = {
+      ...currentBranding,
+      ...(body.primaryColor !== undefined ? { primaryColor: body.primaryColor } : {}),
+      ...(body.accentColor !== undefined ? { accentColor: body.accentColor } : {}),
+      ...(body.fontFamily !== undefined ? { fontFamily: body.fontFamily } : {}),
+      ...(body.heroImageUrl !== undefined ? { heroImageUrl: body.heroImageUrl } : {}),
+      ...(body.announcementBar !== undefined ? { announcementBar: body.announcementBar } : {}),
+    };
+
+    const updatedConfig = { ...existing, branding: updatedBranding };
+    await c.env.TENANT_CONFIG.put(`tenant:${tenantId}`, JSON.stringify(updatedConfig));
+
+    // COM-5: sync branding update to canonical UI_CONFIG_KV for webwaka-ui-builder deployments
+    if (c.env.UI_CONFIG_KV && tenantId) {
+      await syncBrandingToUIConfigKV(
+        tenantId,
+        c.env.UI_CONFIG_KV,
+        updatedBranding as import('../../core/ui-config-branding').StorefrontBranding,
+        (existing.domain as string) ?? undefined,
+      );
+    }
+
+    return c.json({ success: true, data: { tenantId, branding: updatedBranding } });
+  } catch (err) {
+    console.error('[SV][admin/tenant/branding] error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
+// ── SV-E14: Subscriptions CRUD ────────────────────────────────────────────────
+
+// POST /cmrc_subscriptions — create a recurring order subscription
+app.post('/cmrc_subscriptions', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const body = await c.req.json<{ productId: string; frequencyDays: number; paystackToken: string }>();
+  if (!body.productId || !body.frequencyDays || !body.paystackToken) {
+    return c.json({ success: false, error: 'productId, frequencyDays, paystackToken required' }, 400);
+  }
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+  const product = await c.env.DB.prepare(
+    'SELECT name, price FROM cmrc_products WHERE id = ? AND tenant_id = ? AND is_active = 1 AND deleted_at IS NULL',
+  ).bind(body.productId, tenantId).first<{ name: string; price: number }>();
+  if (!product) return c.json({ success: false, error: 'Product not found' }, 404);
+
+  const nextCharge = new Date();
+  nextCharge.setDate(nextCharge.getDate() + body.frequencyDays);
+  const subId = `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+  await c.env.DB.prepare(
+    `INSERT INTO cmrc_subscriptions (id, tenantId, customerId, productId, frequencyDays, nextChargeDate, paystackToken, status, productName)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
+  ).bind(subId, tenantId, customerId, body.productId, body.frequencyDays, nextCharge.toISOString().slice(0, 10), body.paystackToken, product.name).run();
+
+  return c.json({ success: true, data: { id: subId, status: 'ACTIVE', nextChargeDate: nextCharge.toISOString().slice(0, 10) } }, 201);
+});
+
+// PATCH /cmrc_subscriptions/:id — pause, resume, or cancel a subscription
+app.patch('/cmrc_subscriptions/:id', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const id = c.req.param('id');
+  const { status } = await c.req.json<{ status: 'PAUSED' | 'ACTIVE' | 'CANCELLED' }>();
+  const validStatuses = ['PAUSED', 'ACTIVE', 'CANCELLED'];
+  if (!validStatuses.includes(status)) return c.json({ success: false, error: 'status must be PAUSED, ACTIVE, or CANCELLED' }, 400);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+
+  const result = await c.env.DB.prepare(
+    `UPDATE cmrc_subscriptions SET status = ? WHERE id = ? AND tenantId = ? AND customerId = ?`,
+  ).bind(status, id, tenantId, customerId).run();
+
+  if ((result.meta?.changes ?? 0) === 0) return c.json({ success: false, error: 'Subscription not found or not owned by you' }, 404);
+  return c.json({ success: true, data: { id, status } });
+});
+
+// GET /cmrc_subscriptions — list customer cmrc_subscriptions
+app.get('/cmrc_subscriptions', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  const { results } = await c.env.DB.prepare(
+    `SELECT s.id, s.productId, s.productName, s.frequencyDays, s.nextChargeDate, s.status,
+            s.retryCount, p.price_kobo AS priceKobo
+     FROM cmrc_subscriptions s LEFT JOIN cmrc_products p ON p.id = s.productId AND p.tenant_id = s.tenantId
+     WHERE s.tenantId = ? AND s.customerId = ? ORDER BY s.createdAt DESC`,
+  ).bind(tenantId, customerId).all<Record<string, unknown>>();
+  return c.json({ success: true, data: { cmrc_subscriptions: results ?? [] } });
+});
+
+// ── SV-E18: NDPR Data Export and Deletion ─────────────────────────────────────
+
+// POST /account/export — rate-limited once per 30 days; returns all customer data as JSON
+app.post('/account/export', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+  // Rate limit: once per 30 days
+  const rlKey = `ndpr_export:${tenantId}:${customerId}`;
+  const allowed = await kvCheckRL(c.env.SESSIONS_KV, searchRateLimitStore, rlKey, 1, 30 * 24 * 60 * 60 * 1000);
+  if (!allowed) return c.json({ success: false, error: 'Data export is limited to once every 30 days' }, 429);
+
+  const [profile, cmrc_orders, wishlist, loyalty, cmrc_subscriptions] = await Promise.all([
+    c.env.DB.prepare(`SELECT id, name, phone, email, createdAt FROM cmrc_customers WHERE id = ? AND tenant_id = ?`).bind(customerId, tenantId).first(),
+    c.env.DB.prepare(`SELECT id, total_amount, order_status, payment_status, created_at FROM cmrc_orders WHERE customer_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT 100`).bind(customerId, tenantId).all(),
+    c.env.DB.prepare(`SELECT productId, createdAt FROM cmrc_wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
+    c.env.DB.prepare(`SELECT points, tier, updatedAt FROM cmrc_customer_loyalty WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).first(),
+    c.env.DB.prepare(`SELECT id, productName, frequencyDays, nextChargeDate, status FROM cmrc_subscriptions WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId).all(),
+  ]);
+
+  return c.json({
+    success: true,
+    data: {
+      exportedAt: new Date().toISOString(),
+      profile,
+      cmrc_orders: cmrc_orders.results ?? [],
+      wishlist: wishlist.results ?? [],
+      loyalty,
+      cmrc_subscriptions: cmrc_subscriptions.results ?? [],
+    },
+  });
+});
+
+// DELETE /account — NDPR soft-delete: anonymise PII, cancel active cmrc_subscriptions
+app.delete('/account', requireRole(['CUSTOMER']), async (c) => {
+  const tenantId = getTenantId(c);
+  const customerId = (c.get('jwtPayload' as never) as { sub?: string } | undefined)?.sub ?? '';
+  if (!customerId) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+  const customer = await c.env.DB.prepare(
+    `SELECT phone FROM cmrc_customers WHERE id = ? AND tenant_id = ? AND deletedAt IS NULL`,
+  ).bind(customerId, tenantId).first<{ phone: string }>();
+  if (!customer) return c.json({ success: false, error: 'Account not found' }, 404);
+
+  // Send farewell SMS before nulling phone
+  if (customer.phone && c.env.TERMII_API_KEY) {
+    const sms = createSmsProvider(c.env.TERMII_API_KEY, 'WebWaka');
+    await sms.sendMessage(customer.phone, 'Your WebWaka account and personal data have been deleted as requested. Your order history is retained for merchant accounting.').catch(() => {});
+  }
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE cmrc_customers SET name = 'Deleted User', phone = ?, email = NULL, deletedAt = ? WHERE id = ? AND tenant_id = ?`,
+    ).bind(`deleted_${customerId}`, new Date().toISOString(), customerId, tenantId),
+    c.env.DB.prepare(`DELETE FROM cmrc_wishlists WHERE customerId = ? AND tenantId = ?`).bind(customerId, tenantId),
+    c.env.DB.prepare(`UPDATE cmrc_subscriptions SET status = 'CANCELLED' WHERE customerId = ? AND tenantId = ? AND status = 'ACTIVE'`).bind(customerId, tenantId),
+  ]);
+
+  return c.json({ success: true, data: { message: 'Account deleted. Order history retained for merchant accounting.' } });
+});
+
+// ── POS-E12: Payment status poll (transfer confirmation) ──────────────────────
+app.get('/payment-status', async (c) => {
+  const reference = c.req.query('reference');
+  if (!reference) return c.json({ success: false, error: 'reference query param required' }, 400);
+  const confirmed = await c.env.SESSIONS_KV?.get(`transfer_confirmed:${reference}`).catch(() => null);
+  return c.json({ success: true, data: { confirmed: confirmed === '1', reference } });
+});
+
+// ── SV-E17: COD with Deposit — returns deposit amount for COD cmrc_orders ──────────
+app.post('/checkout/cod-deposit', async (c) => {
+  const tenantId = getTenantId(c);
+  const { subtotalKobo } = await c.req.json<{ subtotalKobo: number }>();
+  const tc = c.get('tenantConfig' as never) as { codDepositPercent?: number } | undefined;
+  const pct = tc?.codDepositPercent ?? 20;
+  const depositKobo = Math.round(subtotalKobo * pct / 100);
+  return c.json({ success: true, data: { depositPercent: pct, depositKobo, remainingKobo: subtotalKobo - depositKobo } });
+});
+
 export { app as singleVendorRouter };
-export { computeDiscount };
+
+/**
+ * Reset the OTP rate limit store — for use in tests only.
+ * Clears all rate limit counters so test suites don't bleed into each other.
+ */
+export function _resetOtpRateLimitStore(): void {
+  otpRateLimitStore.clear();
+}
+export function _resetCheckoutRateLimitStore(): void {
+  checkoutRateLimitStore.clear();
+}
+export function _resetSearchRateLimitStore(): void {
+  searchRateLimitStore.clear();
+}

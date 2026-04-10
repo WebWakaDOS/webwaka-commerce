@@ -1,0 +1,160 @@
+You are a senior QA engineer performing a complete verification of Phase P01 (Shared Platform Primitives) in the @webwaka/core package located at packages/webwaka-core/.
+
+Your job is to verify that every task was implemented exactly as specified, identify any bugs or gaps, fix every issue you find, and confirm when the phase is 100% verified. Do not stop until everything is correct.
+
+## Step 1 — Read Everything First
+Read the following files completely before doing anything else:
+- packages/webwaka-core/src/index.ts
+- packages/webwaka-core/src/tax.ts
+- packages/webwaka-core/src/payment.ts
+- packages/webwaka-core/src/sms.ts
+- packages/webwaka-core/src/rate-limit.ts
+- packages/webwaka-core/src/optimistic-lock.ts
+- packages/webwaka-core/src/pin.ts
+- packages/webwaka-core/src/kyc.ts
+- packages/webwaka-core/src/ai.ts
+- packages/webwaka-core/src/events.ts
+- packages/webwaka-core/package.json
+
+## Step 2 — Verify File Existence
+Confirm that ALL of these files exist. If any are missing, create them now following the specification below before continuing.
+
+Required files: tax.ts, payment.ts, sms.ts, rate-limit.ts, optimistic-lock.ts, pin.ts, kyc.ts, ai.ts, events.ts
+
+## Step 3 — Verify Each Implementation
+
+### Verify tax.ts
+- [ ] TaxConfig interface exported with fields: vatRate (number), vatRegistered (boolean), exemptCategories (string[])
+- [ ] TaxLineItem interface exported with fields: category (string), amountKobo (number)
+- [ ] TaxResult interface exported with fields: subtotalKobo, vatKobo, totalKobo, vatBreakdown (array)
+- [ ] TaxEngine class exported with compute(items: TaxLineItem[]): TaxResult method
+- [ ] compute() uses Math.round() for all kobo calculations — no floating-point arithmetic
+- [ ] compute() skips VAT if category is in exemptCategories
+- [ ] compute() skips VAT if vatRegistered is false
+- [ ] vatBreakdown array has one entry per item with correct per-item VAT
+- [ ] createTaxEngine(config) factory function exported
+- [ ] All types re-exported from index.ts
+
+Test: instantiate TaxEngine with vatRate:0.075, vatRegistered:true, exemptCategories:['food']. Call compute with [{category:'food',amountKobo:10000},{category:'general',amountKobo:20000}]. Verify: subtotalKobo=30000, vatKobo=1500 (only general item taxed), totalKobo=31500. If result is wrong, fix the compute() logic.
+
+### Verify payment.ts
+- [ ] ChargeResult interface exported with: success, reference, amountKobo, error (optional)
+- [ ] RefundResult interface exported with: success, refundId, error (optional)
+- [ ] SplitRecipient interface exported with: subaccountCode, amountKobo
+- [ ] IPaymentProvider interface exported with 4 methods: verifyCharge, initiateRefund, initiateSplit, initiateTransfer
+- [ ] PaystackProvider class exported implementing IPaymentProvider
+- [ ] PaystackProvider uses fetch(), not axios or any external HTTP library
+- [ ] verifyCharge hits: GET https://api.paystack.co/transaction/verify/{reference}
+- [ ] verifyCharge returns success:false if data.status is not 'success'
+- [ ] initiateRefund hits: POST https://api.paystack.co/refund
+- [ ] initiateTransfer hits: POST https://api.paystack.co/transfer with source:'balance'
+- [ ] createPaymentProvider(secretKey) factory exported
+- [ ] All Authorization headers use Bearer ${secretKey} format
+- [ ] No API keys hardcoded anywhere
+
+### Verify sms.ts
+- [ ] OtpChannel type exported: 'sms' | 'whatsapp' | 'whatsapp_business'
+- [ ] OtpResult interface exported with: success, messageId (optional), channel, error (optional)
+- [ ] ISmsProvider interface exported with methods: sendOtp, sendMessage
+- [ ] TermiiProvider class exported implementing ISmsProvider
+- [ ] Default channel for sendOtp is 'whatsapp'
+- [ ] WhatsApp fallback to SMS is implemented: if WhatsApp delivery fails (no message_id), retry with 'sms' channel
+- [ ] Termii API URL: https://api.ng.termii.com/api/sms/send
+- [ ] sendMessage calls sendOtp with 'whatsapp' channel
+- [ ] createSmsProvider(apiKey, senderId?) factory exported
+- [ ] Original sendTermiiSms function still exported (backward compatibility) — DO NOT remove it
+- [ ] Verify sendTermiiSms is a wrapper that calls TermiiProvider internally
+
+### Verify rate-limit.ts
+- [ ] RateLimitOptions interface exported: kv, key, maxRequests, windowSeconds
+- [ ] RateLimitResult interface exported: allowed, remaining, resetAt (epoch ms)
+- [ ] checkRateLimit(opts) async function exported
+- [ ] When key doesn't exist in KV: creates entry with count:1, returns allowed:true
+- [ ] When count >= maxRequests: returns allowed:false, remaining:0
+- [ ] When window has expired: resets counter, returns allowed:true
+- [ ] Uses KV TTL (expirationTtl) to automatically clean up expired entries
+- [ ] resetAt is epoch milliseconds (not seconds)
+- [ ] Does NOT use in-memory state — all state in KV
+
+### Verify optimistic-lock.ts
+- [ ] OptimisticLockResult interface exported: success, conflict, error (optional)
+- [ ] updateWithVersionLock(db, table, updates, where) async function exported
+- [ ] where parameter has: id, tenantId, expectedVersion
+- [ ] SQL includes: WHERE id = ? AND tenantId = ? AND version = ? AND deletedAt IS NULL
+- [ ] SQL sets: version = version + 1 AND updatedAt = current timestamp
+- [ ] Returns conflict:true when meta.changes === 0
+- [ ] Returns success:true when meta.changes > 0
+- [ ] Does NOT throw on version mismatch — returns result object
+
+### Verify pin.ts
+- [ ] hashPin(pin, salt?) async function exported — returns { hash: string, salt: string }
+- [ ] Uses ONLY Web Crypto API (crypto.subtle) — no bcrypt, no node:crypto
+- [ ] Uses PBKDF2 with SHA-256 and 100,000 iterations
+- [ ] Generates random UUID for salt if not provided
+- [ ] Returns base64-encoded hash
+- [ ] verifyPin(pin, storedHash, salt) async function exported — returns boolean
+- [ ] verifyPin re-hashes with stored salt and does constant-time comparison
+- [ ] Both functions work in Cloudflare Workers (Web Crypto compatible)
+
+Test: Call hashPin('123456'). Then call verifyPin('123456', result.hash, result.salt). Should return true. Call verifyPin('wrong', result.hash, result.salt). Should return false. If any test fails, fix the implementation.
+
+### Verify kyc.ts
+- [ ] KycVerificationResult interface exported: verified, matchScore (optional), reason (optional), provider
+- [ ] IKycProvider interface exported with 3 methods: verifyBvn, verifyNin, verifyCac
+- [ ] All method signatures use string parameters (no complex objects)
+- [ ] Interface is correctly typed — no 'any' types
+
+### Verify ai.ts
+- [ ] AiMessage interface exported: role ('system'|'user'|'assistant'), content
+- [ ] AiCompletionOptions interface exported: model (optional), messages, maxTokens (optional), temperature (optional)
+- [ ] AiCompletionResult interface exported: content, model, tokensUsed, error (optional)
+- [ ] OpenRouterClient class exported with complete(opts) method
+- [ ] Base URL: https://openrouter.ai/api/v1
+- [ ] Sets headers: Authorization: Bearer {apiKey}, HTTP-Referer: 'https://webwaka.com', X-Title: 'WebWaka Commerce'
+- [ ] Default model is 'openai/gpt-4o-mini'
+- [ ] Returns error in result object (does not throw) on API failure
+- [ ] createAiClient(apiKey, defaultModel?) factory exported
+
+### Verify events.ts
+- [ ] CommerceEvents const object exported
+- [ ] Contains ALL of these keys with exact string values:
+INVENTORY_UPDATED: 'inventory.updated'
+ORDER_CREATED: 'order.created'
+ORDER_READY_DELIVERY: 'order.ready_for_delivery'
+PAYMENT_COMPLETED: 'payment.completed'
+PAYMENT_REFUNDED: 'payment.refunded'
+SHIFT_CLOSED: 'shift.closed'
+CART_ABANDONED: 'cart.abandoned'
+SUBSCRIPTION_CHARGE: 'subscription.charge_due'
+DELIVERY_QUOTE: 'delivery.quote'
+DELIVERY_STATUS: 'delivery.status_changed'
+VENDOR_KYC_SUBMITTED: 'vendor.kyc_submitted'
+VENDOR_KYC_APPROVED: 'vendor.kyc_approved'
+VENDOR_KYC_REJECTED: 'vendor.kyc_rejected'
+STOCK_ADJUSTED: 'stock.adjusted'
+DISPUTE_OPENED: 'dispute.opened'
+DISPUTE_RESOLVED: 'dispute.resolved'
+PURCHASE_ORDER_RECEIVED: 'purchase_order.received'
+FLASH_SALE_STARTED: 'flash_sale.started'
+FLASH_SALE_ENDED: 'flash_sale.ended'
+- [ ] CommerceEventType type exported (typeof CommerceEvents[keyof typeof CommerceEvents])
+- [ ] Object is marked 'as const' so values are literal types
+
+### Verify index.ts Barrel Exports
+- [ ] All 9 new files are re-exported: export * from './tax', './payment', './sms', './rate-limit', './optimistic-lock', './pin', './kyc', './ai', './events'
+- [ ] All pre-existing exports are still present — nothing was removed
+- [ ] Run: import { TaxEngine, IPaymentProvider, ISmsProvider, checkRateLimit, updateWithVersionLock, hashPin, IKycProvider, OpenRouterClient, CommerceEvents, sendTermiiSms } from '@webwaka/core' — verify no TypeScript error
+
+### Verify Package Version
+- [ ] packages/webwaka-core/package.json version is '1.2.0' (bumped from 1.1.0)
+
+## Step 4 — TypeScript Verification
+Run: npx tsc --noEmit from the packages/webwaka-core/ directory.
+If there are any TypeScript errors: read each error, identify the cause, and fix it. Re-run until zero errors.
+
+## Step 5 — Fix All Issues
+For every item above that was not correctly implemented: fix it now. Do not report issues without fixing them. After fixing, re-verify the item.
+
+## Step 6 — Completion Confirmation
+Only after all checkboxes above are verified and all TypeScript errors are resolved, output:
+"P01 QA COMPLETE — All 9 modules verified, all exports confirmed, TypeScript clean. Package version 1.2.0."

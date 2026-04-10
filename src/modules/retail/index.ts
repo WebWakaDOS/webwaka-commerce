@@ -65,7 +65,7 @@ export interface RetailResult {
 
 export class RetailModuleRegistry {
   private modules: Map<string, RetailModule> = new Map();
-  private products: Map<string, RetailProduct> = new Map();
+  private cmrc_products: Map<string, RetailProduct> = new Map();
   private transactions: Map<string, RetailTransaction> = new Map();
   private eventCallbacks: Map<string, Function[]> = new Map();
 
@@ -164,31 +164,31 @@ export class RetailModuleRegistry {
       updatedAt: new Date()
     };
 
-    this.products.set(product.id, product);
+    this.cmrc_products.set(product.id, product);
     this.emit('product.added', product);
 
     return { success: true, id: product.id };
   }
 
   /**
-   * Gets products for a module.
+   * Gets cmrc_products for a module.
    */
   getModuleProducts(moduleId: string): RetailProduct[] {
-    return Array.from(this.products.values()).filter(p => p.moduleId === moduleId);
+    return Array.from(this.cmrc_products.values()).filter(p => p.moduleId === moduleId);
   }
 
   /**
    * Gets a product by ID.
    */
   getProduct(productId: string): RetailProduct | null {
-    return this.products.get(productId) || null;
+    return this.cmrc_products.get(productId) || null;
   }
 
   /**
    * Updates product quantity.
    */
   updateProductQuantity(productId: string, newQuantity: number): RetailResult {
-    const product = this.products.get(productId);
+    const product = this.cmrc_products.get(productId);
     if (!product) {
       return { success: false, error: 'Product not found' };
     }
@@ -266,7 +266,7 @@ export class RetailModuleRegistry {
 
     // Update product quantities
     for (const item of transaction.items) {
-      const product = this.products.get(item.productId);
+      const product = this.cmrc_products.get(item.productId);
       if (product) {
         product.quantity -= item.quantity;
         product.updatedAt = new Date();
@@ -304,13 +304,13 @@ export class RetailModuleRegistry {
     totalRevenue: number;
     averageTransactionValue: number;
   } {
-    const products = this.getModuleProducts(moduleId);
+    const cmrc_products = this.getModuleProducts(moduleId);
     const transactions = this.getModuleTransactions(moduleId);
     const completedTransactions = transactions.filter(t => t.status === 'completed');
     const totalRevenue = completedTransactions.reduce((sum, t) => sum + t.total, 0);
 
     return {
-      totalProducts: products.length,
+      totalProducts: cmrc_products.length,
       totalTransactions: transactions.length,
       completedTransactions: completedTransactions.length,
       totalRevenue,

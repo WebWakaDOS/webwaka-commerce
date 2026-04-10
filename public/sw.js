@@ -1,14 +1,29 @@
 /**
- * WebWaka Commerce Suite — Service Worker v2
- * Strategy: Cache-First for shell, Network-First for API, Background Sync for mutations
+ * WebWaka Commerce Suite — Service Worker v4
+ * Strategy:
+ *   - Shell (HTML/CSS/JS): Cache-First
+ *   - SV Catalog API (/api/single-vendor/catalog, /api/single-vendor/products):
+ *       Stale-While-Revalidate (serve cached immediately, refresh in background)
+ *   - Product images (/api/pos/products/*/image, *.jpg, *.png, *.webp via CDN):
+ *       Cache-First (POS-E20)
+ *   - Other API calls: Network-First with cache fallback
+ *   - Mutations: Background Sync
  * Invariants: Offline-First, PWA-First, Nigeria-First
  */
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v4';
 const SHELL_CACHE = `webwaka-commerce-shell-${CACHE_VERSION}`;
 const API_CACHE = `webwaka-commerce-api-${CACHE_VERSION}`;
+const CATALOG_CACHE = `webwaka-commerce-catalog-${CACHE_VERSION}`;
+const IMAGE_CACHE = `webwaka-commerce-images-${CACHE_VERSION}`;
 const SYNC_TAG = 'webwaka-commerce-sync';
 
 const SHELL_ASSETS = ['/', '/index.html', '/manifest.json'];
+
+// Catalog API paths that get stale-while-revalidate treatment
+const CATALOG_PATTERNS = [
+  '/api/single-vendor/catalog',
+  '/api/single-vendor/products',
+];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -23,18 +38,79 @@ self.addEventListener('activate', (event) => {
     caches.keys().then((keys) =>
       Promise.all(
         keys
-          .filter((k) => k.startsWith('webwaka-commerce-') && k !== SHELL_CACHE && k !== API_CACHE)
+          .filter((k) => k.startsWith('webwaka-commerce-') && ![SHELL_CACHE, API_CACHE, CATALOG_CACHE, IMAGE_CACHE].includes(k))
           .map((k) => caches.delete(k))
       )
     ).then(() => self.clients.claim())
   );
 });
 
+function isCatalogRequest(url) {
+  return CATALOG_PATTERNS.some((p) => url.pathname.startsWith(p));
+}
+
+// Product image patterns: POS product image API and common image extensions from CDNs
+const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|gif|avif|svg)(\?.*)?$/i;
+function isProductImage(url) {
+  return IMAGE_EXTENSIONS.test(url.pathname) || url.pathname.includes('/products/') && url.pathname.includes('/image');
+}
+
+// Max number of image entries to keep in cache (prevents unbounded growth on low-end devices)
+const IMAGE_CACHE_MAX_ENTRIES = 200;
+
+// Cache-First for product images — serves cached asset immediately; updates cache from network
+async function cacheFirstImage(request) {
+  const cache = await caches.open(IMAGE_CACHE);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+  try {
+    const res = await fetch(request);
+    if (res.ok) {
+      cache.put(request, res.clone());
+      // Evict oldest entries if cache exceeds size limit
+      cache.keys().then((keys) => {
+        if (keys.length > IMAGE_CACHE_MAX_ENTRIES) {
+          const toDelete = keys.slice(0, keys.length - IMAGE_CACHE_MAX_ENTRIES);
+          toDelete.forEach((k) => cache.delete(k));
+        }
+      }).catch(() => {});
+    }
+    return res;
+  } catch {
+    return Response.error();
+  }
+}
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
   if (request.method !== 'GET' || !url.protocol.startsWith('http')) return;
 
+  // ── Cache-First for product images (POS-E20 offline image caching) ─────────
+  if (isProductImage(url)) {
+    event.respondWith(cacheFirstImage(request));
+    return;
+  }
+
+  // ── Stale-While-Revalidate for SV catalog/products endpoints ──────────────
+  if (isCatalogRequest(url)) {
+    event.respondWith(
+      caches.open(CATALOG_CACHE).then(async (cache) => {
+        const cached = await cache.match(request);
+        const fetchPromise = fetch(request)
+          .then((res) => {
+            if (res.ok) cache.put(request, res.clone());
+            return res;
+          })
+          .catch(() => cached || Response.error());
+        // Serve cached immediately; refresh in background
+        return cached ?? fetchPromise;
+      })
+    );
+    return;
+  }
+
+  // ── Network-First for other API calls ─────────────────────────────────────
   if (url.pathname.startsWith('/api/')) {
     event.respondWith(
       fetch(request)
@@ -45,11 +121,12 @@ self.addEventListener('fetch', (event) => {
           }
           return res;
         })
-        .catch(() => caches.match(request))
+        .catch(() => caches.match(request).then((cached) => cached || Response.error()))
     );
     return;
   }
 
+  // ── Cache-First for shell assets ──────────────────────────────────────────
   event.respondWith(
     caches.match(request).then((cached) => {
       if (cached) return cached;
